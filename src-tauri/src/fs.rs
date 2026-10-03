@@ -53,6 +53,33 @@ pub struct FolderNode {
     pub has_children: bool,
     /// 直接子文件夹数量（目录树名称后括号追加显示）
     pub subfolder_count: u32,
+    /// L336：隐藏属性（Windows FILE_ATTRIBUTE_HIDDEN；其他平台按点号开头判定）
+    pub hidden: bool,
+    /// L336：系统属性（Windows FILE_ATTRIBUTE_SYSTEM）
+    pub system: bool,
+}
+
+/// L336：读取条目的隐藏/系统属性
+#[cfg(windows)]
+fn hidden_system_attrs(path: &std::path::Path) -> (bool, bool) {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => {
+            let a = m.file_attributes();
+            (a & FILE_ATTRIBUTE_HIDDEN != 0, a & FILE_ATTRIBUTE_SYSTEM != 0)
+        }
+        Err(_) => (false, false),
+    }
+}
+#[cfg(not(windows))]
+fn hidden_system_attrs(path: &std::path::Path) -> (bool, bool) {
+    let hidden = path
+        .file_name()
+        .map(|n| n.to_string_lossy().starts_with('.'))
+        .unwrap_or(false);
+    (hidden, false)
 }
 
 /// 扫描单个目录（非递归），过滤出媒体文件
@@ -65,6 +92,19 @@ pub async fn list_directory(path: String) -> Result<Vec<MediaItem>, String> {
     }
 
     tauri::async_runtime::spawn_blocking(move || scan_dir(&dir))
+        .await
+        .map_err(|e| format!("扫描任务失败: {e}"))?
+}
+
+/// L230「穿透」：递归扫描目录及其所有子目录，只返回媒体文件（不含文件夹）
+/// 上限 10 万条，防止误选磁盘根目录时结果爆炸
+#[tauri::command]
+pub async fn list_directory_deep(path: String) -> Result<Vec<MediaItem>, String> {
+    let dir = canonicalize_checked(&path)?;
+    if !dir.is_dir() {
+        return Err(format!("不是有效目录: {}", dir.display()));
+    }
+    tauri::async_runtime::spawn_blocking(move || scan_dir_deep(&dir))
         .await
         .map_err(|e| format!("扫描任务失败: {e}"))?
 }
@@ -191,11 +231,14 @@ pub async fn list_subfolders(path: String) -> Result<Vec<FolderNode>, String> {
             let subfolder_count = std::fs::read_dir(&p)
                 .map(|rd| rd.filter_map(|x| x.ok()).filter(|x| x.path().is_dir()).count() as u32)
                 .unwrap_or(0);
+            let (hidden, system) = hidden_system_attrs(&p);
             out.push(FolderNode {
                 path: p.to_string_lossy().into_owned(),
                 name: e.file_name().to_string_lossy().into_owned(),
                 has_children: subfolder_count > 0,
                 subfolder_count,
+                hidden,
+                system,
             });
         }
         Ok(out)
@@ -258,6 +301,62 @@ fn scan_dir(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
         });
     }
     // 按类型（夹→图→影→音）+ 名称排序
+    items.sort_by(|a, b| {
+        a.kind
+            .partial_cmp(&b.kind)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(items)
+}
+
+/// L230：递归扫描（穿透）——遍历全部层级，仅收集媒体文件
+fn scan_dir_deep(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
+    const MAX_ITEMS: usize = 100_000;
+    let mut items = Vec::new();
+    // walkdir 默认递归；follow_links(false) 避免环
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if items.len() >= MAX_ITEMS {
+            break;
+        }
+        let p = entry.path();
+        if p == dir {
+            continue;
+        }
+        // 穿透结果里不放文件夹，文件区双击/操作都针对文件
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let Some(kind) = kind_by_ext(&ext) else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        items.push(MediaItem {
+            path: p.to_string_lossy().into_owned(),
+            name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            ext,
+            kind,
+            size: meta.len(),
+            modified,
+            duration: None,
+            width: None,
+            height: None,
+            title: None,
+            artist: None,
+            album: None,
+        });
+    }
+    // 与单层扫描一致：按类型 + 名称排序
     items.sort_by(|a, b| {
         a.kind
             .partial_cmp(&b.kind)

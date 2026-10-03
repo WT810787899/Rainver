@@ -23,6 +23,15 @@ pub struct AppConfig {
     pub view_mode: String,          // grid | list | gallery
     pub theme: String,              // dark | light | system
     pub thumb_size: f64,
+    /// 画廊模式独立缩放（列宽基准），与图标视图 thumb_size 分离
+    #[serde(default = "default_gallery_thumb_size")]
+    pub gallery_thumb_size: f64,
+    /// 画廊卡片间隔 px（L156）
+    #[serde(default = "default_gallery_gap")]
+    pub gallery_gap: f64,
+    /// 画廊方向键 / WASD 导航步长（视口比例，默认 0.05）
+    #[serde(default = "default_gallery_scroll_step")]
+    pub gallery_scroll_step: f64,
     pub info_panel_width: f64,
     pub info_panel_visible: bool,
     pub sidebar_width: f64,
@@ -64,6 +73,33 @@ pub struct AppConfig {
     pub video_seek_step: f64,
     pub immersive_fullscreen: bool, // 进入沉浸模式时自动全屏
     pub tree_folder_count: bool,    // 目录树名称后显示子文件夹数量
+    /// L336：目录树隐藏系统文件夹（持久化修正，此前仅存于前端导致重启丢失）
+    #[serde(default = "default_true")]
+    pub tree_hide_system: bool,
+    /// L336：目录树显示隐藏文件夹
+    #[serde(default)]
+    pub tree_show_hidden: bool,
+    /// L341：列表视图显示 修改时间/分辨率/时长 信息列
+    #[serde(default = "default_true")]
+    pub list_view_meta: bool,
+    /// 截图全局快捷键（视频=提取原始帧；其他=窗口画面）
+    #[serde(default = "default_screenshot_hotkey")]
+    pub screenshot_hotkey: String,
+    /// 截图保存目录（空 = 项目/screenshots）
+    #[serde(default)]
+    pub screenshot_dir: String,
+    /// 全局卡片预览音量（Ctrl+M 取消静音时采用，默认 20%）
+    #[serde(default = "default_card_volume")]
+    pub card_volume: f64,
+    /// 全局卡片预览静音态（画廊卡片默认静音）
+    #[serde(default = "default_true")]
+    pub card_muted: bool,
+    /// 鼠标静止时自动隐藏指针
+    #[serde(default = "default_true")]
+    pub auto_hide_cursor: bool,
+    /// 默认壁纸一次性迁移标记（首次运行启用内置 wallpaper.jpg）
+    #[serde(default)]
+    pub wallpaper_default_initialized: bool,
 
     // ─── 播放器状态（音量/静音持久化） ───
     pub video_volume: f64,          // 视频/预览音量 0~100
@@ -91,10 +127,31 @@ pub struct AppConfig {
     // ─── L93：深/浅主题独立外观覆盖（None = 跟随上方全局基础值；壁纸路径共享不进结构） ───
     pub appearance_dark: ThemeAppearance,
     pub appearance_light: ThemeAppearance,
+    /// L239：用户保存的「默认外观」快照（深/浅各一套 + 共享壁纸路径；全 None = 未保存）
+    #[serde(default)]
+    pub appearance_defaults: AppearanceDefaults,
 
     // ─── 画廊表演（F1 进入/退出，F2 设置面板） ───
     #[serde(default)]
     pub gallery_perf: GalleryPerfConfig,
+}
+
+/// 配置默认值小工具（serde default 函数必须是 fn 路径）
+fn default_gallery_thumb_size() -> f64 { 260.0 }
+fn default_gallery_gap() -> f64 { 14.0 }
+fn default_gallery_scroll_step() -> f64 { 0.05 }
+fn default_screenshot_hotkey() -> String { "F11".into() }
+fn default_card_volume() -> f64 { 20.0 }
+fn default_true() -> bool { true }
+
+/// L239：外观默认配置快照（「存为默认外观」时写入，「恢复默认外观」时读回）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppearanceDefaults {
+    /// 共享壁纸路径（Some 表示保存默认时一并记录）
+    pub wallpaper_path: Option<String>,
+    pub dark: Option<ThemeAppearance>,
+    pub light: Option<ThemeAppearance>,
 }
 
 /// 画廊表演配置：三个模式各自独立子设置
@@ -112,22 +169,36 @@ pub struct GalleryPerfConfig {
     pub cards_interval: f64,        // 切换速度 秒
     pub cards_no_repeat: bool,      // 轮次内排除重复
     pub cards_fade: f64,            // 过渡时长 ms（0 = 无动画纯快切）
-    pub cards_anim: String,         // 动画类型 fade | zoomIn | zoomOut | slideUp | blur
+    pub cards_anim: String,         // 动画类型 fade | zoomIn | zoomOut | slideUp | blur | ...
     pub cards_sync: bool,           // 同步开关：关闭=同时出现；开启=各卡片错峰随机出现
     pub cards_sync_min: f64,        // 错峰随机延迟下限 ms
     pub cards_sync_max: f64,        // 错峰随机延迟上限 ms
-    // 模式3 随机阵列
-    pub array_interval: f64,        // 视口跳动间隔 秒
+    pub cards_random_fx: bool,      // 每张卡片随机一种动画
+    pub cards_random_count: bool,   // 随机数量开关
+    pub cards_count_min: u32,       // 随机数量下限
+    pub cards_count_max: u32,       // 随机数量上限
+    pub cards_random: bool,         // 随机图片（完全随机，不按牌堆顺序）
+    pub cards_fit: String,          // full 完整显示不裁剪 | fill 铺满屏幕可裁剪
+    // 模式3 阵列图案（弹出式，卡片排成各种规律图案）
+    pub array_interval: f64,        // 切换间隔 秒（兼作瀑布流随机跳动速度）
+    pub array_anim: String,         // 入场动画类型
+    pub array_random_fx: bool,      // 每张卡片随机一种动画
     // 模式4 幻灯片（1-2 张大图/视频，Ken Burns / 翻转等动画）
     pub slide_count: u32,           // 同屏张数 0=自动 | 1 | 2
     pub slide_interval: f64,        // 每张停留秒
     pub slide_duration: f64,        // 过渡时长 秒
     pub slide_effect: String,       // kenburns | panL | panR | fade | blur | flip | slideL | circle | blackout
     pub slide_random_fx: bool,      // 每张幻灯片随机一种动画
+    pub slide_random: bool,         // 随机图片（完全随机，不按牌堆顺序）
     pub slide_include_video: bool,  // （已废弃：视频始终直接播放）保留字段兼容旧配置
     // 模式5 封面流（3D Cover Flow 自动推进）
     pub cover_interval: f64,        // 推进间隔 秒
-    pub cover_effect: String,      // 中央卡切换效果 zoom | flip | slide | fade | rotate
+    pub cover_effect: String,      // 中央卡切换效果 zoom | flip | slide | fade | rotate | ...
+    pub cover_random_fx: bool,     // 随机切换效果
+    pub cover_side_count: u32,     // 侧边可见卡片数 2|3|4
+    pub cover_random: bool,        // 随机图片（完全随机，不按顺序推进）
+    // 瀑布流扩展
+    pub waterfall_scroll_mode: String, // smooth 平滑滚动 | jump 随机跳动
     // 配置迁移版本（JS 端一次性迁移用，缺失按 0）
     pub perf_ver: u32,
     // 通用
@@ -150,15 +221,28 @@ impl Default for GalleryPerfConfig {
             cards_sync: true,
             cards_sync_min: 0.0,
             cards_sync_max: 2000.0,
+            cards_random_fx: false,
+            cards_random_count: false,
+            cards_count_min: 3,
+            cards_count_max: 12,
+            cards_random: false,
+            cards_fit: "full".into(),
             array_interval: 2.0,
+            array_anim: "zoomIn".into(),
+            array_random_fx: false,
             slide_count: 0,
             slide_interval: 5.0,
             slide_duration: 0.9,
             slide_effect: "kenburns".into(),
             slide_random_fx: true,
+            slide_random: false,
             slide_include_video: false,
             cover_interval: 2.5,
             cover_effect: "zoom".into(),
+            cover_random_fx: false,
+            cover_side_count: 3,
+            cover_random: false,
+            waterfall_scroll_mode: "smooth".into(),
             perf_ver: 0,
             mute: true,
         }
@@ -177,6 +261,9 @@ pub struct ThemeAppearance {
     pub mask_opacity: Option<f64>,
     pub mica_enabled: Option<bool>,
     pub window_opacity: Option<f64>,
+    /// 壁纸饱和度 / 亮度（百分比，100 = 原图；L192，之前前端有设置但漏了持久化）
+    pub wall_saturation: Option<f64>,
+    pub wall_brightness: Option<f64>,
 }
 
 /// config.json 持久化结构 —— 只含非大列表字段（大列表走 data/*.json）
@@ -188,6 +275,9 @@ struct AppConfigCore<'a> {
     view_mode: &'a str,
     theme: &'a str,
     thumb_size: f64,
+    gallery_thumb_size: f64,
+    gallery_gap: f64,
+    gallery_scroll_step: f64,
     info_panel_width: f64,
     info_panel_visible: bool,
     sidebar_width: f64,
@@ -218,6 +308,15 @@ struct AppConfigCore<'a> {
     video_seek_step: f64,
     immersive_fullscreen: bool,
     tree_folder_count: bool,
+    tree_hide_system: bool,
+    tree_show_hidden: bool,
+    list_view_meta: bool,
+    screenshot_hotkey: &'a str,
+    screenshot_dir: &'a str,
+    card_volume: f64,
+    card_muted: bool,
+    auto_hide_cursor: bool,
+    wallpaper_default_initialized: bool,
     // 播放器状态
     video_volume: f64,
     video_muted: bool,
@@ -229,6 +328,7 @@ struct AppConfigCore<'a> {
     // 主题外观
     appearance_dark: &'a ThemeAppearance,
     appearance_light: &'a ThemeAppearance,
+    appearance_defaults: &'a AppearanceDefaults,
     // 画廊表演
     gallery_perf: &'a GalleryPerfConfig,
 }
@@ -240,6 +340,9 @@ impl<'a> From<&'a AppConfig> for AppConfigCore<'a> {
             view_mode: &c.view_mode,
             theme: &c.theme,
             thumb_size: c.thumb_size,
+            gallery_thumb_size: c.gallery_thumb_size,
+            gallery_gap: c.gallery_gap,
+            gallery_scroll_step: c.gallery_scroll_step,
             info_panel_width: c.info_panel_width,
             info_panel_visible: c.info_panel_visible,
             sidebar_width: c.sidebar_width,
@@ -268,6 +371,15 @@ impl<'a> From<&'a AppConfig> for AppConfigCore<'a> {
             video_seek_step: c.video_seek_step,
             immersive_fullscreen: c.immersive_fullscreen,
             tree_folder_count: c.tree_folder_count,
+            tree_hide_system: c.tree_hide_system,
+            tree_show_hidden: c.tree_show_hidden,
+            list_view_meta: c.list_view_meta,
+            screenshot_hotkey: &c.screenshot_hotkey,
+            screenshot_dir: &c.screenshot_dir,
+            card_volume: c.card_volume,
+            card_muted: c.card_muted,
+            auto_hide_cursor: c.auto_hide_cursor,
+            wallpaper_default_initialized: c.wallpaper_default_initialized,
             video_volume: c.video_volume,
             video_muted: c.video_muted,
             audio_volume: c.audio_volume,
@@ -276,6 +388,7 @@ impl<'a> From<&'a AppConfig> for AppConfigCore<'a> {
             local_shortcuts: &c.local_shortcuts,
             appearance_dark: &c.appearance_dark,
             appearance_light: &c.appearance_light,
+            appearance_defaults: &c.appearance_defaults,
             gallery_perf: &c.gallery_perf,
         }
     }
@@ -288,6 +401,9 @@ impl Default for AppConfig {
             view_mode: "grid".into(),
             theme: "dark".into(),
             thumb_size: 160.0,
+            gallery_thumb_size: default_gallery_thumb_size(),
+            gallery_gap: default_gallery_gap(),
+            gallery_scroll_step: default_gallery_scroll_step(),
             info_panel_width: 280.0,
             info_panel_visible: true,
             sidebar_width: 240.0,
@@ -322,6 +438,15 @@ impl Default for AppConfig {
             video_seek_step: 10.0,
             immersive_fullscreen: true,
             tree_folder_count: true,
+            tree_hide_system: true,
+            tree_show_hidden: false,
+            list_view_meta: true,
+            screenshot_hotkey: default_screenshot_hotkey(),
+            screenshot_dir: String::new(),
+            card_volume: default_card_volume(),
+            card_muted: true,
+            auto_hide_cursor: true,
+            wallpaper_default_initialized: false,
             // 播放器状态默认
             video_volume: 100.0,
             video_muted: false,
@@ -341,12 +466,16 @@ impl Default for AppConfig {
                 ("focusSearch".to_string(), "Ctrl+f".to_string()),
                 ("toggleTheme".to_string(), "Ctrl+t".to_string()),
                 ("togglePanel".to_string(), "Ctrl+i".to_string()),
+                // L237/L238：M 呼出音频播放器；Ctrl+M 切换卡片静音
+                ("toggleAudioPanel".to_string(), "m".to_string()),
+                ("toggleCardMute".to_string(), "Ctrl+m".to_string()),
             ]),
 
             favorites: Vec::new(),
             collection: Vec::new(),
             appearance_dark: ThemeAppearance::default(),
             appearance_light: ThemeAppearance::default(),
+            appearance_defaults: AppearanceDefaults::default(),
             gallery_perf: GalleryPerfConfig::default(),
         }
     }

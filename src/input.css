@@ -398,7 +398,7 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   line-height: 1;
   cursor: pointer;
   white-space: nowrap;
-  transition: background .15s, color .15s;
+  transition: background .15s, color .15s, box-shadow .2s;
 }
 .btn-fav:hover { background: rgba(var(--accent-rgb), .18); }
 .btn-fav:active { transform: scale(.96); }
@@ -409,13 +409,28 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
 .btn-fav-star { display: inline-flex; align-items: center; gap: 4px; color: #eab308; border-color: #eab308; }
 .btn-fav-star:hover { background: rgba(250,204,21,.15); }
 
-/* L89：集锦箱两个按钮 —— 与收藏按钮同高同圆角（继承 .btn-fav） */
+/* L89/L334：集锦箱进入按钮 —— 尺寸同收藏按钮，爱心图标；粉色线框 ↔ 实心粉 */
 .btn-col { display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px; }
 .btn-col-enter {
-  display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px;
-  color: #ec4899; border-color: #ec4899; /* 粉红进入按钮 */
+  display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px;
+  color: #ec4899; border-color: #ec4899; /* 未开启/进入态颜色一致（粉红） */
 }
-.btn-col-enter:hover { background: rgba(236,72,153,.15); }
+/* L343：集锦箱开关按钮 悬浮发光（粉色光晕） */
+.btn-col-enter:hover {
+  background: rgba(236,72,153,.15);
+  box-shadow: 0 0 12px rgba(236,72,153,.55), inset 0 0 4px rgba(236,72,153,.25);
+}
+/* L334：进入态——实心粉色，图标/文字颜色随主题（深色主题白、浅色主题黑） */
+.btn-col-enter.on {
+  color: var(--text);
+  border-color: #ec4899;
+  background: #ec4899;
+}
+.btn-col-enter.on:hover {
+  background: #f472b6;
+  box-shadow: 0 0 16px rgba(236,72,153,.75); /* L343：进入态悬浮发光更强 */
+}
+.btn-col-enter.on svg { fill: currentColor; }
 
 /* L88/L96：集锦箱编号按钮 1-5（放在名称右侧，紧凑尺寸；外观沿用用户调整的 accent 描边风格） */
 .col-tab {
@@ -537,6 +552,22 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
 }
 .settingsSelect:hover, .settingsSelect:focus { border-color: var(--accent); }
 .settingsSelect option { background: var(--modal-bg); color: inherit; }
+/* 显示优先级下拉：分段控件风格，更现代 */
+.perfFitSelect {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 5px 28px 5px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+  background: rgba(255,255,255,.06);
+  border: 1px solid var(--border);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  cursor: pointer;
+  transition: border-color .15s, background-color .15s;
+}
+.perfFitSelect:hover { border-color: var(--accent); background-color: rgba(255,255,255,.1); }
 /* 开关按钮（iOS 风格） */
 .settingsToggle {
   width: 40px; height: 22px;
@@ -562,24 +593,43 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
 #perfCard { height: 580px; } /* 固定尺寸：按设置项最多的 TAB 取高度，切换不跳动 */
 .perf-overlay {
   /* 压暗 + 大半径：哪怕底层 filter 受合成层影响失效，透过本层也看不到清晰画廊 */
-  background: rgba(0,0,0,.66);
+  background: rgba(0,0,0,.77);
   backdrop-filter: blur(30px);
   -webkit-backdrop-filter: blur(30px);
 }
 /* 弹卡模式：直接模糊底层画廊本体（backdrop-filter 在部分合成层场景会失效），
    同时掐断交互，滚轮/点击都到不了画廊 */
 #scroller.perf-bg-blur {
-  filter: blur(24px) scale(1.06);
+  /* scale() 不是合法 filter 函数，写进 filter 会让整条声明被浏览器丢弃；
+     模糊与放大必须拆开：filter 只放 blur，放大走 transform */
+  filter: blur(15px);
+  transform: scale(1.06);
   pointer-events: none;
 }
 /* 弹卡里的视频与图片一样完整填充 */
-.perf-vid { width: 100%; height: 100%; }
+.perf-vid {
+  width: 100%; height: 100%; position: relative;
+  /* 兜底背景：缩略图也拿不到时不至于纯黑 */
+  background: linear-gradient(135deg, rgba(80,80,95,.35), rgba(40,40,55,.35));
+}
+.perf-vid-cover {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: inherit; /* 跟随 .perf-card 的 contain/cover */
+  z-index: 0;
+}
 .perf-vid video {
+  position: relative;
+  z-index: 1;
   width: 100%; height: 100%;
   object-fit: contain;
   display: block;
-  background: #000;
+  background: transparent;
+  /* 未 ready 时隐藏，由底层封面/兜底背景显示；canplay 后 JS 加 .ready 淡入 */
+  opacity: 0;
+  transition: opacity .25s ease;
 }
+.perf-vid video.ready { opacity: 1; }
 .perf-card {
   position: absolute;
   border-radius: 10px;
@@ -588,25 +638,39 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   background: rgba(125,125,125,.12);
   will-change: opacity, transform, filter;
 }
-.perf-card img {
+.perf-card img,
+.perf-card video {
   width: 100%; height: 100%;
-  object-fit: contain;
+  object-position: center;
   display: block;
 }
+/* fit=full：完整显示不裁剪（框比=图比，contain 紧贴边缘） */
+#perfOverlay[data-fit="full"] .perf-card img,
+#perfOverlay[data-fit="full"] .perf-card video { object-fit: contain; }
+/* fit=fill：铺满屏幕可裁剪（框比略大，cover 裁掉边缘填满） */
+#perfOverlay[data-fit="fill"] .perf-card img,
+#perfOverlay[data-fit="fill"] .perf-card video { object-fit: cover; }
 .perf-card-skel {
   width: 100%; height: 100%;
   background: rgba(125,125,125,.14);
 }
-/* 入场动画：起点态由 overlay[data-anim] 决定，.on 为终态；缓动更柔和 */
+/* 入场动画：起点态由每张卡片自己的 data-anim 决定（支持每卡独立随机动画），.on 为终态 */
 .perf-card {
   opacity: 0;
   transition-property: opacity, transform, filter;
   transition-timing-function: cubic-bezier(.22,.61,.36,1);
 }
-.perf-overlay[data-anim="zoomIn"]  .perf-card { transform: scale(.84); }
-.perf-overlay[data-anim="zoomOut"] .perf-card { transform: scale(1.12); }
-.perf-overlay[data-anim="slideUp"] .perf-card { transform: translateY(26px); }
-.perf-overlay[data-anim="blur"]    .perf-card { filter: blur(18px); }
+.perf-card[data-anim="zoomIn"]     { transform: scale(.84); }
+.perf-card[data-anim="zoomOut"]    { transform: scale(1.15); }
+.perf-card[data-anim="slideUp"]    { transform: translateY(30px); }
+.perf-card[data-anim="slideDown"]  { transform: translateY(-30px); }
+.perf-card[data-anim="slideLeft"]  { transform: translateX(35px); }
+.perf-card[data-anim="slideRight"] { transform: translateX(-35px); }
+.perf-card[data-anim="blur"]       { filter: blur(18px); }
+.perf-card[data-anim="rotateIn"]   { transform: rotate(-10deg) scale(.7); }
+.perf-card[data-anim="expand"]     { transform: scale(.25); }
+.perf-card[data-anim="swing"]      { transform: rotate(6deg) translateX(45px); opacity: 0; }
+.perf-card[data-anim="fade"]       { /* 纯淡入：仅 opacity 过渡，无位移 */ }
 .perf-card.on { opacity: 1; transform: none; filter: none; }
 
 /* ─── 模式4 幻灯片 ─── */
@@ -707,9 +771,11 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   /* 仅初始占位；实际宽高由 JS 按每张媒体真实宽高比写内联值，保证卡片框=媒体边界 */
   width: 640px; height: 360px;
   border-radius: 18px;
-  transition: transform .65s cubic-bezier(.22,.61,.36,1), opacity .65s ease,
-              width .5s cubic-bezier(.22,.61,.36,1), height .5s cubic-bezier(.22,.61,.36,1);
+  /* 流畅度：缩短位移时长、GPU 加速提示、缓出曲线 */
+  transition: transform .55s cubic-bezier(.25,.8,.3,1), opacity .55s ease,
+              width .45s cubic-bezier(.25,.8,.3,1), height .45s cubic-bezier(.25,.8,.3,1);
   transform-style: preserve-3d;
+  will-change: transform, opacity;
   pointer-events: none;
 }
 .cover-inner {
@@ -719,6 +785,8 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   overflow: hidden;
   box-shadow: 0 24px 70px rgba(0,0,0,.6);
   background: #0b0f16;
+  backface-visibility: hidden; /* flip 类特效必须 */
+  transform-style: preserve-3d;
 }
 .cover-inner img,
 .cover-inner video {
@@ -728,34 +796,75 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   display: block;
 }
 .cover-inner video { position: absolute; inset: 0; }
-/* 中央卡换入动效（切换效果可在设置中选择，作用于 inner，不与卡片位移动画打架） */
-.cover-inner.cover-pop { animation-duration: .6s; animation-timing-function: cubic-bezier(.22,.61,.36,1); animation-fill-mode: backwards; }
-.cover-inner.cover-pop.fx-zoom   { animation-name: coverPop; }
-.cover-inner.cover-pop.fx-flip   { animation-name: coverFlip; }
-.cover-inner.cover-pop.fx-slide  { animation-name: coverSlide; }
-.cover-inner.cover-pop.fx-fade   { animation-name: coverFade; }
-.cover-inner.cover-pop.fx-rotate { animation-name: coverRotate; }
+/* 中央卡换入动效：与位移动画错峰 0.12s（先滑到中央，再播特效），时长 0.8s 更易看清 */
+.cover-inner.cover-pop {
+  animation-duration: .8s;
+  animation-delay: .12s;
+  animation-timing-function: cubic-bezier(.25,.8,.3,1);
+  animation-fill-mode: backwards; /* delay 期间用 0% 帧样式，不会出现"先到中央再突变" */
+  will-change: transform, opacity, filter;
+}
+.cover-inner.cover-pop.fx-zoom     { animation-name: coverPop; }
+.cover-inner.cover-pop.fx-flip     { animation-name: coverFlip; }
+.cover-inner.cover-pop.fx-slide    { animation-name: coverSlide; }
+.cover-inner.cover-pop.fx-fade     { animation-name: coverFade; }
+.cover-inner.cover-pop.fx-rotate   { animation-name: coverRotate; }
+.cover-inner.cover-pop.fx-zoomBlur { animation-name: coverZoomBlur; }
+.cover-inner.cover-pop.fx-slideUp  { animation-name: coverSlideUp; }
+.cover-inner.cover-pop.fx-flipX    { animation-name: coverFlipX; }
+.cover-inner.cover-pop.fx-elastic  { animation-name: coverElastic; }
+.cover-inner.cover-pop.fx-curtain  { animation-name: coverCurtain; }
+.cover-inner.cover-pop.fx-glow     { animation-name: coverGlow; }
 @keyframes coverPop {
-  0%   { transform: scale(.8); opacity: .2; }
-  55%  { transform: scale(1.06); opacity: 1; }
+  0%   { transform: scale(.45); opacity: 0; }
+  60%  { transform: scale(1.12); opacity: 1; }
   100% { transform: scale(1); opacity: 1; }
 }
 @keyframes coverFlip {
-  0%   { transform: rotateY(80deg) scale(.9); opacity: 0; }
+  0%   { transform: rotateY(90deg) scale(.85); opacity: 0; }
+  60%  { transform: rotateY(-8deg) scale(1.02); opacity: 1; }
   100% { transform: rotateY(0) scale(1); opacity: 1; }
 }
 @keyframes coverSlide {
-  0%   { transform: translateX(18%) scale(.92); opacity: 0; }
+  0%   { transform: translateX(60%) scale(.9); opacity: 0; }
   100% { transform: translateX(0) scale(1); opacity: 1; }
 }
 @keyframes coverFade {
-  0%   { opacity: 0; }
-  100% { opacity: 1; }
+  0%   { opacity: 0; transform: scale(.92); }
+  100% { opacity: 1; transform: scale(1); }
 }
 @keyframes coverRotate {
-  0%   { transform: rotateZ(-8deg) scale(.82); opacity: 0; }
-  60%  { transform: rotateZ(2deg) scale(1.04); opacity: 1; }
+  0%   { transform: rotateZ(-18deg) scale(.6); opacity: 0; }
+  60%  { transform: rotateZ(4deg) scale(1.05); opacity: 1; }
   100% { transform: rotateZ(0) scale(1); opacity: 1; }
+}
+@keyframes coverZoomBlur {
+  0%   { transform: scale(1.5); opacity: 0; filter: blur(24px); }
+  100% { transform: scale(1); opacity: 1; filter: blur(0); }
+}
+@keyframes coverSlideUp {
+  0%   { transform: translateY(60%) scale(.85); opacity: 0; }
+  100% { transform: translateY(0) scale(1); opacity: 1; }
+}
+@keyframes coverFlipX {
+  0%   { transform: rotateX(90deg) scale(.8); opacity: 0; }
+  60%  { transform: rotateX(-10deg) scale(1.02); opacity: 1; }
+  100% { transform: rotateX(0) scale(1); opacity: 1; }
+}
+@keyframes coverElastic {
+  0%   { transform: scale(.3); opacity: 0; }
+  50%  { transform: scale(1.15); opacity: 1; }
+  70%  { transform: scale(.92); }
+  100% { transform: scale(1); opacity: 1; }
+}
+@keyframes coverCurtain {
+  0%   { clip-path: inset(0 50% 0 50%); opacity: .2; }
+  100% { clip-path: inset(0 0 0 0); opacity: 1; }
+}
+@keyframes coverGlow {
+  0%   { opacity: 0; filter: brightness(3) saturate(0) blur(6px); }
+  60%  { opacity: 1; filter: brightness(1.6) saturate(1.4); }
+  100% { opacity: 1; filter: brightness(1) saturate(1); }
 }
 
 /* 快捷键行 */
@@ -1087,7 +1196,7 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   background: var(--panel);
   border: 1px solid var(--border);
   cursor: pointer;
-  transition: color .15s, border-color .15s, background .15s;
+  transition: color .15s, border-color .15s, background .15s, box-shadow .2s;
 }
 .titlebar-btn:hover { color: var(--text); border-color: var(--accent); }
 .titlebar-btn:active { transform: scale(0.92); }
@@ -1112,6 +1221,9 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   border-color: var(--accent);
   filter: hue-rotate(180deg) saturate(1.4) brightness(1.12);
+  /* L343：悬浮发光（filter 使光晕随按钮呈现互补色） */
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 65%, transparent),
+              inset 0 0 4px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 /* 最小化：绿 */
 #btnMin { color: #3fb950; border-color: rgba(63,185,80,.45); }
@@ -1128,8 +1240,26 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
 
 .tree-node.dragging { opacity: .45; }
 
-/* L123：工具栏自动播放按钮点亮态（线框+中间透明，点亮显关键色） */
-.tool-ico.on { color: var(--accent); }
+/* L318-10/L337：收藏夹双列显示——minmax(0,1fr) 保证两列宽度严格平均 */
+#favList.cols-2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2px 6px;
+}
+#favList.cols-2 .tree-node {
+  font-size: 12px;
+  padding: 3px 6px;
+  min-width: 0; /* 允许内容收缩，避免长名称撑破等宽布局 */
+}
+#favList.collapsed { display: none; }
+
+/* L123/L318-9：工具栏自动播放按钮点亮态（图标+线框关键色，中间半透明） */
+.tool-ico.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb), .2);
+  box-shadow: 0 0 6px rgba(var(--accent-rgb), .3);
+}
 
 /* 欢迎空态 */
 /* L132：空白首页 —— 顶部磁盘栏 + 居中欢迎内容 */
@@ -1534,4 +1664,119 @@ body.immersive #immersionBar { display: flex; }
   }
   .rv-buf-indeterminate { width: 100% !important; opacity: 0.45; }
 }
+
+/* ═══════════════ L229/L245/L253：目录树标题旁磁盘「卷标+盘符」 ═══════════════ */
+#treeDriveHint {
+  color: var(--text-dim);
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+#treeDriveHint .tdh-label { color: var(--text); opacity: .8; max-width: 7em; overflow: hidden; text-overflow: ellipsis; }
+/* L253：盘符统一关键色、常规字重（不再粗体、不按盘配色） */
+#treeDriveHint .tdh-letter { color: var(--accent); font-weight: 600; margin-left: 4px; font-size: 12px; }
+.tree-drive-letter {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: .5px;
+  color: var(--accent);
+}
+
+/* ═══════════════ L230：选中目录的「穿透」按钮 ═══════════════ */
+.tree-penetrate {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: none;
+  align-items: center; justify-content: center;
+  width: 20px; height: 20px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  background: transparent;
+  cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.tree-penetrate svg { width: 15px; height: 15px; }
+.tree-node:hover .tree-penetrate,
+.tree-node.active .tree-penetrate { display: inline-flex; }
+.tree-penetrate:hover { color: var(--accent); background: rgba(var(--accent-rgb), .14); }
+.tree-penetrate.on {
+  color: #fff;
+  background: rgba(var(--accent-rgb), .85);
+  border-color: rgba(var(--accent-rgb), .9);
+}
+
+/* ═══════════════ L236：画廊行优先布局（先左→右，再上→下） ═══════════════ */
+.gallery-rows {
+  position: relative;
+  width: 100%;
+  padding: 14px;
+}
+.gallery-rows > .media-card {
+  position: absolute;
+  margin: 0;
+  transition: left .16s ease-out, top .16s ease-out,
+              width .16s ease-out, height .16s ease-out;
+}
+/* Ctrl+滚轮缩放期间禁用过渡，避免几何读到中间值导致卡片/视频不同步 */
+.gallery-rows.no-anim > .media-card { transition: none; }
+
+/* ═══════════════ L233：图片竖排缩放控制条（悬浮显示） ═══════════════ */
+/* 总览图隐藏（未缩放）时仍保留右下角热区，悬浮即可呼出缩放条 */
+#imgDock { min-width: 30px; min-height: 30px; }
+#imgZoomBar {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .18s ease;
+}
+#imgDock:hover #imgZoomBar,
+#imgDock[data-zoom="1"] #imgZoomBar {
+  opacity: 1;
+  pointer-events: auto;
+}
+.img-zoom-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px;
+  border-radius: 7px;
+  color: rgba(255,255,255,.85);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.img-zoom-btn:hover { background: rgba(255,255,255,.16); color: #fff; }
+.img-zoom-btn svg { width: 13px; height: 13px; }
+.img-vrange {
+  -webkit-appearance: none;
+  appearance: none;
+  writing-mode: vertical-lr;   /* Chromium 竖排滑块 */
+  direction: rtl;             /* 大值朝上 */
+  width: 4px;
+  height: 112px;
+  margin: 2px 0;
+  background: rgba(255,255,255,.2);
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+}
+.img-vrange::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  border: none;
+  box-shadow: 0 1px 4px rgba(0,0,0,.55);
+  cursor: pointer;
+}
+
+/* ═══════════════ L241：鼠标静止自动隐藏指针 ═══════════════ */
+body.cursor-idle,
+body.cursor-idle * {
+  cursor: none !important;
+}
+
 

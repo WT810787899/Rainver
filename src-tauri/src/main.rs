@@ -57,6 +57,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             fs::list_directory,             // 扫描目录 → MediaItem 列表
+            fs::list_directory_deep,        // L230：穿透递归扫描
             fs::list_subfolders,            // 侧边树：子文件夹
             fs::pick_and_list,              // 选择根目录并扫描
             fs::list_drives,                // 磁盘根列表
@@ -114,6 +115,7 @@ fn main() {
             files::write_collection_box,    // L88：写入编号集锦箱
             files::rename_item,             // 重命名文件/文件夹
             files::save_screenshot,         // 保存截图
+            files::capture_window,          // L240：截取窗口画面（非视频截图）
         ])
 
         .setup(|app| {

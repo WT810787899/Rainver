@@ -455,6 +455,170 @@ pub async fn save_screenshot(path: String, data: Vec<u8>) -> Result<String, Stri
     Ok(p.to_string_lossy().into_owned())
 }
 
+/// L240：截取主窗口客户区画面（非视频场景的「其他截图」），返回 PNG 字节
+/// Windows：PrintWindow(PW_RENDERFULLCONTENT) 优先（兼容 DWM/合成窗口），
+/// 全黑时回退到窗口 DC BitBlt；其他平台暂不支持
+#[tauri::command]
+pub fn capture_window(app: tauri::AppHandle) -> Result<Vec<u8>, String> {
+    #[cfg(windows)]
+    {
+        capture_window_win(&app)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("窗口截图仅支持 Windows".into())
+    }
+}
+
+#[cfg(windows)]
+fn capture_window_win(app: &tauri::AppHandle) -> Result<Vec<u8>, String> {
+    use tauri::Manager;
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS, HGDIOBJ, RGBQUAD, SRCCOPY,
+    };
+    // 注意：windows 0.61 元数据把 PrintWindow 放在 Storage::Xps（feature = Win32_Storage_Xps）
+    use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "未找到主窗口".to_string())?;
+    let hwnd = win.hwnd().map_err(|e| format!("获取窗口句柄失败: {e}"))?;
+
+    unsafe {
+        let mut rc = windows::Win32::Foundation::RECT::default();
+        GetClientRect(hwnd, &mut rc).map_err(|e| format!("GetClientRect 失败: {e}"))?;
+        let w = rc.right - rc.left;
+        let h = rc.bottom - rc.top;
+        if w <= 0 || h <= 0 {
+            return Err("窗口客户区尺寸无效".into());
+        }
+        let (w32, h32) = (w as u32, h as u32);
+
+        let hdc_win = GetDC(Some(hwnd));
+        if hdc_win.is_invalid() {
+            return Err("GetDC 失败".into());
+        }
+        let hdc_mem = CreateCompatibleDC(Some(hdc_win));
+        if hdc_mem.is_invalid() {
+            ReleaseDC(Some(hwnd), hdc_win);
+            return Err("CreateCompatibleDC 失败".into());
+        }
+        let hbmp = CreateCompatibleBitmap(hdc_win, w, h);
+        if hbmp.is_invalid() {
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(Some(hwnd), hdc_win);
+            return Err("CreateCompatibleBitmap 失败".into());
+        }
+        let old_obj = SelectObject(hdc_mem, HGDIOBJ(hbmp.0));
+        if old_obj.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(hbmp.0));
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(Some(hwnd), hdc_win);
+            return Err("SelectObject 失败".into());
+        }
+
+        // PW_RENDERFULLCONTENT = 2：对 DirectComposition / WebView 一类窗口更有效
+        let printed = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(2)).as_bool();
+        if !printed
+            && BitBlt(hdc_mem, 0, 0, w, h, Some(hdc_win), 0, 0, SRCCOPY).is_err()
+        {
+            let _ = SelectObject(hdc_mem, old_obj);
+            let _ = DeleteObject(HGDIOBJ(hbmp.0));
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(Some(hwnd), hdc_win);
+            return Err("BitBlt 失败".into());
+        }
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: h, // 正数 = bottom-up
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD::default()],
+        };
+        let mut buf = vec![0u8; (w32 * h32 * 4) as usize];
+        let copied = GetDIBits(
+            hdc_mem,
+            hbmp,
+            0,
+            h32,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        if copied != h as i32 {
+            let _ = SelectObject(hdc_mem, old_obj);
+            let _ = DeleteObject(HGDIOBJ(hbmp.0));
+            let _ = DeleteDC(hdc_mem);
+            ReleaseDC(Some(hwnd), hdc_win);
+            return Err(format!("GetDIBits 失败：{copied}"));
+        }
+
+        // PrintWindow 偶发返回成功但画面全黑（硬件加速合成）→ 回退 BitBlt 窗口 DC
+        if buf.iter().all(|&b| b == 0)
+            && BitBlt(hdc_mem, 0, 0, w, h, Some(hdc_win), 0, 0, SRCCOPY).is_ok()
+        {
+            let copied2 = GetDIBits(
+                hdc_mem,
+                hbmp,
+                0,
+                h32,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            if copied2 != h as i32 {
+                let _ = SelectObject(hdc_mem, old_obj);
+                let _ = DeleteObject(HGDIOBJ(hbmp.0));
+                let _ = DeleteDC(hdc_mem);
+                ReleaseDC(Some(hwnd), hdc_win);
+                return Err("窗口画面抓取失败（全黑）".into());
+            }
+        }
+
+        // BGRA(bottom-up) → RGBA(top-down)
+        let mut rgba = vec![0u8; (w32 * h32 * 4) as usize];
+        for row in 0..h32 as usize {
+            let src_row = (h as usize - 1 - row) * (w as usize) * 4;
+            let dst_row = row * (w as usize) * 4;
+            for x in 0..w as usize {
+                let s = src_row + x * 4;
+                let d = dst_row + x * 4;
+                rgba[d] = buf[s + 2]; // R
+                rgba[d + 1] = buf[s + 1]; // G
+                rgba[d + 2] = buf[s]; // B
+                rgba[d + 3] = 255;
+            }
+        }
+
+        let _ = SelectObject(hdc_mem, old_obj);
+        let _ = DeleteObject(HGDIOBJ(hbmp.0));
+        let _ = DeleteDC(hdc_mem);
+        ReleaseDC(Some(hwnd), hdc_win);
+
+        let img = image::RgbaImage::from_raw(w32, h32, rgba)
+            .ok_or_else(|| "组装截图图像失败".to_string())?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .map_err(|e| format!("PNG 编码失败: {e}"))?;
+        Ok(out.into_inner())
+    }
+}
+
 /// 拖入文件区：以「复制」方式把路径列表复制进目标目录（文件夹递归）
 #[tauri::command]
 pub async fn copy_files_into(srcs: Vec<String>, dest_dir: String) -> Result<u32, String> {

@@ -11,7 +11,7 @@
        是「取交集」，两边都得放行，所以两处都要改。 -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://rvframe.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
-  <link rel="stylesheet" href="style.css?v=20" />
+  <link rel="stylesheet" href="style.css?v=43" />
 </head>
 <body class="h-screen w-screen overflow-hidden select-none bg-transparent text-slate-800 dark:text-slate-200">
 
@@ -28,8 +28,9 @@
         <path d="M12 2C8 7 4 10.5 4 15a8 8 0 1 0 16 0c0-4.5-4-8-8-13z"/>
       </svg>
       <span class="font-semibold text-sm tracking-wide">Rainver 落雨影音</span>
-      <span id="statusText" class="text-xs opacity-60 truncate max-w-xs"></span>
     </div>
+    <!-- L318-6：日志文本显示区域移到顶栏中间往右 200px -->
+    <span id="statusText" class="text-xs opacity-60 truncate max-w-xs pointer-events-none absolute" style="left:calc(50% + 200px);transform:translateX(0)"></span>
     <!-- LOGO 旁：全屏（关键色描边）+ 音乐按钮（拉开约三键距，竖线隔开） -->
     <div class="flex items-center gap-1 pointer-events-auto">
       <button id="btnFull" title="全屏 / 退出全屏 (Shift+F)" class="titlebar-btn titlebar-btn-accent">
@@ -96,11 +97,20 @@
                                border-b border-white/20 dark:border-white/5"></div>
 
       <div class="p-3 pb-1 flex items-center justify-between">
-        <span class="text-xs font-semibold uppercase tracking-wider opacity-60">收藏文件夹</span>
-        <button id="btnAddFav" title="收藏当前目录" class="btn-fav btn-fav-star">
-          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="#facc15" stroke="#eab308" stroke-width="1"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>
-          <span>收藏</span>
+        <!-- L337：点击标题收起/展开收藏夹 -->
+        <button id="favToggle" class="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider opacity-60 hover:opacity-100 shrink-0">
+          <span id="favArrow" class="inline-block w-3">▾</span><span>收藏文件夹</span>
         </button>
+        <div class="flex items-center gap-1">
+          <!-- L318-10：收藏夹单列/双列切换按钮（关键色，靠近收藏按钮） -->
+          <button id="favColsBtn" title="切换单列/双列显示" class="btn-fav btn-col" style="color:var(--accent);border-color:var(--accent)">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/></svg>
+          </button>
+          <button id="btnAddFav" title="收藏当前目录" class="btn-fav btn-fav-star">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="#facc15" stroke="#eab308" stroke-width="1"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>
+            <span>收藏</span>
+          </button>
+        </div>
       </div>
       <div id="favList" class="px-2 pb-2 text-sm" title="可将目录树节点拖到此处收藏"></div>
 
@@ -123,16 +133,20 @@
           <button id="collectionViewBtn" title="切换 列表/图标 视图" class="btn-fav btn-col">
             <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
           </button>
+          <!-- L334：进入集锦箱按钮——爱心图标，尺寸同收藏按钮；进入态实心 -->
           <button id="collectionModeBtn" title="进入集锦箱模式（文件区显示收藏文件）" class="btn-fav btn-col-enter">
-            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg>
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>
+            <span>集锦</span>
           </button>
         </div>
       </div>
       <div id="collectionList" class="px-2 pb-2 text-sm"></div>
 
-      <div class="px-3 pb-1 border-t border-white/20 dark:border-white/5 pt-2 flex items-center justify-between">
-        <span class="text-xs font-semibold uppercase tracking-wider opacity-60">目录树</span>
-        <button id="btnRefresh" title="刷新当前目录" class="chip">刷新</button>
+      <div class="px-3 pb-1 border-t border-white/20 dark:border-white/5 pt-2 flex items-center gap-2">
+        <span id="treeTitle" class="text-xs font-semibold uppercase tracking-wider opacity-60 shrink-0 cursor-pointer hover:opacity-100">目录树</span>
+        <!-- L229/L245：当前选中目录所属磁盘「卷标 + 盘符」（紧挨标题，仅隔一点距离） -->
+        <span id="treeDriveHint"></span>
+        <button id="btnRefresh" title="刷新当前目录" class="chip shrink-0 ml-auto">刷新</button>
       </div>
       <div id="folderTree" class="flex-1 overflow-y-auto px-2 pb-3 text-sm"></div>
     </aside>
@@ -156,11 +170,15 @@
         <button id="btnUp" title="返回上级" class="tool-ico">
           <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
         </button>
-        <button id="btnOpenRoot" title="选择根目录文件夹" class="tool-ico glow-accent">
-          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <!-- L342：首页按钮——接管原「选择根目录文件夹」按钮的位置与发光样式（图标保留房子），原按钮删除 -->
+        <button id="btnHome" title="首页" class="tool-ico glow-accent">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9 21v-6h6v6"/></svg>
         </button>
         <!-- 面包屑 -->
         <div id="breadcrumb" class="flex-1 flex items-center gap-0.5 text-xs overflow-x-auto whitespace-nowrap opacity-80"></div>
+
+        <!-- 搜索（L256：移至自动播放按钮左侧） -->
+        <input id="searchInput" type="text" placeholder="搜索… (Ctrl+F)" class="tool-search w-36" />
 
         <!-- L123：自动播放开关（线框+中间透明，点亮显关键色） -->
         <button id="btnAutoplay" title="自动播放" class="tool-ico">
@@ -185,16 +203,14 @@
           <option value="modifiedDesc">修改时间 ↓</option>
           <option value="modifiedAsc">修改时间 ↑</option>
         </select>
-        <!-- 搜索 -->
-        <input id="searchInput" type="text" placeholder="搜索… (Ctrl+F)" class="tool-search w-36" />
         <!-- 视图切换 -->
         <div class="viewSeg">
           <button data-view="grid"   class="viewBtn">网格</button>
           <button data-view="list"   class="viewBtn">列表</button>
           <button data-view="gallery" class="viewBtn">画廊</button>
         </div>
-        <!-- 缩放滑块（画廊最大可放大到单列 1 张） -->
-        <input id="zoomSlider" type="range" min="60" max="300" value="160" step="10"
+        <!-- 画廊缩放滑块 --> 
+        <input id="zoomSlider" type="range" min="60" max="200" value="160" step="10"
                class="w-24" title="缩略图大小" />
         <!-- 信息面板开关 -->
         <button id="btnInfoPanel" title="元信息面板 (Ctrl+I)" class="tool-ico">
@@ -305,12 +321,27 @@
       <span id="viewerZoomBadge" class="hidden absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full
                  bg-black/60 text-white/80 text-xs backdrop-blur pointer-events-none"></span>
 
-      <!-- 图片总览图：右下角，缩放时显示（可点击/拖动定位） -->
-      <div id="imgMinimap" class="hidden absolute right-4 bottom-5 z-20">
-        <div class="relative overflow-hidden rounded-xl border border-white/15 bg-black/55
-                    backdrop-blur-md shadow-[0_8px_28px_rgba(0,0,0,.55)]">
-          <img id="minimapImg" alt="" draggable="false" class="block max-w-none" />
-          <div id="minimapView" class="absolute cursor-move"></div>
+      <!-- L233/L248：图片右下角停靠区：缩放总览图 + 竖排缩放控制条（最右侧，悬浮显示） -->
+      <div id="imgDock" class="hidden absolute right-3 bottom-5 z-20 flex items-end gap-2">
+        <!-- 图片总览图：缩放时显示（可点击/拖动定位） -->
+        <div id="imgMinimap" class="hidden">
+          <div class="relative overflow-hidden rounded-xl border border-white/15 bg-black/55
+                      backdrop-blur-md shadow-[0_8px_28px_rgba(0,0,0,.55)]">
+            <img id="minimapImg" alt="" draggable="false" class="block max-w-none" />
+            <div id="minimapView" class="absolute cursor-move"></div>
+          </div>
+        </div>
+        <!-- 竖排缩放控制条：默认隐藏，鼠标悬浮停靠区或图片已缩放时显示 -->
+        <div id="imgZoomBar" class="flex flex-col items-center gap-1.5 py-2 px-1 rounded-2xl
+                    border border-white/15 bg-black/55 backdrop-blur-md shadow-[0_8px_28px_rgba(0,0,0,.55)]">
+          <button id="imgZoomIn" title="放大" class="img-zoom-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <input id="imgZoomRange" type="range" min="0" max="100" value="0" class="img-vrange" title="缩放" />
+          <button id="imgZoomOut" title="缩小" class="img-zoom-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M5 12h14"/></svg>
+          </button>
+          <button id="imgZoomReset" title="重置缩放 (0)" class="img-zoom-btn !px-0 !py-0 text-[10px] leading-none">1:1</button>
         </div>
       </div>
 
@@ -362,7 +393,7 @@
             <button id="videoInfo" title="解码信息" class="player-ctl player-ctl-sm">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5"/><circle cx="12" cy="8" r="0.6" fill="currentColor"/></svg>
             </button>
-            <button id="videoMute" title="静音 (M)" class="player-ctl player-ctl-sm">
+            <button id="videoMute" title="静音" class="player-ctl player-ctl-sm">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>
             </button>
             <input id="videoVol" type="range" min="0" max="100" value="100" class="player-vol" />
@@ -373,6 +404,14 @@
               <option value="0.5">0.5×</option><option value="0.75">0.75×</option>
               <option value="1" selected>1×</option><option value="1.25">1.25×</option>
               <option value="1.5">1.5×</option><option value="2">2×</option>
+            </select>
+            <!-- L235：画面缩放 -->
+            <select id="videoZoom" title="画面缩放" class="player-select">
+              <option value="0.5">缩放0.5×</option>
+              <option value="1" selected>缩放1×</option>
+              <option value="1.5">缩放1.5×</option>
+              <option value="2">缩放2×</option>
+              <option value="4">缩放4×</option>
             </select>
             <!-- L151：原循环播放按钮已删除（功能与播放模式重合），播放模式按钮移到该位置 -->
             <button id="videoPlayMode" title="顺序播放" class="player-ctl player-ctl-sm"></button>
@@ -516,10 +555,12 @@
           <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
         </button>
       </div>
-      <!-- TAB 标签栏 -->
+      <!-- TAB 标签栏（L338：重新梳理分类） -->
       <div class="shrink-0 flex px-4 pt-2 gap-1 border-b border-white/20 dark:border-white/5">
         <button data-tab="appearance" class="settingsTab">外观</button>
-        <button data-tab="behavior"   class="settingsTab">行为</button>
+        <button data-tab="gallery"    class="settingsTab">画廊</button>
+        <button data-tab="playback"   class="settingsTab">播放</button>
+        <button data-tab="ui"         class="settingsTab">界面</button>
         <button data-tab="system"     class="settingsTab">系统</button>
         <button data-tab="shortcuts"  class="settingsTab">快捷键</button>
         <button data-tab="about"      class="settingsTab">关于</button>
@@ -590,10 +631,18 @@
             <label>强调色</label>
             <input id="setAccent" type="color" class="w-10 h-7 rounded cursor-pointer bg-transparent border-0" />
           </div>
+          <!-- L239：把当前深/浅两套外观参数存为默认 / 恢复已保存的默认 -->
+          <div class="settingsRow">
+            <label>默认外观（深/浅两套参数）</label>
+            <div class="flex items-center gap-2">
+              <button id="btnSaveAppearanceDefault" class="settingsBtn">存为默认外观</button>
+              <button id="btnRestoreAppearanceDefault" class="settingsBtn">恢复默认外观</button>
+            </div>
+          </div>
         </div>
 
-        <!-- ── TAB 行为：浏览与预览交互 ── -->
-        <div id="tab-behavior" class="settingsPage hidden space-y-5">
+        <!-- ── TAB 画廊（L338）：画廊视图的排列、滚动与自动播放 ── -->
+        <div id="tab-gallery" class="settingsPage hidden space-y-5">
           <div class="settingsRow">
             <label>视频自动播放（画廊预览）</label>
             <button id="setVideoAutoplay" class="settingsToggle"></button>
@@ -620,6 +669,10 @@
             <label>虚拟滚动预渲染行数</label>
             <input id="setOverscan" type="number" min="1" max="20" step="1" class="settingsInput w-20" />
           </div>
+        </div>
+
+        <!-- ── TAB 播放（L338）：预览器交互、音量、跳转、截屏 ── -->
+        <div id="tab-playback" class="settingsPage hidden space-y-5">
           <div class="settingsRow">
             <label>双击媒体项行为</label>
             <select id="setDblClick" class="settingsSelect">
@@ -643,15 +696,30 @@
             </select>
           </div>
           <div class="settingsRow">
-            <label>视频截图快捷键</label>
+            <label>画廊卡片音量（Ctrl+M 取消静音时）</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="setCardVolume" type="range" min="0" max="100" step="1" class="w-48" />
+              <span id="setCardVolumeVal" class="w-10 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>截屏快捷键（视频截原始帧，其他截窗口）</label>
             <input id="setScreenshotHotkey" type="text" class="settingsInput w-24" placeholder="F11" />
           </div>
           <div class="settingsRow">
-            <label>截图保存路径</label>
+            <label>截屏保存路径</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
               <span id="setScreenshotDir" class="opacity-70 truncate max-w-[200px]">默认（项目/screenshots）</span>
               <button id="setScreenshotDirPick" class="settingsBtn">选择…</button>
             </div>
+          </div>
+        </div>
+
+        <!-- ── TAB 界面（L338）：指针、沉浸模式、目录树显示项 ── -->
+        <div id="tab-ui" class="settingsPage hidden space-y-5">
+          <div class="settingsRow">
+            <label>鼠标静止时自动隐藏指针</label>
+            <button id="setHideCursor" class="settingsToggle"></button>
           </div>
           <div class="settingsRow">
             <label>进入沉浸模式自动全屏</label>
@@ -660,6 +728,19 @@
           <div class="settingsRow">
             <label>目录树显示子文件夹数量</label>
             <button id="setTreeCount" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>目录树隐藏系统文件夹</label>
+            <button id="setTreeHideSystem" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>目录树显示隐藏文件夹</label>
+            <button id="setTreeShowHidden" class="settingsToggle"></button>
+          </div>
+          <!-- L341：列表视图信息列开关 -->
+          <div class="settingsRow">
+            <label>列表视图显示 修改时间 / 分辨率 / 时长</label>
+            <button id="setListMeta" class="settingsToggle"></button>
           </div>
         </div>
 
@@ -763,7 +844,7 @@
       <div class="shrink-0 flex px-3 pt-2 gap-1 border-b border-white/20 dark:border-white/5 overflow-x-auto">
         <button data-perf="waterfall" class="settingsTab perfTab">瀑布流</button>
         <button data-perf="cards"     class="settingsTab perfTab">卡片动画</button>
-        <button data-perf="array"     class="settingsTab perfTab">随机阵列</button>
+        <button data-perf="array"     class="settingsTab perfTab">阵列图案</button>
         <button data-perf="slideshow" class="settingsTab perfTab">幻灯片</button>
         <button data-perf="cover"     class="settingsTab perfTab">封面流</button>
       </div>
@@ -771,31 +852,45 @@
         <!-- ── 模式1：瀑布流 ── -->
         <div id="perf-waterfall" class="perfPage space-y-5">
           <div class="settingsRow">
+            <label>滚动方式</label>
+            <select id="perfWfScrollMode" class="settingsSelect">
+              <option value="smooth">平滑滚动</option>
+              <option value="jump">随机跳动</option>
+            </select>
+          </div>
+          <div class="settingsRow">
             <label>滚动速度</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
               <input id="perfWfSpeed" type="range" min="20" max="800" step="10" class="w-44" />
               <span id="perfWfSpeedVal" class="w-14 text-right opacity-70"></span>
             </div>
           </div>
-          <div class="settingsRow">
+          <div class="settingsRow" id="perfWfDirectionRow">
             <label>滚动方向</label>
             <select id="perfWfDirection" class="settingsSelect">
               <option value="down">由上至下</option>
               <option value="up">由下至上</option>
             </select>
           </div>
-          <div class="settingsRow">
+          <div class="settingsRow" id="perfWfBottomRow">
             <label>触底模式</label>
             <select id="perfWfBottom" class="settingsSelect">
               <option value="bounce">回弹</option>
               <option value="restart">从头</option>
             </select>
           </div>
-          <div class="settingsRow">
+          <div class="settingsRow" id="perfWfDwellRow">
             <label>触底停留</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
               <input id="perfWfDwell" type="range" min="0" max="5" step="0.5" class="w-44" />
               <span id="perfWfDwellVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow" id="perfWfJumpSpeedRow">
+            <label>跳动速度</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfWfJumpSpeed" type="range" min="0.5" max="10" step="0.5" class="w-44" />
+              <span id="perfWfJumpSpeedVal" class="w-12 text-right opacity-70"></span>
             </div>
           </div>
         </div>
@@ -804,6 +899,18 @@
           <div class="settingsRow">
             <label>同时显示数量（0 = 跟随缩放）</label>
             <input id="perfCardsCount" type="number" min="0" max="24" step="1" class="settingsInput w-20" />
+          </div>
+          <div class="settingsRow">
+            <label>随机数量</label>
+            <button id="perfCardsRandomCount" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow" id="perfCardsCountRangeRow">
+            <label>数量范围</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfCardsCountMin" type="number" min="1" max="50" step="1" class="settingsInput w-20" title="下限" />
+              <span class="opacity-50">–</span>
+              <input id="perfCardsCountMax" type="number" min="1" max="50" step="1" class="settingsInput w-20" title="上限" />
+            </div>
           </div>
           <div class="settingsRow">
             <label>切换速度</label>
@@ -823,7 +930,28 @@
               <option value="fade">淡入淡出</option>
               <option value="zoomOut">放大落位</option>
               <option value="slideUp">上滑入场</option>
+              <option value="slideDown">下滑入场</option>
+              <option value="slideLeft">左滑入场</option>
+              <option value="slideRight">右滑入场</option>
               <option value="blur">模糊清晰</option>
+              <option value="rotateIn">旋转进入</option>
+              <option value="expand">中心展开</option>
+              <option value="swing">摆入归位</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>随机动画（每卡独立）</label>
+            <button id="perfCardsRandomFx" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>随机图片（完全随机，不按顺序）</label>
+            <button id="perfCardsRandom" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>显示优先级</label>
+            <select id="perfCardsFit" class="settingsSelect perfFitSelect">
+              <option value="full">完整显示</option>
+              <option value="fill">铺满屏幕</option>
             </select>
           </div>
           <div class="settingsRow">
@@ -847,23 +975,43 @@
             </div>
           </div>
         </div>
-        <!-- ── 模式3：随机阵列 ── -->
+        <!-- ── 模式3：阵列图案 ── -->
         <div id="perf-array" class="perfPage hidden space-y-5">
           <div class="settingsRow">
-            <label>跳动速度</label>
+            <label>切换速度</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
               <input id="perfArrayInterval" type="range" min="0.5" max="10" step="0.5" class="w-44" />
               <span id="perfArrayIntervalVal" class="w-12 text-right opacity-70"></span>
             </div>
           </div>
-          <p class="text-xs opacity-50 leading-relaxed">视口随机快切跳动，优先跳到不显示当前视口卡片的位置；卡片不足一屏时忽略该条件。</p>
+          <div class="settingsRow">
+            <label>入场动画类型</label>
+            <select id="perfArrayAnim" class="settingsSelect">
+              <option value="zoomIn">缩放进场</option>
+              <option value="fade">淡入淡出</option>
+              <option value="zoomOut">放大落位</option>
+              <option value="slideUp">上滑入场</option>
+              <option value="slideDown">下滑入场</option>
+              <option value="slideLeft">左滑入场</option>
+              <option value="slideRight">右滑入场</option>
+              <option value="blur">模糊清晰</option>
+              <option value="rotateIn">旋转进入</option>
+              <option value="expand">中心展开</option>
+              <option value="swing">摆入归位</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>随机动画（每卡独立）</label>
+            <button id="perfArrayRandomFx" class="settingsToggle"></button>
+          </div>
+          <p class="text-xs opacity-50 leading-relaxed">卡片随机排列成整齐图案：网格、行列、簇拥、菱形等，每次布局不同。</p>
         </div>
         <!-- ── 模式4：幻灯片 ── -->
         <div id="perf-slideshow" class="perfPage hidden space-y-5">
           <div class="settingsRow">
             <label>同屏张数</label>
             <select id="perfSlideCount" class="settingsSelect">
-              <option value="0">自动（竖屏 2 张 · 横屏 1 张）</option>
+              <option value="0">自动（竖版媒体 2 张 · 横版媒体 1 张）</option>
               <option value="1">1 张（全屏大图）</option>
               <option value="2">2 张（按屏幕方向并排）</option>
             </select>
@@ -894,6 +1042,10 @@
             <button id="perfSlideRandomFx" class="settingsToggle"></button>
           </div>
           <div class="settingsRow">
+            <label>随机图片（完全随机，不按顺序）</label>
+            <button id="perfSlideRandom" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
             <label>过渡时长</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
               <input id="perfSlideDuration" type="range" min="0.2" max="3" step="0.1" class="w-44" />
@@ -912,6 +1064,14 @@
             </div>
           </div>
           <div class="settingsRow">
+            <label>侧边卡片数量</label>
+            <select id="perfCoverSideCount" class="settingsSelect">
+              <option value="2">2 张</option>
+              <option value="3">3 张</option>
+              <option value="4">4 张</option>
+            </select>
+          </div>
+          <div class="settingsRow">
             <label>卡片切换效果</label>
             <select id="perfCoverEffect" class="settingsSelect">
               <option value="zoom">缩放落位</option>
@@ -919,7 +1079,21 @@
               <option value="slide">侧滑推入</option>
               <option value="fade">淡入浮现</option>
               <option value="rotate">旋入归位</option>
+              <option value="zoomBlur">模糊缩放</option>
+              <option value="slideUp">上滑归位</option>
+              <option value="flipX">垂直翻转</option>
+              <option value="elastic">弹性落位</option>
+              <option value="curtain">幕布展开</option>
+              <option value="glow">辉光浮现</option>
             </select>
+          </div>
+          <div class="settingsRow">
+            <label>随机切换效果</label>
+            <button id="perfCoverRandomFx" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>随机图片（完全随机，不按顺序）</label>
+            <button id="perfCoverRandom" class="settingsToggle"></button>
           </div>
           <p class="text-xs opacity-50 leading-relaxed">3D 封面流：中央大图高清展示，两侧卡片斜立后退，自动向前翻转推进。</p>
         </div>
@@ -937,6 +1111,6 @@
   <!-- 画廊表演：模式2 卡片动画的全屏覆盖层（视口定格，卡片快切） -->
   <div id="perfOverlay" class="hidden fixed inset-0 z-[56] overflow-hidden"></div>
 
-  <script src="main.js?v=20" type="module"></script>
+  <script src="main.js?v=45" type="module"></script>
 </body>
 </html>

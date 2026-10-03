@@ -12,7 +12,6 @@ import { renderAboutHtml, ABOUT } from './about.js';
 const win = getCurrentWindow();
 const APP_VERSION = ABOUT.version;
 
-
 // 全局错误捕获：任何未处理异常显示在状态栏，避免静默失败难以排查
 window.addEventListener('error', (e) => {
   try { setStatus(`JS错误: ${e.message}（${e.filename?.split('/').pop()}:${e.lineno}）`, true); } catch { /* 忽略 */ }
@@ -39,6 +38,8 @@ const state = {
   infoCache: new Map(),
   treeState: new Set(),   // 展开的树节点路径
   collectionMode: false,  // 集锦箱模式：文件区显示收藏文件而非目录
+  penetrate: null,        // L230：穿透扫描中的目录路径（null = 普通单层浏览）
+  galleryVer: 0,          // L236：画廊布局版本（缩略图比例回填后 +1，触发重排）
   pendingReveal: null,    // 跳目录后待选中/滚到的文件路径（集锦箱点击定位）
   systemDark: window.matchMedia('(prefers-color-scheme: dark)').matches,
 };
@@ -62,6 +63,13 @@ $('aboutAuthor').addEventListener('click', () => {
 
 
 // ═══════════════ 启动 ═══════════════
+// L239：内置壁纸（随前端分发的 src/wallpaper.jpg）。配置里存哨兵值，
+// 应用时解析为相对 URL（不能走 convertFileSrc，那是给绝对本地路径用的）
+const BUILTIN_WALLPAPER = '__builtin_wallpaper__';
+function resolveWallpaperUrl(p) {
+  return p === BUILTIN_WALLPAPER ? './wallpaper.jpg' : convertFileSrc(p);
+}
+
 async function init() {
   try {
     state.cfg = await invoke('load_config');
@@ -89,6 +97,20 @@ async function init() {
   if (lsc.viewerNext === 'ArrowRight') lsc.viewerNext = 'd';
   // L122：沉浸模式默认快捷键 Shift+D（仅用户未自定义过时注入）
   if (!lsc.toggleImmersion) lsc.toggleImmersion = 'Shift+d';
+  // L237/L238：M 呼出音频播放器；Ctrl+M 全局卡片静音
+  if (!lsc.toggleAudioPanel) lsc.toggleAudioPanel = 'm';
+  if (!lsc.toggleCardMute) lsc.toggleCardMute = 'Ctrl+m';
+
+  // L239：首次运行把内置 wallpaper.jpg 设为默认壁纸（深浅两套均开启）
+  if (!c.wallpaperDefaultInitialized) {
+    c.wallpaperDefaultInitialized = true;
+    if (!c.wallpaperPath) c.wallpaperPath = BUILTIN_WALLPAPER;
+    c.appearanceDark = c.appearanceDark ?? {};
+    c.appearanceLight = c.appearanceLight ?? {};
+    if (c.appearanceDark.wallpaperEnabled === undefined) c.appearanceDark.wallpaperEnabled = true;
+    if (c.appearanceLight.wallpaperEnabled === undefined) c.appearanceLight.wallpaperEnabled = true;
+    saveCfg();
+  }
   // 缩略并发默认值迁移：旧默认 2 → 按 CPU 核数（多线程加载优化）；同样只在未自定义过时提升
   if (c.ffmpegConcurrency === 2) {
     c.ffmpegConcurrency = Math.max(4, Math.min(8, navigator.hardwareConcurrency || 4));
@@ -145,6 +167,22 @@ async function init() {
   // 又把存储的物理像素错当 Logical 用（HiDPI 下尺寸错误）。这里不再重复设置。
 }
 init();
+
+// ═══════════════ L241：鼠标静止自动隐藏指针 ═══════════════
+(function initIdleCursor() {
+  let timer = null;
+  const IDLE_MS = 2800;
+  const reveal = () => {
+    document.body.classList.remove('cursor-idle');
+    clearTimeout(timer);
+    if (state.cfg?.autoHideCursor === false) return; // 可在设置中关闭
+    timer = setTimeout(() => document.body.classList.add('cursor-idle'), IDLE_MS);
+  };
+  for (const ev of ['mousemove', 'mousedown', 'wheel']) {
+    window.addEventListener(ev, reveal, { passive: true });
+  }
+  reveal();
+})();
 
 // ═══════════════ 外观实时预览 ═══════════════
 /** 强调色派生变量：--accent-rgb（rgba 用）/ --accent-on（实底文字）/ --accent-text（浅色模式压暗） */
@@ -203,7 +241,7 @@ function applyAppearance() {
   const wallOn = eff('wallpaperEnabled') && c.wallpaperPath;
   if (wallOn) {
     wall.classList.remove('hidden');
-    wall.style.backgroundImage = `url(${convertFileSrc(c.wallpaperPath)})`;
+    wall.style.backgroundImage = `url(${resolveWallpaperUrl(c.wallpaperPath)})`;
     wall.style.opacity = (eff('wallpaperOpacity') ?? 1);
     const blur = eff('backgroundBlur') ?? 0;
     // L192：壁纸饱和度 / 亮度（100 = 原图）
@@ -256,6 +294,9 @@ function setActiveTab(i) {
 async function openDirectory(dir, opts = {}) {
   if (!dir) return;
   state.collectionMode = false; // L74：点击新目录时退出集锦箱模式，正常响应
+  syncCollectionModeBtn();
+  // L230：deep = 穿透扫描（递归所有子目录）；普通导航显式退出穿透
+  state.penetrate = opts.deep ? dir : null;
   // 标签页：显式新开 / 首个标签 / 覆盖当前标签（浏览器式）
   // 注意用 push 而非重新赋值，保持与 state.cfg.tabs 的同一引用
   if (opts.newTab || state.tabs.length === 0) {
@@ -271,13 +312,15 @@ async function openDirectory(dir, opts = {}) {
   renderTabs();
   setStatus('加载中…');
   try {
-    state.items = await invoke('list_directory', { path: dir });
+    state.items = opts.deep
+      ? await invoke('list_directory_deep', { path: dir })
+      : await invoke('list_directory', { path: dir });
     resetSelection();
     state.thumbFailed.clear(); // 换目录：允许重新尝试之前失败的缩略图
     renderBreadcrumb();
 
 
-    setStatus('');
+    setStatus(opts.deep ? `穿透扫描：${state.items.length} 个文件（含全部子目录）` : '');
   } catch (e) {
     setStatus('加载失败: ' + e, true);
   }
@@ -298,6 +341,8 @@ async function openDirectory(dir, opts = {}) {
   renderAudioNow();
   updateQuickDirActive(); // L43：高亮匹配的快捷入口
   revealInTree(dir).catch(() => {}); // 目录树按文件区位置自动定位选中
+  updateTreeDriveHint(dir);   // L229：标题行磁盘「卷标+盘符」
+  syncPenetrateButtons();     // L230：穿透按钮状态
 }
 
 
@@ -380,9 +425,22 @@ function invalidateRender() {
   lastRenderSig = '';
 }
 
-/** L70：画廊模式列宽（缩放滑块 → 瀑布流 column-width） */
+/** L70/L318-7：画廊模式列宽（缩放滑块 → 行高基准）
+ *  · 量化到离散区间，避免小范围滑动频繁切换每行卡片数
+ *  · 最大缩放 → 仅 1 张/行；最小缩放 → 多张/行（随容器宽度动态）
+ */
+const GALLERY_SIZE_STEPS = [60, 80, 100, 120, 145, 170, 200, 230, 265, 300];
+function quantizeGallerySize(size) {
+  return GALLERY_SIZE_STEPS.reduce((p, c) =>
+    Math.abs(c - size) < Math.abs(p - size) ? c : p);
+}
 function galleryColW(size) {
-  return Math.max(180, Math.round(size * (size > 320 ? 2.4 : 1.6)));
+  const innerW = (content.clientWidth || 800) - GALLERY_PAD * 2;
+  const qs = quantizeGallerySize(size);
+  const t = (qs - 60) / (300 - 60); // 0..1
+  const minH = 100;                 // 最小行高 → 多列
+  const maxH = innerW * 0.82;       // 最大行高 → 1 张/行（竖屏也撑满宽度）
+  return Math.max(minH, minH + (maxH - minH) * t);
 }
 
 /** L80：缩放状态按视图独立（图标/列表用 thumbSize，画廊用 galleryThumbSize），共享同一滑块 */
@@ -511,20 +569,22 @@ function renderVirtual() {
     content.style.height = total * rowH + 'px';
     const start = Math.max(0, Math.floor(scrollTop / rowH) - overscan * 2);
     const end = Math.min(total, Math.ceil((scrollTop + viewH) / rowH) + overscan * 2);
-    sig = `l|${total}|${start}|${end}|${state.selVersion}|${overscan}`;
+    sig = `l|${total}|${start}|${end}|${state.selVersion}|${overscan}|${state.cfg?.listViewMeta !== false ? 1 : 0}`;
     for (let i = start; i < end; i++) html += listRow(state.filtered[i], i, i * rowH);
   } else {
-    // 画廊模式：多列瀑布流，卡片按媒体宽高比占位（不裁剪完整显示）
-    // 文档流布局（无虚拟化，签名跳过对纯滚动尤为关键）
-    content.style.height = '';
+    // 画廊模式（L236）：行优先排列——先从左到右填满一行，再换行向下。
+    // 卡片绝对定位（位置由 layoutGalleryNow 计算），无虚拟化。
+    // L318 bug 修复：重建 innerHTML 前锁定 content 高度，避免 .gallery-rows 高度为 0
+    // 的瞬间导致 scroller.scrollTop 被浏览器钳制回 0。
+    if (!content.style.height) content.style.height = (scroller.scrollHeight || content.clientHeight) + 'px';
     // L36：扩大缩放范围；size>320 后斜率加大，最大(800)→列宽 1920，
     // 常见 1080p~4K 窗口均只显示 1 张
     const colW = galleryColW(size);
     // 画廊视图过滤文件夹（只展示可预览的媒体）
     const tiles = [];
-    state.filtered.forEach((it, i) => { if (it.kind !== 'folder') tiles.push(galleryTile(it, i)); });
-    sig = `y|${total}|${state.selVersion}|${size}|${Math.round(content.clientWidth)}`;
-    html = `<div class="gallery-masonry" style="column-width:${colW}px">` + tiles.join('') + `</div>`;
+    state.filtered.forEach((it, i) => { if (it.kind !== 'folder') tiles.push(galleryTile(it, i, colW)); });
+    sig = `y|${total}|${state.selVersion}|${size}|${Math.round(content.clientWidth)}|${state.galleryVer || 0}`;
+    html = `<div class="gallery-rows">` + tiles.join('') + `</div>`;
 
   }
 
@@ -534,7 +594,15 @@ function renderVirtual() {
     return;
   }
   recycleAutoPreviews(); // innerHTML 替换会销毁 video：先回收入池供重挂复用
+  // L318：保存滚动位置，画廊模式重建后恢复（防止偶发回到顶部）
+  const savedScrollTop = scroller.scrollTop;
   content.innerHTML = html;
+  if (state.cfg?.viewMode === 'gallery') {
+    layoutGalleryNow(); // L236：行优先定位
+    // 锁定高度已由 .gallery-rows 接管，清掉内联 height 让其随内容自适应
+    content.style.height = '';
+    scroller.scrollTop = savedScrollTop;
+  }
   requestThumbs();
   requestFullImgs(); // L155：画廊图片视口内原质量加载
   scheduleAutoPreviews();
@@ -653,25 +721,115 @@ function gridCard(item, idx, x, y) {
 function listRow(item, idx, y) {
   const sel = state.selection.has(idx) ? ' selected' : '';
   const name = escapeHtml(item.name);
+  // L341：列表视图信息列（修改时间 / 分辨率 / 时长），设置项可整体关闭
+  const meta = state.cfg?.listViewMeta !== false;
+  let metaHtml = '';
+  if (meta) {
+    const t = (item.kind === 'video' || item.kind === 'image') ? thumbAny(item.path) : null;
+    const w = t?.w || item.width, h = t?.h || item.height;
+    const res = (w > 0 && h > 0) ? `${w}×${h}` : '';
+    const dur = (item.kind === 'audio' || item.kind === 'video') ? fmtDur(item.duration) : '';
+    metaHtml =
+      `<span class="opacity-40 text-xs w-[7.5rem] text-right">${item.kind === 'folder' ? '' : fmtDate(item.modified)}</span>` +
+      `<span class="opacity-40 text-xs w-20 text-right">${res}</span>` +
+      `<span class="opacity-50 text-xs w-14 text-right">${dur}</span>`;
+  }
   return `
   <div class="media-row${sel}" data-idx="${idx}" style="position:absolute;left:0;right:0;top:${y}px">
     ${thumbHtml(item, 'rounded-md', 'width:36px;height:36px;flex-shrink:0')}
     <span class="flex-1 truncate" title="${name}">${name}</span>
-    <span class="opacity-50 text-xs w-14 text-right">${item.kind === 'audio' ? fmtDur(item.duration) : ''}</span>
+    ${metaHtml}
     <span class="opacity-50 text-xs w-16 text-right">${item.kind === 'folder' ? '' : fmtSize(item.size)}</span>
     <span class="opacity-40 text-xs w-14 text-right">${kindLabel(item.kind)}</span>
   </div>`;
 }
 
 // 画廊卡片：占位框按媒体宽高比（完整显示不裁剪）；文件名默认隐藏，悬浮显示在卡片顶部
-function galleryTile(item, idx) {
+// L236：colW 给定时直接内联宽高/位置初值，避免首帧跳动（位置随后由 layoutGalleryNow 校正）
+function galleryTile(item, idx, colW = 0) {
   const name = escapeHtml(item.name);
   const sel = state.selection.has(idx) ? ' selected' : '';
+  const wStyle = colW ? ` width:${colW}px;` : '';
   return `
-  <div class="media-card gallery-card${sel}" data-idx="${idx}">
+  <div class="media-card gallery-card${sel}" data-idx="${idx}" style="position:absolute;${wStyle}">
     <div class="thumb-box" style="aspect-ratio:${ratioCss(item)}"${item.kind === 'image' ? ` data-fullimg="${escapeAttr(item.path)}"` : ''}>${thumbHtml(item, 'gallery-thumb', '', galleryReq())}${badgesHtml(item, true)}</div>
     <div class="gallery-name" title="${name}">${name}</div>
   </div>`;
+}
+
+// ─── L236/L250：画廊行优先布局（对齐行：每行卡片等高、宽度按比例填满整行，上下相连无大片背景） ───
+const GALLERY_PAD = 14;
+function galleryGapPx() { return state.cfg?.galleryGap ?? 14; }
+/** 卡片媒体区宽高比（数值 w/h），与 ratioCss 的默认值保持一致 */
+function itemRatioNum(item) {
+  if (item.kind === 'video' || item.kind === 'image') {
+    const t = thumbAny(item.path);
+    const w = t?.w || item.width;
+    const h = t?.h || item.height;
+    if (w > 0 && h > 0) return w / h;
+  }
+  return item.kind === 'video' ? 16 / 9 : 1;
+}
+/** 就地重排画廊卡片（对齐行布局，不重建 DOM，正在自动预览的视频不受影响） */
+function layoutGalleryNow() {
+  const m = content.querySelector('.gallery-rows');
+  if (!m) return;
+  const gap = galleryGapPx();
+  // 基准行高由缩放滑块决定（与原列宽一致的尺寸感）
+  const targetH = galleryColW(state.cfg?.galleryThumbSize ?? 260);
+  const innerW = (content.clientWidth || m.clientWidth || scroller.clientWidth) - GALLERY_PAD * 2;
+
+  const cards = [...m.children];
+  const items = cards.map((card) => {
+    const item = state.filtered[Number(card.dataset.idx)];
+    const ratio = item ? itemRatioNum(item) : 1;
+    return { card, ratio, natW: targetH * ratio }; // 基准行高下卡片的自然宽度
+  });
+
+  let y = GALLERY_PAD;
+  let row = [];
+  let rowNatW = 0;
+
+  const flushRow = (isLast) => {
+    if (!row.length) return;
+    const n = row.length;
+    const totalGap = (n - 1) * gap;
+    const available = innerW - totalGap;
+    // 按比例缩放使整行正好填满容器宽度；最后一行限制最大放大，避免单卡被拉得过大
+    let scale = available / rowNatW;
+    if (isLast) scale = Math.min(scale, 1.4);
+    scale = Math.min(scale, 1.4);
+    const h = targetH * scale;
+    let x = GALLERY_PAD;
+    for (const it of row) {
+      const w = it.natW * scale;
+      it.card.style.width = w + 'px';
+      it.card.style.height = h + 'px';
+      it.card.style.left = x + 'px';
+      it.card.style.top = y + 'px';
+      // thumb-box 填满卡片（覆盖原 aspect-ratio，由 object-fit:contain 保证媒体不变形）
+      const box = it.card.querySelector('.thumb-box');
+      if (box) { box.style.aspectRatio = 'auto'; box.style.height = '100%'; box.style.width = '100%'; }
+      x += w + gap;
+    }
+    y += h + gap;
+    row = []; rowNatW = 0;
+  };
+
+  for (const it of items) {
+    const projectedW = rowNatW + it.natW + (row.length ? gap : 0);
+    if (row.length && projectedW > innerW) flushRow(false);
+    row.push(it);
+    rowNatW += it.natW;
+  }
+  flushRow(true);
+
+  m.style.height = (y - gap + GALLERY_PAD) + 'px';
+}
+let galleryLayoutRaf = 0;
+function scheduleGalleryLayout() {
+  if (galleryLayoutRaf) return;
+  galleryLayoutRaf = requestAnimationFrame(() => { galleryLayoutRaf = 0; layoutGalleryNow(); });
 }
 
 
@@ -890,6 +1048,9 @@ async function playableVideoSrc(path) {
   catch { return path; } // ffmpeg 缺失/失败 → 回退原文件
 }
 
+const CARD_VOL_ON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>';
+const CARD_VOL_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M22 9l-6 6M16 9l6 6"/></svg>';
+
 function makeCardCtrl(v) {
   const ctrl = document.createElement('div');
   ctrl.className = 'card-ctrl';
@@ -909,8 +1070,8 @@ function makeCardCtrl(v) {
   const muteBtn = ctrl.querySelector('.card-ctl-btn');
   const vol = ctrl.querySelector('.card-vol');
 
-  const VOL_ON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>';
-  const VOL_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M22 9l-6 6M16 9l6 6"/></svg>';
+  const VOL_ON = CARD_VOL_ON;
+  const VOL_OFF = CARD_VOL_OFF;
   const syncMuteIcon = () => { muteBtn.innerHTML = (v.muted || v.volume === 0) ? VOL_OFF : VOL_ON; };
 
   // 进度：点击 / 拖拽跳转
@@ -945,6 +1106,7 @@ function makeCardCtrl(v) {
     vol.value = v.muted ? 0 : Math.round(v.volume * 100);
     syncMuteIcon();
   });
+  vol.value = v.muted ? 0 : Math.round(v.volume * 100); // L238：初值跟随全局卡片音量
   syncMuteIcon();
 
   // 控件操作不触发卡片选中 / 双击打开
@@ -960,7 +1122,9 @@ async function attachCardPreview(box, path) {
   const v = document.createElement('video');
   v.className = 'auto-preview';
   v.dataset.src = path; // 池化复用 key（remux 后的 src 可能与源路径不同）
-  v.muted = true;
+  // L238：卡片默认静音、默认音量 20%（均可在设置中配置）
+  v.volume = Math.min(1, Math.max(0, (state.cfg?.cardVolume ?? 20) / 100));
+  v.muted = state.cfg?.cardMuted !== false;
   v.loop = true;
   v.playsInline = true;
   v.preload = 'metadata';
@@ -1129,9 +1293,16 @@ function loadThumbForNode(node) {
         if (t.duration) n.textContent = fmtDur(t.duration);
         return;
       }
-      // 缩略图尺寸就绪 → 校正画廊占位比例（瀑布流按媒体宽高比排版）
+      // 缩略图尺寸就绪 → 校正画廊占位比例（L236：行布局需按真实比例重排）
       const box = n.closest('.thumb-box');
-      if (box && t.w > 0 && t.h > 0) box.style.aspectRatio = `${t.w} / ${t.h}`;
+      if (box && t.w > 0 && t.h > 0) {
+        const prev = box.style.aspectRatio;
+        box.style.aspectRatio = `${t.w} / ${t.h}`;
+        if (state.cfg?.viewMode === 'gallery' && box.closest('.gallery-rows') && prev !== box.style.aspectRatio) {
+          state.galleryVer++;
+          scheduleGalleryLayout();
+        }
+      }
       if (n.tagName === 'IMG') {
         n.src = t.url;
         // 大尺寸已就位 → 去掉懒加载标记，避免重渲染时重复请求
@@ -1336,8 +1507,9 @@ function initSeekDrag(seekEl, onChange) {
 }
 
 function toggleVideoPlay() {
-  if (mpvCtl('toggle')) return;
+  if (mpvCtl('toggle')) { showVideoBar(); return; }
   if (vVideo.paused) vVideo.play().catch(() => {}); else vVideo.pause();
+  showVideoBar(); // 用户主动暂停/播放时亮出控制条
 }
 
 
@@ -1419,6 +1591,23 @@ $('videoSpeed').addEventListener('change', (e) => {
   mpvCtl('speed', Number(e.target.value));
   vVideo.playbackRate = Number(e.target.value);
   localStorage.setItem('videoSpeed', e.target.value);
+});
+
+// L235：视频画面缩放 0.5/1/1.5/2/4（HTML5 video 与 mpv canvas 统一用 CSS transform，
+// 以画面中心为原点；不影响原始帧截图）
+function applyVideoZoom() {
+  const z = Number($('videoZoom')?.value) || 1;
+  const tf = z === 1 ? '' : `scale(${z})`;
+  vVideo.style.transform = tf;
+  const vc = $('videoCanvas');
+  if (vc) vc.style.transform = tf;
+}
+const videoZoomStored = localStorage.getItem('videoZoom');
+if (videoZoomStored) $('videoZoom').value = videoZoomStored;
+applyVideoZoom();
+$('videoZoom').addEventListener('change', (e) => {
+  applyVideoZoom();
+  localStorage.setItem('videoZoom', e.target.value);
 });
 // L151：循环按钮已并入播放模式；旧 videoLoop 存储迁移为 loop 模式
 if (localStorage.getItem('videoLoop') === '1' && !localStorage.getItem('viewerPlayMode')) {
@@ -1546,6 +1735,8 @@ const PLAY_MODES = [
     icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h13M4 12h13M4 17h9"/><path d="M14 14l4 3-4 3"/></svg>' },
   { id: 'loop', title: '循环播放（列表循环）',
     icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>' },
+  { id: 'one', title: '单曲循环（当前文件循环）',
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><text x="12" y="14.5" font-size="8" font-weight="700" fill="currentColor" stroke="none" text-anchor="middle">1</text></svg>' },
   { id: 'random', title: '随机播放',
     icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20L21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></svg>' },
   { id: 'once', title: '一次播放（播完当前项停止）',
@@ -1560,21 +1751,27 @@ function syncPlayModeBtn() {
   btn.innerHTML = m.icon;
   btn.classList.toggle('active', playMode !== 'seq');
 }
+/** L247：按当前播放模式设置播放器循环状态（单曲循环=开，其余=关） */
+function applyPlayLoop() {
+  const loop = playMode === 'one';
+  if (mpvPlaying) mpvCtl('loop', loop ? 1 : 0);
+  vVideo.loop = loop;
+}
 $('videoPlayMode').addEventListener('click', () => {
   const i = PLAY_MODES.findIndex((m) => m.id === playMode);
   playMode = PLAY_MODES[(i + 1) % PLAY_MODES.length].id;
   localStorage.setItem('viewerPlayMode', playMode);
   syncPlayModeBtn();
-  // 实时更新当前播放项的循环状态
-  const loop = playMode === 'one';
-  if (mpvPlaying) mpvCtl('loop', loop ? 1 : 0);
-  vVideo.loop = loop;
+  applyPlayLoop();
 });
 syncPlayModeBtn();
 
 /** L130：播放结束时按模式选下一项；无下一项返回 -1 */
 function pickAfterEnded() {
   if (playMode === 'once') return -1;
+  // L247：单曲循环模式下播放器自身 loop 已开启（HTML5/mpv 都不会触发 ended），
+  // 这里兜底：万一 ended 被触发，重播当前项
+  if (playMode === 'one') return state.viewerIndex;
   if (playMode === 'random') {
     const viewable = [];
     state.filtered.forEach((it, i) => {
@@ -1585,7 +1782,8 @@ function pickAfterEnded() {
     while (n === state.viewerIndex) n = viewable[Math.floor(Math.random() * viewable.length)];
     return n;
   }
-  const n = nextViewable(state.viewerIndex, 1); // 环形查找
+  // 从「下一项」开始环形查找（旧代码从当前项开始，会把自己当成下一项重播）
+  const n = nextViewable(state.viewerIndex + 1, 1);
   if (n < 0 || n <= state.viewerIndex) {
     // 发生回绕：循环模式回开头；顺序模式停止
     return playMode === 'loop' ? n : -1;
@@ -2139,7 +2337,9 @@ function startMpvSession(item, autoplay) {
   const gen = ++mpvGen;
   videoPrimed = false;
   videoRate = Number($('videoSpeed')?.value) || 1;
+  // L247：按播放模式设置循环（单曲循环=开，其余=关）
   videoLoop = playMode === 'one';
+  applyPlayLoop();
 
   // 显示 canvas，隐藏 HTML5 video
   videoCanvas.classList.remove('hidden');
@@ -2279,6 +2479,7 @@ async function openViewer(idx, quiet = false) {
   $('viewerVideo').classList.add('hidden');
   videoCanvas.classList.add('hidden');
   $('videoBar').classList.add('hidden');
+  $('imgDock').classList.add('hidden'); // L233：停靠区仅图片模式显示
   resetImageTransform(); // 翻转/旋转/缩放/平移为视图级状态，切换项即复位
   stopMpvSession(); // 停止上一个视频会话
   // L34：侧切换箭头仅图片显示（视频不显示）；光标复位
@@ -2286,11 +2487,12 @@ async function openViewer(idx, quiet = false) {
   viewerImg.style.cursor = item.kind === 'image' ? 'grab' : '';
 
   vVideo.pause();
-  vAudio.pause();
+  // L249：打开视频预览时不暂停音频后台播放（音频播放器独立于视频）
   setViewerSuspension(true); // 单一播放期间暂停文件区列表预览
 
   const src = convertFileSrc(item.path);
   if (item.kind === 'image') {
+    $('imgDock').classList.remove('hidden'); // L233：竖排缩放条停靠区
     // 渐进加载：先显示已缓存的缩略图（瞬时），全尺寸原图解码完成后再无缝替换
     const t = thumbAny(item.path);
     if (t) {
@@ -2329,7 +2531,7 @@ async function openViewer(idx, quiet = false) {
         const resume = progressGet(item.path);
         vVideo.src = convertFileSrc(playPath);
         vVideo.playbackRate = Number($('videoSpeed')?.value) || 1;
-        vVideo.loop = playMode === 'one';
+        applyPlayLoop(); // L247：单曲循环模式下开启 loop
         const onMeta = () => {
           if (resume > 0 && vVideo.duration) {
             vVideo.currentTime = Math.min(resume, vVideo.duration - 0.5);
@@ -2409,25 +2611,59 @@ function revealVideoBar() {
   }
 }
 
-/** 视频截图：捕获当前帧保存为 PNG */
+/** L240：截屏——视频=原始帧；图片=原图；其他=当前窗口客户区截图。保存为 PNG */
 async function takeScreenshot() {
-  // 确定截图源：mpv 模式用 videoCanvas，HTML5 模式用 vVideo
-  let srcCanvas = null;
-  if (mpvPlaying && videoCanvas && videoCanvas.width > 0) {
-    srcCanvas = videoCanvas;
-  } else if (vVideo && vVideo.videoWidth > 0) {
-    const c = document.createElement('canvas');
-    c.width = vVideo.videoWidth;
-    c.height = vVideo.videoHeight;
-    c.getContext('2d').drawImage(vVideo, 0, 0);
-    srcCanvas = c;
+  const viewerOpen = !$('viewer').classList.contains('hidden');
+  const item = viewerOpen ? state.filtered[state.viewerIndex] : null;
+  let data = null;   // PNG 字节数组（save_screenshot 入参）
+  let kind = '';
+
+  // 1) 视频预览：提取原始分辨率帧（mpv 解码 canvas / HTML5 video 内禀尺寸）
+  if (item?.kind === 'video') {
+    let srcCanvas = null;
+    if (mpvPlaying && videoCanvas && videoCanvas.width > 0) {
+      srcCanvas = videoCanvas;
+    } else if (vVideo && vVideo.videoWidth > 0) {
+      const c = document.createElement('canvas');
+      c.width = vVideo.videoWidth;
+      c.height = vVideo.videoHeight;
+      c.getContext('2d').drawImage(vVideo, 0, 0);
+      srcCanvas = c;
+    }
+    if (srcCanvas) {
+      try {
+        const blob = await new Promise((res, rej) => srcCanvas.toBlob(res, 'image/png'));
+        if (!blob) throw new Error('视频帧编码失败');
+        data = Array.from(new Uint8Array(await blob.arrayBuffer()));
+        kind = '视频原始帧';
+      } catch (e) { setStatus(`截图失败：${e}`, true); return; }
+    }
   }
-  if (!srcCanvas) { setStatus('当前无可截图的画面', true); return; }
+
+  // 2) 图片预览：绘制原图（naturalWidth/Height，不受视图缩放影响）
+  if (!data && item?.kind === 'image' && viewerImg.naturalWidth > 0) {
+    try {
+      const c = document.createElement('canvas');
+      c.width = viewerImg.naturalWidth;
+      c.height = viewerImg.naturalHeight;
+      c.getContext('2d').drawImage(viewerImg, 0, 0);
+      const blob = await new Promise((res, rej) => c.toBlob(res, 'image/png'));
+      if (!blob) throw new Error('图片编码失败');
+      data = Array.from(new Uint8Array(await blob.arrayBuffer()));
+      kind = '原图';
+    } catch (e) { setStatus(`截图失败：${e}`, true); return; }
+  }
+
+  // 3) 其他情况（无预览 / 音频 / 文件区…）：后端抓窗口客户区
+  if (!data) {
+    try {
+      data = await invoke('capture_window');
+      kind = '窗口截图';
+    } catch (e) { setStatus(`窗口截图失败：${e}`, true); return; }
+    if (!data || !data.length) { setStatus('窗口截图失败：未获取到画面', true); return; }
+  }
+
   try {
-    const blob = await new Promise((res, rej) => srcCanvas.toBlob(res, 'image/png'));
-    if (!blob) throw new Error('截图失败');
-    const buf = await blob.arrayBuffer();
-    const data = Array.from(new Uint8Array(buf));
     // 默认路径：项目目录/screenshots/，可在设置中修改
     const dir = state.cfg?.screenshotDir || '';
     const ts = new Date();
@@ -2435,10 +2671,10 @@ async function takeScreenshot() {
     const name = `screenshot_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.png`;
     const path = dir ? `${dir.replace(/[\\/]+$/, '')}/${name}` : name;
     const saved = await invoke('save_screenshot', { path, data });
-    showTopToast(`截图已保存：${name}`);
-    setStatus(`截图已保存：${saved}`);
+    showTopToast(`${kind}已保存：${name}`);
+    setStatus(`${kind}已保存：${saved}`);
   } catch (e) {
-    setStatus(`截图失败：${e}`, true);
+    setStatus(`截图保存失败：${e}`, true);
   }
 }
 
@@ -2447,6 +2683,65 @@ function viewerStep(d) {
   const cur = state.viewerIndex < 0 ? 0 : state.viewerIndex;
   const next = nextViewable(cur + d, d);
   if (next >= 0) openViewer(next, true); // true = quiet（不唤醒隐藏的悬浮控件）
+}
+
+// ─── L255：预览器内删除当前文件（Del=回收站，Shift+Del=永久删除） ───
+async function deleteViewerItem(permanent = false) {
+  const item = state.filtered[state.viewerIndex];
+  if (!item || deleteBusy) return;
+  if (permanent) {
+    const ok = await askConfirm(
+      `将永久删除「${item.name}」，\n不进入回收站，删除后无法恢复。确定继续吗？`,
+      '永久删除',
+    );
+    if (!ok) return;
+  }
+  deleteBusy = true;
+  try {
+    await invoke('delete_items', { paths: [item.path], permanent });
+    setStatus(permanent ? '已永久删除' : '已删除（移入回收站，可还原）');
+    // 本地列表同步移除（避免重扫丢失穿透态），文件区卡片即时消失
+    const rm = (arr) => {
+      const i = arr.findIndex((x) => x && x.path === item.path);
+      if (i >= 0) arr.splice(i, 1);
+    };
+    rm(state.items);
+    rm(state.filtered);
+    // 集锦箱中若有该文件的失效引用一并清理
+    if (collectionPaths.includes(item.path)) {
+      collectionPaths.splice(collectionPaths.indexOf(item.path), 1);
+      renderCollection();
+      saveCollectionBox();
+    }
+    resetSelection();
+    renderVirtual();
+    const idx = state.viewerIndex;
+    if (idx >= state.filtered.length || !state.filtered.length) {
+      closeViewer(); // 后面没有文件了
+    } else {
+      openViewer(idx, true); // 原位显示下一项
+    }
+  } catch (e) {
+    setStatus(String(e), true);
+  } finally {
+    deleteBusy = false;
+  }
+}
+
+/** L255：当前预览文件加入 / 移出集锦箱（与文件区右键同一逻辑，作用于当前编号） */
+function toggleCollectViewerItem() {
+  const item = state.filtered[state.viewerIndex];
+  if (!item) return;
+  const i = collectionPaths.indexOf(item.path);
+  if (i >= 0) {
+    collectionPaths.splice(i, 1);
+    setStatus('已移出集锦箱');
+  } else {
+    collectionPaths.push(item.path);
+    setStatus(`已加入集锦箱 ${collectionIdx} 号`);
+  }
+  renderCollection();
+  saveCollectionBox();
 }
 
 // 预览器（关闭；左右切换箭头已移除，改用快捷键 / 控制条上下文件按钮）
@@ -2474,7 +2769,7 @@ viewerNextSide.addEventListener('mouseleave', () => hideSideArrowsSoon());
 // L98/L106：双击视频或图片 → 全屏；再次双击退出返回预览器（控件/面板区域不触发）
 $('viewerStage').addEventListener('dblclick', (e) => {
   if ($('viewer').classList.contains('hidden')) return;
-  if (e.target.closest('button, input, select, a, #videoBar, #viewerPlaylist, #viewerTopFloat, #imgMinimap')) return;
+  if (e.target.closest('button, input, select, a, #videoBar, #viewerPlaylist, #viewerTopFloat, #imgDock')) return;
   const item = state.filtered[state.viewerIndex];
   if (item?.kind !== 'video' && item?.kind !== 'image') return;
   e.preventDefault();
@@ -2488,7 +2783,7 @@ $('viewerStage').addEventListener('dblclick', (e) => {
 let viewerWinDrag = null;
 $('viewerStage').addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
-  if (e.target.closest('button, input, select, a, #videoBar, #viewerPlaylist, #viewerTopFloat, #imgMinimap')) return;
+  if (e.target.closest('button, input, select, a, #videoBar, #viewerPlaylist, #viewerTopFloat, #imgDock')) return;
   const onVideo = e.target === $('viewerVideo') || e.target === $('videoCanvas');
   if (!(e.target === $('viewerStage') || onVideo || inViewerUpper(e))) return;
   viewerWinDrag = { x: e.clientX, y: e.clientY };
@@ -2645,6 +2940,67 @@ viewerImg.addEventListener('load', () => {
   if (!$('viewer').classList.contains('hidden')) setupMinimap();
 });
 
+// ─── L233：竖排缩放控制条（停靠在总览区旁，悬浮显示） ───
+const IMG_ZOOM_MIN = 0.2, IMG_ZOOM_MAX = 12;
+const zoomToRange = (z) => Math.round(Math.log(z / IMG_ZOOM_MIN) / Math.log(IMG_ZOOM_MAX / IMG_ZOOM_MIN) * 100);
+const rangeToZoom = (v) => IMG_ZOOM_MIN * Math.pow(IMG_ZOOM_MAX / IMG_ZOOM_MIN, v / 100);
+/** 以舞台中心为锚点缩放（按钮用） */
+function zoomImageCenter(factor) {
+  const r = $('viewerStage').getBoundingClientRect();
+  zoomImageAt({ clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }, factor);
+}
+/** 直接设定缩放（以舞台中心为锚，保留旋转/翻转） */
+function setImageZoom(nz) {
+  nz = Math.min(IMG_ZOOM_MAX, Math.max(IMG_ZOOM_MIN, nz));
+  const z = imgTransform.zoom || 1;
+  imgTransform.tx *= nz / z;
+  imgTransform.ty *= nz / z;
+  imgTransform.zoom = nz;
+  applyImageTransform();
+}
+$('imgZoomIn').addEventListener('click', () => zoomImageCenter(1.2));
+$('imgZoomOut').addEventListener('click', () => zoomImageCenter(1 / 1.2));
+$('imgZoomReset').addEventListener('click', () => {
+  // 仅复位缩放/平移，保留旋转与翻转
+  imgTransform.zoom = 1; imgTransform.tx = 0; imgTransform.ty = 0;
+  applyImageTransform();
+});
+$('imgZoomRange').addEventListener('input', (e) => setImageZoom(rangeToZoom(Number(e.target.value))));
+
+// ─── L234：图片模式按住右键，上滑放大、下滑缩小（单击右键仍弹菜单） ───
+let rzActive = false;   // 右键按下中
+let rzMoved = false;    // 已产生纵向缩放位移（用于抑制本次右键菜单）
+let rzX = 0, rzY = 0, rzAcc = 0;
+viewerImg.addEventListener('pointerdown', (e) => {
+  if (e.button !== 2 || $('viewer').classList.contains('hidden')) return;
+  rzActive = true; rzMoved = false;
+  rzX = e.clientX; rzY = e.clientY; rzAcc = 0;
+  try { viewerImg.setPointerCapture(e.pointerId); } catch { /* 忽略 */ }
+  e.preventDefault();
+});
+viewerImg.addEventListener('pointermove', (e) => {
+  if (!rzActive) return;
+  rzAcc += rzY - e.clientY; // 向上滑累积为正
+  rzX = e.clientX; rzY = e.clientY;
+  let steps = 0;
+  while (Math.abs(rzAcc) >= 10 && steps < 20) {
+    const up = rzAcc > 0;
+    rzAcc += up ? -10 : 10;
+    rzMoved = true;
+    zoomImageAt({ clientX: rzX, clientY: rzY }, up ? 1.07 : 1 / 1.07);
+    steps++;
+  }
+});
+const endRz = (e) => {
+  if (!rzActive) return;
+  rzActive = false;
+  try { viewerImg.releasePointerCapture(e.pointerId); } catch { /* 忽略 */ }
+  // contextmenu 在 pointerup 之后、本轮宏任务结束前派发：延迟清标志让菜单判定先跑完
+  if (rzMoved) setTimeout(() => { rzMoved = false; }, 0);
+};
+viewerImg.addEventListener('pointerup', endRz);
+viewerImg.addEventListener('pointercancel', endRz);
+
 
 // L84：预览器悬浮 UI 分区控制——控制条 / 图片箭头 / 顶部关闭按钮均为「悬浮出现，离开消失」
 // L90：鼠标离开热区后 1 秒消失（带缓动）；切换文件不唤醒（openViewer quiet 参数）
@@ -2764,9 +3120,9 @@ $('viewer').addEventListener('mousemove', (e) => {
   if (e.clientX >= w - 40) showViewerPlaylist(); else hideViewerPlaylistSoon();
 });
 
-// 暂停/播放切换时亮出控制条（暂停时常显由 hideVideoBarSoon 保证）
-vVideo.addEventListener('pause', showVideoBar);
-vVideo.addEventListener('play', showVideoBar);
+// L232：不再监听 pause/play 事件弹控制条——openViewer 切文件时的 pause()/autoplay
+// 会误触发，导致切换文件控制条自动弹出。用户主动暂停/播放改由 toggleVideoPlay 显式亮条，
+// 暂停时常显由 hideVideoBarSoon（videoMode && paused）保证。
 bindVideoBar();
 
 // L62：控制条按钮开关顶部文件名显示（默认不显示）；L153：状态记忆
@@ -2900,10 +3256,20 @@ function updateQuickDirActive() {
   });
 }
 
+// L318-10/L337：收藏夹单列/双列切换 + 收起/展开
+let favColsMode = localStorage.getItem('favColsMode') || '1';
+let favCollapsed = localStorage.getItem('favCollapsed') === '1';
 function renderFavorites() {
   const favs = state.cfg?.favorites ?? [];
   // L69：侧栏收藏用实心黄色文件夹图标
   const FOLDER_ICO = `<svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24"><path fill="#facc15" stroke="#eab308" stroke-width="0.6" d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>`;
+  const list = $('favList');
+  if (list) {
+    list.classList.toggle('cols-2', favColsMode === '2');
+    list.classList.toggle('collapsed', favCollapsed);
+  }
+  const arrow = $('favArrow');
+  if (arrow) arrow.textContent = favCollapsed ? '▸' : '▾';
   $('favList').innerHTML = favs.length
     ? favs.map((p) => {
         const name = p.split(/[\\/]/).filter(Boolean).pop() || p;
@@ -2916,6 +3282,18 @@ function renderFavorites() {
       }).join('')
     : `<div class="px-2 py-1 text-xs opacity-40">（暂无收藏，点击上方「♥ 收藏」）</div>`;
 }
+
+$('favColsBtn')?.addEventListener('click', () => {
+  favColsMode = favColsMode === '1' ? '2' : '1';
+  localStorage.setItem('favColsMode', favColsMode);
+  renderFavorites();
+});
+// L337：点击「收藏文件夹」标题收起/展开
+$('favToggle')?.addEventListener('click', () => {
+  favCollapsed = !favCollapsed;
+  localStorage.setItem('favCollapsed', favCollapsed ? '1' : '0');
+  renderFavorites();
+});
 
 // ═══════════════ L71-74/L88：集锦箱（收藏的文件） ═══════════════
 // L88：5 个独立集锦箱列表，编号 1-5 按钮切换；每个列表存本地文件 box{idx}.json
@@ -2949,6 +3327,45 @@ async function setCollectionIdx(i) {
   await loadCollectionBox();
   renderCollection();
   if (state.collectionMode) enterCollectionMode(); // 视图跟随新编号
+}
+
+// L318-4/5：读取 / 写入指定编号集锦箱（不切换当前编号）
+async function readBox(idx) {
+  try { const list = await invoke('read_collection_box', { idx }); return Array.isArray(list) ? list : []; }
+  catch { return []; }
+}
+function writeBox(idx, paths) {
+  return invoke('write_collection_box', { idx, paths: [...paths] }).catch((e) => setStatus(String(e), true));
+}
+
+/** L318-4：把选中文件复制到目标编号集锦箱（保留在当前箱） */
+async function copyToBox(paths, targetIdx) {
+  if (!paths.length) return;
+  const target = await readBox(targetIdx);
+  let added = 0;
+  paths.forEach((p) => { if (!target.includes(p)) { target.push(p); added++; } });
+  await writeBox(targetIdx, target);
+  if (targetIdx === collectionIdx) { collectionPaths = target; renderCollection(); if (state.collectionMode) refreshCollectionMode(); }
+  setStatus(added ? `已复制 ${added} 项到 ${targetIdx} 号集锦箱` : `${targetIdx} 号集锦箱已包含这些项`);
+}
+
+/** L318-4：把选中文件移动到目标编号集锦箱（从当前箱移除） */
+async function moveToBox(paths, targetIdx) {
+  if (!paths.length) return;
+  // 加入目标箱
+  const target = await readBox(targetIdx);
+  paths.forEach((p) => { if (!target.includes(p)) target.push(p); });
+  await writeBox(targetIdx, target);
+  // 从当前箱移除
+  paths.forEach((p) => {
+    const i = collectionPaths.indexOf(p);
+    if (i >= 0) collectionPaths.splice(i, 1);
+  });
+  saveCollectionBox();
+  renderCollection();
+  if (targetIdx === collectionIdx) collectionPaths = target;
+  if (state.collectionMode) refreshCollectionMode();
+  setStatus(`已移动 ${paths.length} 项到 ${targetIdx} 号集锦箱`);
 }
 
 function renderCollection() {
@@ -3004,8 +3421,14 @@ function toggleCollect(path) {
 async function enterCollectionMode() {
   if (!collectionPaths.length) { setStatus(`集锦箱 ${collectionIdx} 号为空（右键媒体加入）`, true); return; }
   state.collectionMode = true;
+  syncCollectionModeBtn();
   setStatus(`集锦箱模式 · ${collectionIdx} 号箱`);
   await refreshCollectionMode();
+}
+
+/** L318-3：集锦箱进入按钮的点亮/线框态同步 */
+function syncCollectionModeBtn() {
+  $('collectionModeBtn')?.classList.toggle('on', state.collectionMode);
 }
 
 $('collectionToggle')?.addEventListener('click', () => {
@@ -3051,9 +3474,23 @@ function makeTreeNode(name, path, depth, count = 0, isDrive = false) {
   el.draggable = true; // 支持拖到收藏区
   const driveIco = isDrive
     ? `<svg class="w-3.5 h-3.5 shrink-0 opacity-70 mr-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="7" width="20" height="10" rx="2"/><circle cx="17" cy="12" r="1.2" fill="currentColor" stroke="none"/><path d="M5 12h6"/></svg>` : '';
+  // L229/L253：磁盘根节点名称后追加盘符（统一关键色，样式在 CSS）
+  const driveLetter = isDrive
+    ? `<span class="tree-drive-letter">${path.slice(0, 2)}</span>` : '';
+  // L230/L254：非磁盘节点提供「穿透」按钮（雷达扫描图标，表示搜索全部子目录）
+  const penetrateBtn = isDrive ? '' : `
+    <button class="tree-penetrate" data-penetrate="1" title="穿透扫描（递归该目录及全部子目录的文件）">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8.5"/>
+        <circle cx="11" cy="11" r="5"/>
+        <path d="M11 11l6-6"/>
+        <circle cx="11" cy="11" r="1.3" fill="currentColor" stroke="none"/>
+        <circle cx="14.7" cy="7.3" r="1" fill="currentColor" stroke="none"/>
+      </svg>
+    </button>`;
   el.innerHTML = `
     <span class="arrow">${state.treeState.has(path) ? '▾' : '▸'}</span>${driveIco}
-    <span class="truncate">${escapeHtml(name)}</span><span class="tree-count opacity-50 text-xs ml-1 shrink-0"></span>`;
+    <span class="truncate">${escapeHtml(name)}</span>${driveLetter}<span class="tree-count opacity-50 text-xs ml-1 shrink-0"></span>${penetrateBtn}`;
   el.style.paddingLeft = depth * 14 + 6 + 'px';
   el.addEventListener('dragstart', (e) => {
     e.dataTransfer.setData('application/x-folder', path);
@@ -3109,6 +3546,37 @@ function collapseTreeNode(node) {
 function treeSetActive(node) {
   document.querySelectorAll('#folderTree .tree-node.active').forEach((n) => n.classList.remove('active'));
   node.classList.add('active');
+  // L229/L230：标题行磁盘提示 + 穿透按钮点亮态随选中节点刷新
+  updateTreeDriveHint(node.dataset.path);
+  syncPenetrateButtons();
+}
+
+// ─── L229/L253：目录树标题行显示选中目录所属磁盘「卷标 + 盘符」 ───
+function updateTreeDriveHint(dir) {
+  const el = $('treeDriveHint');
+  if (!el) return;
+  if (!dir || !/^[A-Za-z]:/.test(dir)) { el.innerHTML = ''; return; }
+  const letter = dir.slice(0, 1).toUpperCase();
+  const label = driveLabels[letter] || '';
+  el.innerHTML = (label ? `<span class="tdh-label">${escapeHtml(label)}</span>` : '')
+    + `<span class="tdh-letter">${letter}:</span>`;
+}
+
+// ─── L230：穿透按钮点亮态 ───
+function syncPenetrateButtons() {
+  document.querySelectorAll('#folderTree .tree-penetrate').forEach((b) => {
+    const nodePath = b.closest('.tree-node')?.dataset.path;
+    b.classList.toggle('on', !!state.penetrate && nodePath === state.penetrate);
+  });
+}
+
+/** 切换某目录的穿透扫描：同目录再点一次退出；不同目录则直接穿透打开 */
+function togglePenetrate(path) {
+  if (state.penetrate === path && state.currentDir === path) {
+    openDirectory(path); // 退出穿透，回到单层
+  } else {
+    openDirectory(path, { deep: true });
+  }
 }
 
 /** 目录树按文件区当前位置自动定位：逐级展开、选中并滚动到可见 */
@@ -3137,7 +3605,10 @@ async function revealInTree(dir) {
   treeSetActive(node);
   node.scrollIntoView({ block: 'nearest' });
   // L42：选中目录自动展开其下级目录树（一层；已展开则保留不重复加载）
-  if (!kidsOf(node)) {
+  // L333：用户刚主动收起的目录不自动再展开
+  const justCollapsed = treeCollapsedByUser === dir;
+  treeCollapsedByUser = null;
+  if (!kidsOf(node) && !justCollapsed) {
     await expandTreeNode(node, depth);
   }
 }
@@ -3161,9 +3632,21 @@ async function revealInTree(dir) {
   });
 })();
 
+/** L336：目录树文件夹过滤——默认隐藏系统文件夹；隐藏文件夹需手动开启显示 */
+function treeVisibleSubs(subs) {
+  const hideSystem = state.cfg?.treeHideSystem !== false; // 默认 true
+  const showHidden = state.cfg?.treeShowHidden === true;   // 默认 false
+  return subs.filter((s) => {
+    if (s.system && hideSystem) return false;
+    if (s.hidden && !showHidden) return false;
+    return true;
+  });
+}
+
 async function loadChildren(path, container, depth) {
   try {
-    const subs = await invoke('list_subfolders', { path });
+    const subsAll = await invoke('list_subfolders', { path });
+    const subs = treeVisibleSubs(subsAll);
     setTreeNodeCount(path, subs.length); // L68：数量只对已展开节点显示
     if (subs.length === 0) {
       container.innerHTML = `<div class="text-xs opacity-40" style="padding-left:${depth * 14 + 24}px">（空）</div>`;
@@ -3177,6 +3660,8 @@ async function loadChildren(path, container, depth) {
 
 
 // 侧边栏事件委托：收藏 / 目录树（磁盘已并入树根）
+/** L333：用户刚在树中主动收起的目录路径（阻止 revealInTree 立刻再展开） */
+let treeCollapsedByUser = null;
 $('sidebar').addEventListener('click', async (e) => {
   // 移除收藏
   const del = e.target.closest('[data-favdel]');
@@ -3207,17 +3692,31 @@ $('sidebar').addEventListener('click', async (e) => {
   const node = e.target.closest('#folderTree .tree-node[data-path]');
   if (!node) return;
   const path = node.dataset.path;
-  if (e.target.classList.contains('arrow')) {
-    if (state.treeState.has(path)) {
-      collapseTreeNode(node);
-    } else {
-      const depth = Math.max(0, Math.round((parseInt(node.style.paddingLeft) - 6) / 14)) + 1;
-      await expandTreeNode(node, depth);
-    }
+  // L230：穿透按钮（不触发展开/打开目录）
+  if (e.target.closest('[data-penetrate]')) {
+    e.stopPropagation();
+    togglePenetrate(path);
     return;
+  }
+  // L318-1/L333：单击目录节点（箭头或名称）在展开/收起之间切换，同时打开该目录
+  const isExpanded = state.treeState.has(path);
+  if (isExpanded) {
+    // 标记为用户主动收起：openDirectory→revealInTree 的自动展开（L42）跳过该节点，
+    // 否则收起后立刻被重新展开，表现为"只会展开"
+    treeCollapsedByUser = path;
+    collapseTreeNode(node);
+  } else {
+    treeCollapsedByUser = null;
+    const depth = Math.max(0, Math.round((parseInt(node.style.paddingLeft) - 6) / 14)) + 1;
+    await expandTreeNode(node, depth);
   }
   treeSetActive(node);
   openDirectory(path);
+});
+
+// L318-1：点击「目录树」标题直接收起整个目录树
+$('treeTitle')?.addEventListener('click', () => {
+  document.querySelectorAll('#folderTree .tree-node[data-path]').forEach((n) => collapseTreeNode(n));
 });
 
 
@@ -3227,6 +3726,7 @@ let driveLabels = {};
 invoke('list_drives').then((ds) => {
   ds.forEach((d) => { driveLabels[d.path.replace(/[\\/]+$/, '').toUpperCase()] = d.name; });
   renderBreadcrumb(); // 卷标到达后刷新一次首段显示
+  updateTreeDriveHint(state.currentDir); // L229：标题行磁盘提示同步
 }).catch(() => {});
 
 function renderBreadcrumb() {
@@ -3335,6 +3835,7 @@ function newTab() {
 /** 空白首页：清空当前目录并显示欢迎空态 */
 function showHomeTab() {
   state.collectionMode = false;
+  syncCollectionModeBtn();
   state.currentDir = '';
   state.items = [];
   resetSelection();
@@ -3473,6 +3974,8 @@ let marqueeJustDragged = false;
 
 scroller.addEventListener('mousedown', (e) => {
   if (e.button !== 0 || !state.filtered.length) return;
+  // L318-2：点击文件区时让搜索框失焦（框选的 preventDefault 会阻止默认失焦）
+  if (document.activeElement === $('searchInput')) $('searchInput').blur();
   if (e.target.closest('.card-ctrl')) return; // 卡片悬浮控件（进度/音量）不参与框选
   if (e.target.closest('[data-idx]')) return; // L78：卡片上按住 = 拖动文件，不进入框选
   marqueeStartV = { x: e.clientX, y: e.clientY };
@@ -3623,6 +4126,11 @@ function applyImageTransform() {
   const label = transformLabel();
   badge.textContent = label;
   badge.classList.toggle('hidden', !label);
+  // L233：同步竖排缩放条位置与停靠区「已缩放」态（拖动滑块时不回写，避免打架）
+  const dock = $('imgDock');
+  if (dock) dock.dataset.zoom = zoom > 1.01 ? '1' : '';
+  const zr = $('imgZoomRange');
+  if (zr && document.activeElement !== zr) zr.value = zoomToRange(zoom);
   updateMinimap();
 }
 
@@ -3634,7 +4142,16 @@ function resetImageTransform() {
 function transformLabel() {
   const { rotate, flipH, flipV, zoom } = imgTransform;
   const parts = [];
-  if (zoom !== 1) parts.push(`${Math.round(zoom * 100)}%`);
+  // L318-8：缩放百分比 = 当前显示尺寸 / 图片真实尺寸（而非相对 fit 的倍数）
+  const iw = viewerImg.naturalWidth, ih = viewerImg.naturalHeight;
+  const stage = $('viewerStage');
+  if (iw && ih && stage) {
+    const s0 = Math.min(stage.clientWidth / iw, stage.clientHeight / ih); // fit 基准缩放
+    const realRatio = s0 * zoom; // 实际显示相对真实尺寸的比例
+    parts.push(`${Math.round(realRatio * 100)}%`);
+  } else if (zoom !== 1) {
+    parts.push(`${Math.round(zoom * 100)}%`);
+  }
   if (rotate) parts.push(`${rotate}°`);
   if (flipH) parts.push('水平翻转');
   if (flipV) parts.push('垂直翻转');
@@ -3845,6 +4362,8 @@ function copySelection(cut = false) {
 
 /** 粘贴到目标目录（读取系统剪贴板，资源管理器复制的文件也能粘贴） */
 async function pasteInto(dir) {
+  // L318-5：集锦箱模式下，粘贴 = 把剪贴板文件加入当前集锦箱（文件夹取其内文件）
+  if (state.collectionMode) { pasteIntoCollection(); return; }
   if (!dir) { setStatus('未选择目标目录', true); return; }
   let data = null;
   try {
@@ -3867,6 +4386,38 @@ async function pasteInto(dir) {
   } catch (e) {
     setStatus(String(e), true);
   }
+}
+
+/** L318-5：集锦箱模式下粘贴——文件直接加入，文件夹则加入其内的全部媒体文件 */
+async function pasteIntoCollection() {
+  let data = null;
+  try { data = await invoke('get_clipboard_files'); } catch { /* ignore */ }
+  if (!data?.paths?.length && clipboard?.paths?.length) data = clipboard;
+  if (!data?.paths?.length) { setStatus('剪贴板中没有文件', true); return; }
+  const collected = [];
+  let folderCount = 0;
+  for (const p of data.paths) {
+    const k = kindOf(p);
+    if (k === 'folder') {
+      folderCount++;
+      try {
+        const entries = await invoke('list_directory', { path: p });
+        entries.forEach((it) => { if (it.kind !== 'folder') collected.push(it.path); });
+      } catch { /* 单个文件夹失败不影响其他 */ }
+    } else {
+      collected.push(p);
+    }
+  }
+  if (!collected.length) { setStatus('剪贴板中没有可加入的媒体文件', true); return; }
+  let added = 0;
+  collected.forEach((p) => { if (!collectionPaths.includes(p)) { collectionPaths.push(p); added++; } });
+  saveCollectionBox();
+  renderCollection();
+  if (state.collectionMode) refreshCollectionMode();
+  const parts = [];
+  if (added) parts.push(`${added} 个文件`);
+  if (folderCount) parts.push(`${folderCount} 个文件夹`);
+  setStatus(`已加入 ${parts.join(' / ')} 到 ${collectionIdx} 号集锦箱`);
 }
 
 /** L126：按绝对路径列表选中（粘贴/拖入后定位新文件）；索引基于 state.filtered */
@@ -4004,10 +4555,23 @@ scroller.addEventListener('contextmenu', (e) => {
       : { label: '收藏所在文件夹', icon: 'starYellow', fn: () => addFavorite(dir) },
 
   );
-  // L82：媒体文件右键加入「💖 加入集锦箱 / 移出集锦箱」（作用于当前编号）
+  // L82/L335：媒体文件右键集锦箱相关项
   if (item.kind !== 'folder') {
     const paths = selectedPaths().filter((p) => kindOf(p) !== 'folder');
     const inBox = paths.length > 0 && paths.every((p) => collectionPaths.includes(p));
+    // L335：集锦箱界面，「移动到/复制到集锦箱」（爱心图标）放在「移出集锦箱」之上
+    if (state.collectionMode) {
+      const moveSub = [], copySub = [];
+      for (let b = 1; b <= 5; b++) {
+        const label = b === collectionIdx ? `${b} 号（当前）` : `${b} 号`;
+        moveSub.push({ label, fn: () => moveToBox(paths, b) });
+        copySub.push({ label, fn: () => copyToBox(paths, b) });
+      }
+      menu.push('sep',
+        { label: '移动到集锦箱', icon: 'heart', submenu: moveSub },
+        { label: '复制到集锦箱', icon: 'heart', submenu: copySub },
+      );
+    }
     menu.push({
       label: inBox ? '移出集锦箱' : '加入集锦箱',
       icon: 'heart',
@@ -4128,6 +4692,8 @@ $('sidebar').addEventListener('contextmenu', (e) => {
 // ─── 播放器（画廊预览内）右键 ───
 $('viewer').addEventListener('contextmenu', async (e) => {
   e.preventDefault();
+  // L234：右键拖拽缩放刚结束时不弹菜单（单击右键才弹）
+  if (rzMoved) return;
   const item = state.filtered[state.viewerIndex];
   if (!item) return;
   const isVideo = !$('viewerVideo').classList.contains('hidden');
@@ -4146,11 +4712,17 @@ $('viewer').addEventListener('contextmenu', async (e) => {
     // 图片：二级菜单「翻转 / 旋转」（视图级，不改原文件）
     items.push({ label: '翻转 / 旋转', icon: 'refresh', sub: transformLabel(), submenu: imageTransformItems() }, 'sep');
   }
+  // L255：集锦箱加入/移出（作用于当前编号）
+  const inBox = collectionPaths.includes(item.path);
   items.push(
     { label: '关闭预览', icon: 'eye', sub: 'Esc', fn: () => closeViewer() }, // L63：关闭预览移到上部
     'sep',
     { label: '系统默认程序打开', icon: 'open', fn: () => invoke('open_media', { path: item.path }).catch((err) => setStatus(String(err), true)) },
     { label: '复制文件路径', icon: 'copy', fn: () => copyText(item.path, '路径已复制') },
+    { label: inBox ? '移出集锦箱' : '加入集锦箱', icon: 'heart', fn: () => toggleCollectViewerItem() },
+    'sep',
+    { label: '删除', icon: 'trash', sub: 'Del', fn: () => deleteViewerItem(false) },
+    { label: '永久删除', icon: 'trash', danger: true, sub: 'Shift+Del', fn: () => deleteViewerItem(true) },
     'sep',
     { label: '属性', icon: 'info', fn: () => openProps(item.path, item.kind) },
   );
@@ -4224,12 +4796,14 @@ $('btnTheme').addEventListener('click', () => {
   saveCfg();
 });
 
+// L318-7：画廊缩放防抖——避免小范围滑动频繁重排，80ms trailing
+let galleryZoomTimer = null;
 $('zoomSlider').addEventListener('input', (e) => {
   setActiveThumbSize(Number(e.target.value)); // L80：写入当前视图独立的缩放状态
-  // L70：画廊模式只改瀑布流列宽（CSS transition 平滑过渡），不重建 DOM
+  // L236：画廊模式缩放只改列宽并重排行（卡片 left/top/width 带 CSS 过渡），不重建 DOM
   if (state.cfg.viewMode === 'gallery') {
-    const m = content.querySelector('.gallery-masonry');
-    if (m) m.style.columnWidth = galleryColW(state.cfg.galleryThumbSize) + 'px';
+    clearTimeout(galleryZoomTimer);
+    galleryZoomTimer = setTimeout(() => layoutGalleryNow(), 80);
   } else {
     renderVirtual();
   }
@@ -4249,15 +4823,15 @@ scroller.addEventListener('wheel', (e) => {
   setActiveThumbSize(nz);
   $('zoomSlider').value = nz;
   if (mode === 'gallery') {
-    const m = content.querySelector('.gallery-masonry');
+    const m = content.querySelector('.gallery-rows');
     if (m) {
-      // 禁用 column-width 过渡，让卡片瞬时跳到新位置；同步给视频 geometry
+      // 连滚期间禁用位置过渡，让卡片瞬时跳到新位置；同步给视频 geometry
       // 否则过渡期间 getBoundingClientRect 读到中间值，视频滞留 → 不同步
-      m.classList.add('no-col-transition');
-      m.style.columnWidth = galleryColW(nz) + 'px';
+      m.classList.add('no-anim');
+      layoutGalleryNow();
       // 缩放停止 250ms 后恢复过渡（鼠标停顿后视觉柔和）
       clearTimeout(wheelColTransitionT);
-      wheelColTransitionT = setTimeout(() => m.classList.remove('no-col-transition'), 250);
+      wheelColTransitionT = setTimeout(() => m.classList.remove('no-anim'), 250);
     }
   } else {
     renderVirtual();
@@ -4284,8 +4858,11 @@ $('searchInput').addEventListener('input', () => {
 });
 
 $('btnUp').addEventListener('click', goUp);
-$('btnRefresh').addEventListener('click', () => openDirectory(state.currentDir));
-$('btnOpenRoot').addEventListener('click', pickRoot); // 选择新的根目录文件夹
+$('btnRefresh').addEventListener('click', () => {
+  // L230：穿透中刷新仍按穿透递归扫描
+  openDirectory(state.currentDir, state.penetrate ? { deep: true } : {});
+});
+$('btnHome').addEventListener('click', () => showHomeTab()); // L342：首页按钮（接管原「选择根目录」位置与发光样式）
 $('btnAddFav').addEventListener('click', () => {
   if (addFavorite(state.currentDir)) setStatus('已收藏当前目录');
 });
@@ -4392,7 +4969,7 @@ async function setImmersive(on) {
 $('btnImmersion').addEventListener('click', () => setImmersive(true));
 $('btnImmersionExit').addEventListener('click', () => setImmersive(false));
 
-// L123：工具栏自动播放开关（点亮显关键色，与设置面板状态同步）
+// L123/L318-9：工具栏自动播放开关（点亮显关键色，与设置面板状态同步；切换立即生效）
 function syncAutoplayBtn() {
   $('btnAutoplay')?.classList.toggle('on', state.cfg?.videoAutoplay !== false);
 }
@@ -4400,6 +4977,9 @@ $('btnAutoplay')?.addEventListener('click', () => {
   state.cfg.videoAutoplay = !(state.cfg.videoAutoplay !== false);
   syncAutoplayBtn();
   saveCfg();
+  // L318-9：立即生效——开启时立刻启动可见视频预览，关闭时回收全部预览
+  if (state.cfg.videoAutoplay !== false) scheduleAutoPreviews();
+  else recycleAutoPreviews();
 });
 // L65：沉浸模式下仅鼠标移到顶部 48px 才显示退出按钮，离开后缓慢隐藏
 document.addEventListener('mousemove', (e) => {
@@ -4498,6 +5078,8 @@ const ACTION_NAMES = {
   goUp: '返回上级', focusSearch: '聚焦搜索',
   toggleTheme: '切换主题', togglePanel: '元信息面板',
   toggleImmersion: '沉浸模式',
+  toggleAudioPanel: '音频播放器', // L237：M 呼出/收起
+  toggleCardMute: '卡片静音开关', // L238：Ctrl+M
 };
 
 /** 事件是否匹配组合键字符串（"Ctrl+f" / "Escape"） */
@@ -4530,6 +5112,13 @@ function runAction(action) {
     case 'togglePanel': $('btnInfoPanel').click(); break;
     // L122：沉浸模式进入/退出（默认 Shift+D）
     case 'toggleImmersion': setImmersive(!document.body.classList.contains('immersive')); break;
+    // L237：音频播放器呼出/收起
+    case 'toggleAudioPanel':
+      if ($('audioPanel').classList.contains('hidden')) openAudioPanel();
+      else closeAudioPanel();
+      break;
+    // L238：全局卡片静音开关
+    case 'toggleCardMute': toggleCardMute(); break;
   }
 }
 
@@ -4579,31 +5168,52 @@ window.addEventListener('keydown', (e) => {
     else closePerfSettings();
     e.preventDefault(); return;
   }
-  // 表演中：空格暂停/继续；Esc 由下方通用分支退出表演
+  // 表演中：空格暂停/继续；Tab 切换模式；数字键 1-5 直跳指定模式；Esc 由下方通用分支退出表演
   if (perf.active) {
     if (e.code === 'Space') { togglePerfPause(); e.preventDefault(); return; }
+    if (e.key === 'Tab') { perfCycleMode(e.shiftKey ? -1 : 1); e.preventDefault(); return; }
+    // 数字键 1-5：直跳对应模式
+    const numModes = { '1': 'waterfall', '2': 'cards', '3': 'array', '4': 'slideshow', '5': 'cover' };
+    if (numModes[e.key]) {
+      const next = numModes[e.key];
+      if (next !== perf.mode) {
+        ensurePerfCfg().mode = next;
+        saveCfg();
+        syncPerfUI();
+        startPerfMode(next);
+        showTopToast('模式：' + ({ waterfall: '瀑布流', cards: '卡片动画', array: '阵列图案', slideshow: '幻灯片', cover: '封面流' })[next]);
+      }
+      e.preventDefault(); return;
+    }
     // 方向键 / WASD / Enter 等导航键在表演期间屏蔽（避免与视口自动滚动冲突）
     const navKeys = ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown','Enter'];
     if (navKeys.includes(e.key) || 'wasd'.includes(e.key.toLowerCase())) { e.preventDefault(); return; }
   }
 
-  // 音频播放界面打开时：空格播放/暂停、Esc 收起、左右切换
+  // 本地可配置快捷键（L240 截屏 / L238 卡片静音需要在所有界面全局生效，提前取出）
+  const ls = state.cfg?.localShortcuts ?? {};
+
+  // L240：截屏全局可用（视频=原始帧，图片=原图，其他=窗口截图）；默认 F11，可配置
+  const shotKey = state.cfg?.screenshotHotkey || 'F11';
+  if (e.key === shotKey || matchShortcut(shotKey, e)) { takeScreenshot(); e.preventDefault(); return; }
+  // L238：全局卡片静音/开启（默认 Ctrl+M，可配置）
+  if (matchShortcut(ls.toggleCardMute || 'Ctrl+m', e)) { runAction('toggleCardMute'); e.preventDefault(); return; }
+
+  // 音频播放界面打开时：空格播放/暂停、Esc 收起、左右切换、M（可配置）收起
   if (!$('audioPanel').classList.contains('hidden')) {
     if (e.key === 'Escape') { closeAudioPanel(); e.preventDefault(); return; }
+    if (matchShortcut(ls.toggleAudioPanel || 'm', e)) { closeAudioPanel(); e.preventDefault(); return; }
     if (e.code === 'Space') { audioToggle(); e.preventDefault(); return; }
     if (e.key === 'ArrowLeft') { audioPrev(); e.preventDefault(); return; }
     if (e.key === 'ArrowRight') { audioNext(false); e.preventDefault(); return; }
     return;
   }
 
-  const ls = state.cfg?.localShortcuts ?? {};
-
   if (!$('viewer').classList.contains('hidden')) {
     // 预览模式：Esc / 上下文件 + 播放器控制键
     if (matchShortcut(ls.viewerClose ?? 'Escape', e)) { closeViewer(); e.preventDefault(); return; }
-    // 截图：默认 F11，可在设置中配置
-    const shotKey = state.cfg?.screenshotHotkey ?? 'F11';
-    if (e.key === shotKey || matchShortcut(shotKey, e)) { takeScreenshot(); e.preventDefault(); return; }
+    // L255：Del 移入回收站；Shift+Del 永久删除（右键菜单也有入口）
+    if (e.key === 'Delete') { deleteViewerItem(e.shiftKey); e.preventDefault(); return; }
     // 可配置键 + 固定别名（方向键 / A / D）都能切上下文件
     const prevKey = matchShortcut(ls.viewerPrev ?? 'a', e) || e.key === 'ArrowLeft' || e.key.toLowerCase() === 'a';
     const nextKey = matchShortcut(ls.viewerNext ?? 'd', e) || e.key === 'ArrowRight' || e.key.toLowerCase() === 'd';
@@ -4621,7 +5231,8 @@ window.addEventListener('keydown', (e) => {
     if (e.code === 'Space') { if (isVideo) toggleVideoPlay(); e.preventDefault(); return; }
     // L129/L136：F 在预览器内 = 播放全屏统一入口
     if (e.key.toLowerCase() === 'f') { viewerFullscreenAction(); e.preventDefault(); return; }
-    if (e.key.toLowerCase() === 'm' && isVideo) { $('videoMute').click(); e.preventDefault(); return; }
+    // L237：预览器内的纯 M 仍是视频静音（Ctrl+M 已在全局作为卡片静音处理）
+    if (!e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'm' && isVideo) { $('videoMute').click(); e.preventDefault(); return; }
     if (e.key.toLowerCase() === 'l' && isVideo) { $('videoPlayMode').click(); e.preventDefault(); return; } // L151：L 键改为切换播放模式
     // 上下方向键：音量增减（步长 5%）
     if (e.key === 'ArrowUp' && isVideo) {
@@ -4796,7 +5407,9 @@ function syncSettingsUI() {
   const c = state.cfg;
   $('setOpacity').value = Math.round((eff('windowOpacity') ?? 1) * 100);
   $('setOpacityVal').textContent = Math.round((eff('windowOpacity') ?? 1) * 100) + '%';
-  $('setWallpaperPath').textContent = c.wallpaperPath ? c.wallpaperPath.split(/[\\/]/).pop() : '未选择';
+  $('setWallpaperPath').textContent = c.wallpaperPath
+    ? (c.wallpaperPath === BUILTIN_WALLPAPER ? 'wallpaper.jpg（内置默认）' : c.wallpaperPath.split(/[\\/]/).pop())
+    : '未选择';
   $('setWallpaperToggle').classList.toggle('on', !!eff('wallpaperEnabled'));
   $('setWallpaperOpacity').value = Math.round((eff('wallpaperOpacity') ?? 1) * 100);
   $('setWallSat').value = eff('wallSaturation') ?? 100; // L192
@@ -4826,8 +5439,15 @@ function syncSettingsUI() {
   $('setVideoSeekStep').value = c.videoSeekStep ?? 10;
   $('setScreenshotHotkey').value = c.screenshotHotkey ?? 'F11';
   $('setScreenshotDir').textContent = c.screenshotDir || '默认（项目/screenshots）';
+  $('setCardVolume').value = c.cardVolume ?? 20; // L238
+  $('setCardVolumeVal').textContent = Math.round(c.cardVolume ?? 20) + '%';
+  $('setHideCursor').classList.toggle('on', c.autoHideCursor !== false); // L241
   $('setImmersionFs').classList.toggle('on', c.immersiveFullscreen !== false);
   $('setTreeCount').classList.toggle('on', c.treeFolderCount !== false);
+  // L336：目录树系统/隐藏文件夹过滤
+  $('setTreeHideSystem').classList.toggle('on', c.treeHideSystem !== false);
+  $('setTreeShowHidden').classList.toggle('on', c.treeShowHidden === true);
+  $('setListMeta').classList.toggle('on', c.listViewMeta !== false); // L341
   refreshFfmpegStatus();
 
   $('setHotkey').value = c.globalHotkey ?? 'Shift+S';
@@ -4910,6 +5530,32 @@ $('setAccent').addEventListener('input', (e) => {
   setEff('accentColor', e.target.value);
   applyAppearance();
   saveCfg();
+});
+
+// ─── L239：默认外观（深/浅两套参数 + 壁纸路径）的保存与恢复 ───
+$('btnSaveAppearanceDefault').addEventListener('click', () => {
+  const c = state.cfg;
+  c.appearanceDefaults = {
+    wallpaperPath: c.wallpaperPath ?? null,
+    dark: JSON.parse(JSON.stringify(c.appearanceDark ?? {})),
+    light: JSON.parse(JSON.stringify(c.appearanceLight ?? {})),
+  };
+  saveCfg();
+  showTopToast('当前外观已存为默认（深/浅两套）');
+});
+$('btnRestoreAppearanceDefault').addEventListener('click', () => {
+  const d = state.cfg.appearanceDefaults;
+  if (!d || (d.dark == null && d.light == null)) {
+    setStatus('尚未保存过默认外观', true);
+    return;
+  }
+  if (d.wallpaperPath) state.cfg.wallpaperPath = d.wallpaperPath;
+  if (d.dark) state.cfg.appearanceDark = JSON.parse(JSON.stringify(d.dark));
+  if (d.light) state.cfg.appearanceLight = JSON.parse(JSON.stringify(d.light));
+  saveCfg();
+  applyAppearance();
+  syncSettingsUI();
+  showTopToast('已恢复默认外观');
 });
 
 // ─── 行为 TAB ───
@@ -5000,6 +5646,21 @@ $('setScreenshotDirPick').addEventListener('click', async () => {
     }
   } catch (e) { setStatus(`选择失败：${e}`, true); }
 });
+// L238：画廊卡片音量（Ctrl+M 取消静音时使用该音量）
+$('setCardVolume').addEventListener('input', (e) => {
+  const v = Number(e.target.value);
+  state.cfg.cardVolume = v;
+  $('setCardVolumeVal').textContent = v + '%';
+  applyCardAudioGlobal(); // 现存卡片即时跟随
+  saveCfg();
+});
+// L241：鼠标静止自动隐藏指针
+$('setHideCursor').addEventListener('click', (e) => {
+  state.cfg.autoHideCursor = !(state.cfg.autoHideCursor !== false);
+  e.target.classList.toggle('on', state.cfg.autoHideCursor);
+  if (state.cfg.autoHideCursor) document.body.classList.remove('cursor-idle');
+  saveCfg();
+});
 $('setImmersionFs').addEventListener('click', (e) => {
   state.cfg.immersiveFullscreen = !(state.cfg.immersiveFullscreen !== false);
   e.target.classList.toggle('on', state.cfg.immersiveFullscreen);
@@ -5009,6 +5670,28 @@ $('setTreeCount').addEventListener('click', async (e) => {
   state.cfg.treeFolderCount = !(state.cfg.treeFolderCount !== false);
   e.target.classList.toggle('on', state.cfg.treeFolderCount);
   await renderTree(); // 立即重绘目录树
+  saveCfg();
+});
+// L336：隐藏系统文件夹 / 显示隐藏文件夹——切换后重绘树并恢复当前目录定位
+$('setTreeHideSystem').addEventListener('click', async (e) => {
+  state.cfg.treeHideSystem = !(state.cfg.treeHideSystem !== false);
+  e.target.classList.toggle('on', state.cfg.treeHideSystem);
+  await renderTree();
+  if (state.currentDir) revealInTree(state.currentDir).catch(() => {});
+  saveCfg();
+});
+$('setTreeShowHidden').addEventListener('click', async (e) => {
+  state.cfg.treeShowHidden = !state.cfg.treeShowHidden;
+  e.target.classList.toggle('on', state.cfg.treeShowHidden);
+  await renderTree();
+  if (state.currentDir) revealInTree(state.currentDir).catch(() => {});
+  saveCfg();
+});
+// L341：列表视图信息列开关——切换后立即重绘文件区
+$('setListMeta').addEventListener('click', (e) => {
+  state.cfg.listViewMeta = !(state.cfg.listViewMeta !== false);
+  e.target.classList.toggle('on', state.cfg.listViewMeta);
+  renderVirtual();
   saveCfg();
 });
 $('setCacheDirPick').addEventListener('click', async () => {
@@ -5053,6 +5736,7 @@ $('setGalleryScrollStep').addEventListener('input', (e) => {
 });
 function applyGalleryGap() {
   document.documentElement.style.setProperty('--gallery-gap', (state.cfg?.galleryGap ?? 14) + 'px');
+  if (state.cfg?.viewMode === 'gallery') layoutGalleryNow(); // L236：间距变化重排
 }
 $('setDblClick').addEventListener('change', (e) => {
   state.cfg.doubleClickAction = e.target.value;
@@ -5216,6 +5900,14 @@ function fmtDur(sec) {
   return h ? `${h}:${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}` : `${m}:${String(ss).padStart(2, '0')}`;
 }
 
+// L341：列表视图「修改时间」列（Unix 秒 → YYYY-MM-DD HH:mm）
+function fmtDate(sec) {
+  if (!sec) return '';
+  const d = new Date(sec * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -5242,13 +5934,17 @@ const perf = {
 function perfCfg() {
   return state.cfg?.galleryPerf ?? {
     mode: 'waterfall', waterfallSpeed: 120, waterfallDirection: 'down',
-    waterfallBottom: 'bounce', waterfallDwell: 1,
+    waterfallBottom: 'bounce', waterfallDwell: 1, waterfallScrollMode: 'smooth',
     cardsCount: 0, cardsInterval: 2, cardsNoRepeat: true, cardsFade: 450,
     cardsAnim: 'zoomIn', cardsSync: true, cardsSyncMin: 0, cardsSyncMax: 2000,
-    arrayInterval: 2,
+    cardsRandomFx: false, cardsRandomCount: false, cardsCountMin: 3, cardsCountMax: 12,
+    cardsRandom: false, cardsFit: 'full',
+    arrayInterval: 2, arrayAnim: 'zoomIn', arrayRandomFx: false,
     slideCount: 0, slideInterval: 5, slideDuration: 0.9,
     slideEffect: 'kenburns', slideRandomFx: true, slideIncludeVideo: false,
-    coverInterval: 2.5, coverEffect: 'zoom',
+    slideRandom: false,
+    coverInterval: 2.5, coverEffect: 'zoom', coverRandomFx: false, coverSideCount: 3,
+    coverRandom: false,
     mute: true,
   };
 }
@@ -5269,10 +5965,65 @@ function perfFullSrc(item) {
 }
 const PERF_VIDEO_THUMB = 1280;
 
+// ─── 表演图片预加载队列：path -> Image 对象，已加载的进内存，展示时零闪烁 ───
+const perfImgPool = new Map();
+const PERF_IMG_MAX = 24; // 预加载图片上限（防内存膨胀）
+function perfPreloadImage(path) {
+  if (perfImgPool.has(path)) return;
+  const im = new Image();
+  im.decoding = 'async';
+  im.src = convertFileSrc(path);
+  perfImgPool.set(path, im);
+  if (perfImgPool.size > PERF_IMG_MAX) {
+    const first = perfImgPool.keys().next().value;
+    perfImgPool.delete(first);
+  }
+}
+/** 从预加载池取图；命中则直接复用 Image 对象（已缓存），未命中则创建并返回 */
+function perfTakeImage(path) {
+  return perfImgPool.get(path) || null;
+}
+/** 预加载一组媒体路径（图片才走 img 预载；视频走 perfEnsureVideo 池） */
+function perfPreloadMedia(items) {
+  for (const it of items) {
+    if (!it) continue;
+    if (it.kind === 'image') perfPreloadImage(it.path);
+    else if (it.kind === 'video') perfEnsureVideo(it.path).catch(() => {});
+  }
+}
+
+/**
+ * 随机图片队列：维护一个不断补充的随机媒体队列。
+ * 队列中的媒体都已预加载（图片进 perfImgPool，视频进 perfVidPool），
+ * 调用方取出即播，完全无加载延迟。
+ * - queueRef: 挂在 perf 对象上的字段名（每个模式独立队列）
+ * - list: 完整媒体池
+ * - n: 本次取几张
+ */
+function perfRandomQueue(queueRef, list, n) {
+  if (!list.length) return [];
+  if (!perf[queueRef]) perf[queueRef] = [];
+  const q = perf[queueRef];
+  // 队列水位低：补充一批新的随机媒体（不重复最近 5 张避免连续重复）
+  while (q.length < n + 4) {
+    const recent = new Set(q.slice(-5).map((x) => x.path));
+    const avail = list.filter((it) => !recent.has(it.path));
+    if (!avail.length) break;
+    const pick = avail[Math.floor(Math.random() * avail.length)];
+    q.push(pick);
+    // 后台异步预加载（不阻塞主流程）
+    if (pick.kind === 'image') perfPreloadImage(pick.path);
+    else if (pick.kind === 'video') perfEnsureVideo(pick.path).catch(() => {});
+  }
+  // 再预加载队列中未来几张（确保轮到它们时已加载完成）
+  perfPreloadMedia(q.slice(0, Math.min(q.length, n + 4)));
+  return q.splice(0, n);
+}
+
 // ─── 表演视频预判播放队列：提前创建/缓冲 video，展示即播；离队暂停、超量回收 ───
 // path -> { v: HTMLVideoElement, last: 时间戳 }。元素可在容器间移动（src 保留不重载）。
 const perfVidPool = new Map();
-const PERF_VID_MAX = 8;   // 同时缓冲的视频上限（当前展示 + 预判队列）
+const PERF_VID_MAX = 20;  // 同时缓冲的视频上限（当前展示 + 预判队列）
 const PERF_PREFETCH = 6; // 预判未来多少个媒体位
 
 /** 确保池中已有某视频（离屏即可开始缓冲，不播放） */
@@ -5294,17 +6045,34 @@ async function perfEnsureVideo(path) {
   return e;
 }
 
-/** 把视频挂进展示容器并起播（命中池则直接搬移，零加载延迟） */
-async function perfShowVideo(path, host) {
-  const e = await perfEnsureVideo(path);
-  if (!e || !perf.active || !host.isConnected) return;
-  e.last = performance.now();
-  // 裸元素挂载：清掉在别的模式（如幻灯片）残留的 class/样式
-  e.v.className = '';
-  e.v.removeAttribute('style');
-  e.v.muted = perfCfg().mute !== false;
-  if (e.v.parentElement !== host) host.appendChild(e.v);
-  e.v.play().catch(() => {});
+/** 把视频挂进展示容器并起播（命中池则同步挂载，零加载延迟；未命中走异步兜底） */
+function perfShowVideo(path, host) {
+  const attach = (e) => {
+    if (!e || !perf.active || !host.isConnected) return;
+    e.last = performance.now();
+    // 裸元素挂载：清掉在别的模式（如幻灯片）残留的 class/样式
+    e.v.className = '';
+    e.v.removeAttribute('style');
+    e.v.muted = perfCfg().mute !== false;
+    if (e.v.parentElement !== host) host.appendChild(e.v);
+    // 就绪检查：readyState>=2 有当前帧数据才能播；否则等 canplay 再起播，避免黑屏
+    const markReady = () => e.v.classList.add('ready');
+    if (e.v.readyState >= 2) {
+      markReady();
+      e.v.play().catch(() => {});
+    } else {
+      e.v.addEventListener('canplay', () => {
+        markReady();
+        if (e.v.isConnected && perf.active) e.v.play().catch(() => {});
+      }, { once: true });
+      e.v.load(); // 主动触发加载（某些浏览器对未显式 load 的 video 不预取）
+    }
+  };
+  // 同步快速路径：池中已缓冲（预加载队列已提前完成 playableVideoSrc + 视频元素创建）
+  const cached = perfVidPool.get(path);
+  if (cached) { attach(cached); return; }
+  // 异步兜底：未预加载（罕见，如预加载队列被 LRU 挤出），等加载完成再挂
+  perfEnsureVideo(path).then(attach).catch(() => {});
 }
 
 /** 暂停所有已脱离展示容器的池内视频（保留缓冲以便复用） */
@@ -5382,7 +6150,7 @@ function enterPerf() {
   if (perf.activatedImmersive) setImmersive(true);
   if (perfCfg().mute) muteAllCardPreviews();
   startPerfMode(perfCfg().mode || 'waterfall');
-  showTopToast('画廊表演中 · F2 设置 · 空格 暂停 · F1/Esc 退出');
+  showTopToast('画廊表演中 · F2 设置 · 1-5/Tab 切模式 · 空格 暂停 · F1/Esc 退出');
 }
 
 function exitPerf() {
@@ -5397,6 +6165,7 @@ function exitPerf() {
   overlay.classList.remove('perf-overlay');
   scroller.classList.remove('perf-bg-blur');
   scroller.style.filter = '';
+  scroller.style.transform = '';
   overlay.innerHTML = '';
   closePerfSettings();
   if (perf.activatedImmersive) { setImmersive(false); perf.activatedImmersive = false; }
@@ -5421,9 +6190,52 @@ function muteAllCardPreviews() {
   content.querySelectorAll('video.auto-preview').forEach((v) => { v.muted = true; });
 }
 
+// ─── L238：全局卡片音量/静音（设置/快捷键统一入口） ───
+/** 把配置里的卡片音量与静音态同步到所有现存预览视频（含池中复用实例）及其控件 UI */
+function applyCardAudioGlobal() {
+  const vol = Math.min(1, Math.max(0, (state.cfg?.cardVolume ?? 20) / 100));
+  const muted = state.cfg?.cardMuted !== false;
+  const syncOne = (v, ctrl) => {
+    v.volume = vol;
+    v.muted = muted;
+    if (!ctrl) return;
+    const s = ctrl.querySelector('.card-vol');
+    if (s && document.activeElement !== s) s.value = muted ? 0 : Math.round(vol * 100);
+    const b = ctrl.querySelector('.card-ctl-btn');
+    if (b) b.innerHTML = (muted || vol === 0) ? CARD_VOL_OFF : CARD_VOL_ON;
+  };
+  content.querySelectorAll('video.auto-preview').forEach((v) => {
+    syncOne(v, v.closest('.thumb-box')?.querySelector('.card-ctrl') ?? null);
+  });
+  for (const e of previewPool.values()) syncOne(e.v, e.ctrl);
+}
+
+/** 翻转全局卡片静音（默认快捷键 Ctrl+M，可配置） */
+function toggleCardMute() {
+  state.cfg.cardMuted = state.cfg.cardMuted === false; // undefined/true → false；false → true
+  applyCardAudioGlobal();
+  saveCfg();
+  showTopToast(state.cfg.cardMuted
+    ? '卡片预览已静音'
+    : `卡片预览已开启 · 音量 ${Math.round((state.cfg.cardVolume ?? 20))}%`);
+}
+
 function stopPerfTimers() {
   if (perf.rafId) { cancelAnimationFrame(perf.rafId); perf.rafId = 0; }
   if (perf.timer) { clearTimeout(perf.timer); clearInterval(perf.timer); perf.timer = 0; }
+}
+
+/** 循环切换表演模式：Tab 键 / 模式 TAB 点击均走这里 */
+const PERF_MODES = ['waterfall', 'cards', 'array', 'slideshow', 'cover'];
+function perfCycleMode(step = 1) {
+  const cur = PERF_MODES.indexOf(perf.mode);
+  const next = PERF_MODES[(cur + step + PERF_MODES.length) % PERF_MODES.length];
+  const c = ensurePerfCfg();
+  c.mode = next;
+  saveCfg();
+  syncPerfUI();
+  startPerfMode(next);
+  showTopToast('模式：' + ({ waterfall: '瀑布流', cards: '卡片动画', array: '阵列图案', slideshow: '幻灯片', cover: '封面流' })[next]);
 }
 
 /** 切换/启动表演模式（设置面板 TAB 选中即调用） */
@@ -5431,8 +6243,8 @@ function startPerfMode(mode) {
   stopPerfTimers();
   perf.mode = mode;
   const overlay = $('perfOverlay');
-  // 定格类模式（卡片动画 / 幻灯片 / 封面流）用覆盖层；瀑布流 / 随机阵列看真实画廊
-  const overlayModes = ['cards', 'slideshow', 'cover'];
+  // 定格类模式（卡片动画 / 阵列图案 / 幻灯片 / 封面流）用覆盖层；瀑布流看真实画廊
+  const overlayModes = ['cards', 'array', 'slideshow', 'cover'];
   const isOverlay = overlayModes.includes(mode);
   overlay.classList.toggle('hidden', !isOverlay);
   // 必须显式挂 perf-overlay：背景模糊/压暗样式全靠它（初始 HTML 上没有）
@@ -5444,7 +6256,9 @@ function startPerfMode(mode) {
   // 直接模糊+锁定画廊本体（覆盖层拦截点击，scroller 锁交互兜底，滚轮也传不过去）
   // 类 + 内联双保险：类负责 pointer-events，内联 filter 优先级最高，任何样式顺序都压不掉
   scroller.classList.toggle('perf-bg-blur', isOverlay);
-  scroller.style.filter = isOverlay ? 'blur(24px) scale(1.06)' : '';
+  // 内联兜底与 CSS 同理拆开：scale() 写进 filter 是非法值，整条会被浏览器丢弃
+  scroller.style.filter = isOverlay ? 'blur(15px)' : '';
+  scroller.style.transform = isOverlay ? 'scale(1.06)' : '';
   if (isOverlay) pauseAllCardPreviews();
   if (!isOverlay) {
     perfClearVideos();
@@ -5457,9 +6271,10 @@ function startPerfMode(mode) {
   else startCoverFlow();
 }
 
-// ─── 模式1 瀑布流：视口自动滚动（rAF，方向/触底回弹或从头/触底停留） ───
+// ─── 模式1 瀑布流：视口自动滚动（rAF 平滑 / setInterval 随机跳动） ───
 function startWaterfall() {
   const c = perfCfg();
+  perf.scrollMode = c.waterfallScrollMode === 'jump' ? 'jump' : 'smooth';
   perf.dir = c.waterfallDirection === 'up' ? -1 : 1;
   // 方向向上时从底部开始滚
   if (perf.dir < 0) scroller.scrollTop = scroller.scrollHeight;
@@ -5467,6 +6282,12 @@ function startWaterfall() {
   perf.dwellUntil = 0;
   perf.scrollAccum = 0;
   perf._lastPreviewSync = 0;
+  if (perf.scrollMode === 'jump') {
+    // 随机跳动：整合旧随机阵列逻辑，跳动速度用 arrayInterval 控制
+    jumpRandomViewport();
+    scheduleWaterfallJumpTimer();
+    return;
+  }
   const tick = (ts) => {
     if (!perf.active || perf.mode !== 'waterfall') return;
     const dt = Math.min(0.1, (ts - perf.lastTs) / 1000); // 失焦恢复时限幅，避免一次跳很远
@@ -5501,10 +6322,25 @@ function startWaterfall() {
   perf.rafId = requestAnimationFrame(tick);
 }
 
+/** 瀑布流 jump 模式：定时随机跳动视口 */
+function scheduleWaterfallJumpTimer() {
+  if (perf.timer) { clearTimeout(perf.timer); clearInterval(perf.timer); perf.timer = 0; }
+  const arm = (ms) => {
+    perf.timer = setTimeout(() => {
+      if (!perf.active || perf.mode !== 'waterfall') return;
+      if (perf.paused) { arm(250); return; }
+      jumpRandomViewport();
+      arm(Math.max(500, (perfCfg().arrayInterval ?? 2) * 1000));
+    }, ms);
+  };
+  arm(Math.max(500, (perfCfg().arrayInterval ?? 2) * 1000));
+}
+
 // 滚轮直接控制瀑布流方向（被动监听，不 preventDefault：现有手动滚动完全不受限制）
 scroller.addEventListener('wheel', (e) => {
   if (!perf.active || perf.mode !== 'waterfall' || perf.paused) return;
   if (!e.deltaY) return;
+  if (perf.scrollMode === 'jump') return; // 随机跳动模式下滚轮只负责浏览，不改变方向
   perf.dir = e.deltaY > 0 ? 1 : -1;
   perf.dwellUntil = 0;
   perf.scrollAccum = 0;
@@ -5546,58 +6382,170 @@ function perfNext(list) {
 }
 
 /** 媒体宽高比（缩略图元数据优先，未知按横竖类型兜底；forced=true 表示用了兜底） */
+/** 图片真实宽高比缓存：path -> {w, h}。装箱前由 perfEnsureAspect 主动填充 */
+const perfRealAspect = new Map();
 function perfAspect(item) {
+  // 优先取真实宽高比（perfRealAspect），其次缩略图元数据，最后兜底
+  const real = perfRealAspect.get(item.path);
+  if (real) return { w: real.w, h: real.h, forced: false };
   const t = thumbAny(item.path);
   const w = t?.w || item.width, h = t?.h || item.height;
   if (w > 0 && h > 0) return { w, h, forced: false };
   return item.kind === 'video' ? { w: 16, h: 9, forced: true } : { w: 1, h: 1, forced: true };
 }
 
+/** 主动加载图片拿真实宽高比（视频走 thumbAny 兜底），结果写入 perfRealAspect */
+async function perfEnsureAspect(item) {
+  if (perfRealAspect.has(item.path)) return;
+  if (item.kind !== 'image') return; // 视频用 16:9 兜底，由 perfShowVideo 后续自适应
+  if (!perfAspect(item).forced) return; // 已有元数据
+  await new Promise((resolve) => {
+    const im = new Image();
+    im.onload = () => {
+      if (im.naturalWidth > 0 && im.naturalHeight > 0) {
+        perfRealAspect.set(item.path, { w: im.naturalWidth, h: im.naturalHeight });
+      }
+      resolve();
+    };
+    im.onerror = () => resolve();
+    im.src = convertFileSrc(item.path);
+  });
+}
+
 /**
- * 两端对齐（justified）布局：按行贪心装满整个视口宽度，行高反向缩放使
- * 每行恰好顶满左右边缘；二分搜索基准行高使总高度最接近视口高度。
- * 相比均分网格，留白极小、卡片占比尽量大且不裁剪。
+ * 卡片动画铺设：整洁 + 大小有节奏差异 + 铺满。
+ *
+ * full（完整显示，contain 不裁切）：
+ *   动态规划找最优行分组 → 每组按比例分配高度 → 每行反向缩放让宽度恰好铺满。
+ *   框比=图比，contain 紧贴无留白；行高自然差异（如首行高、末行矮），不强制统一。
+ *
+ * fill（铺满，cover 兜底）：
+ *   宽高比自适应递归二分 treemap：横图给横框、竖图给竖框，
+ *   每次沿能使子框宽高比最接近子集媒体均值的方向切割。绝大多数框比≈图比，
+ *   cover 裁切量最小化；仅极端宽高比图（如全景/长条）才需明显裁切。
  */
-function perfJustified(picked, W, H, gap, pad) {
+function perfJustified(picked, W, H, gap, pad, fit = 'full') {
   if (!picked.length) return [];
   const availW = W - pad * 2;
-  let lo = 80, hi = H, best = null;
-  for (let iter = 0; iter < 14; iter++) {
-    const baseH = (lo + hi) / 2;
-    const rows = [];
-    let cur = [], curW = 0;
-    for (const it of picked) {
-      const { w, h } = perfAspect(it);
-      const add = baseH * (w / h) + (cur.length ? gap : 0);
-      if (cur.length && curW + add > availW) { rows.push(cur); cur = []; curW = 0; }
-      cur.push(it);
-      curW += add;
+  const availH = H - pad * 2;
+  const n = picked.length;
+  const AR = picked.map((it) => { const a = perfAspect(it); return a.w / a.h; });
+
+  // ─── fill：宽高比自适应 treemap ───
+  if (fit === 'fill') {
+    const boxes = [];
+    function split(items, x, y, w, h) {
+      if (!items.length) return;
+      if (items.length === 1) {
+        boxes.push({ item: items[0].it, x: x + gap / 2, y: y + gap / 2, w: w - gap, h: h - gap });
+        return;
+      }
+      // 子集平均宽高比
+      const mid = Math.ceil(items.length / 2);
+      const L = items.slice(0, mid), R = items.slice(mid);
+      const avgArL = L.reduce((s, o) => s + o.ar, 0) / L.length;
+      const avgArR = R.reduce((s, o) => s + o.ar, 0) / R.length;
+      // 候选 A：垂直切（左右分）。左框宽 lw，右框宽 w-lw。
+      //   让 lw/w = mid/n，则左框 AR = (lw)/(h)，右框 AR = (w-lw)/h
+      // 候选 B：水平切（上下分）。上框 AR = w/th，下框 AR = w/(h-th)
+      // 评分：子框 AR 与子集媒体平均 AR 的偏差（log 比例越小越好）
+      const lwA = w * mid / items.length;
+      const scoreA = Math.abs(Math.log((lwA / h) / avgArL)) + Math.abs(Math.log(((w - lwA) / h) / avgArR));
+      const thB = h * mid / items.length;
+      const scoreB = Math.abs(Math.log((w / thB) / avgArL)) + Math.abs(Math.log((w / (h - thB)) / avgArR));
+      if (scoreA <= scoreB) {
+        split(L, x, y, lwA, h);
+        split(R, x + lwA, y, w - lwA, h);
+      } else {
+        split(L, x, y, w, thB);
+        split(R, x, y + thB, w, h - thB);
+      }
     }
-    if (cur.length) rows.push(cur);
-    let total = 0;
-    const rowHs = rows.map((r) => {
-      const nat = r.reduce((s, x) => { const a = perfAspect(x); return s + baseH * (a.w / a.h); }, 0);
-      const rh = baseH * (availW - (r.length - 1) * gap) / nat;
-      total += rh;
-      return rh;
-    });
-    total += (rows.length - 1) * gap;
-    if (!best || Math.abs(total - (H - pad * 2)) < best.diff) best = { rows, rowHs, total, diff: Math.abs(total - (H - pad * 2)) };
-    if (total > H - pad * 2) hi = baseH; else lo = baseH;
+    split(picked.map((it, i) => ({ it, ar: AR[i] })), pad, pad, availW, availH);
+    return boxes;
   }
-  const y0 = pad + Math.max(0, (H - pad * 2 - best.total) / 2); // 垂直方向多余空间居中
-  const out = [];
-  let y = y0;
-  best.rows.forEach((r, ri) => {
-    const rh = best.rowHs[ri];
-    let x = pad;
-    for (const it of r) {
-      const { w, h } = perfAspect(it);
-      const bw = rh * (w / h);
-      out.push({ item: it, x, y, w: bw, h: rh });
-      x += bw + gap;
+
+  // ─── full：DP 最优行分组 + 行高比例分配 ───
+  // step 1：DP 找最优行数 R
+  // cost(i,j) = 第 i..j 张图组成一行时，铺满 availW 所需行高
+  // totalH(R 行分组) = sum(行高) + (R-1)*gap，选 ≤ availH 且最大
+  const cost = [];
+  for (let i = 0; i < n; i++) {
+    cost[i] = [];
+    let sumAR = 0;
+    for (let j = i; j < n; j++) {
+      sumAR += AR[j];
+      const gaps = (j - i) * gap;
+      cost[i][j] = (availW - gaps) / sumAR;
     }
-    y += rh + gap;
+  }
+  // dp[j] = 前 j 张图分成若干行，总高度 ≤ availH 时的最大高度
+  // prev[j] = 第 j 张图所在行的起始索引
+  const dp = new Array(n + 1).fill(-1);
+  const prev = new Array(n + 1).fill(-1);
+  dp[0] = 0;
+  for (let j = 1; j <= n; j++) {
+    for (let i = 0; i < j; i++) {
+      if (dp[i] < 0) continue;
+      const rowH = cost[i][j - 1];
+      const newTotal = dp[i] + rowH + (i > 0 ? gap : 0);
+      if (newTotal <= availH && newTotal > dp[j]) {
+        dp[j] = newTotal;
+        prev[j] = i;
+      }
+    }
+  }
+  // 回溯得到行分组
+  let rows = [];
+  if (dp[n] >= 0) {
+    let j = n;
+    while (j > 0) {
+      const i = prev[j];
+      rows.unshift({ start: i, end: j - 1, height: cost[i][j - 1] });
+      j = i;
+    }
+  } else {
+    // 兜底：单行 + 行高不超 availH
+    rows = [{ start: 0, end: n - 1, height: Math.min(cost[0][n - 1], availH) }];
+  }
+
+  // step 2：如果 DP 结果行数过少（单行但多图），强制分行
+  if (rows.length === 1 && n > 1) {
+    // 用理想行数强制分组
+    const R = Math.max(2, Math.min(n, Math.round(Math.sqrt(n * availH / availW))));
+    rows = [];
+    const per = Math.ceil(n / R);
+    for (let i = 0; i < n; i += per) {
+      const end = Math.min(n - 1, i + per - 1);
+      rows.push({ start: i, end, height: cost[i][end] });
+    }
+  }
+
+  // step 3：高度按比例缩放到 availH
+  const totalNat = rows.reduce((s, r) => s + r.height, 0) + (rows.length - 1) * gap;
+  const scale = totalNat > 0 ? availH / totalNat : 1;
+  // full 模式：仅在缩小或微调（≤1.02x）时应用 scale，避免放大后行宽不足
+  const finalScale = Math.min(scale, 1.02);
+
+  // step 4：生成 boxes
+  const out = [];
+  let y = pad;
+  rows.forEach((row) => {
+    const rh = row.height * finalScale;
+    // 行内：每张图宽度 = rh * AR，反向缩放让总宽 = availW
+    const items = picked.slice(row.start, row.end + 1);
+    const sumAR = items.reduce((s, it) => { const a = perfAspect(it); return s + a.w / a.h; }, 0);
+    const rowW = rh * sumAR + (items.length - 1) * gap;
+    // 若行宽 ≠ availW（因 finalScale ≠ 1 或取整），反向缩放让宽度铺满
+    const adjRh = rh * (availW - (items.length - 1) * gap) / (rh * sumAR);
+    let x = pad;
+    items.forEach((it) => {
+      const a = perfAspect(it);
+      const bw = adjRh * (a.w / a.h);
+      out.push({ item: it, x, y, w: bw, h: adjRh });
+      x += bw + gap;
+    });
+    y += adjRh + gap;
   });
   return out;
 }
@@ -5635,7 +6583,11 @@ function scheduleCardsTimer() {
 function perfCardInner(item) {
   const src = perfFullSrc(item);
   if (src) return `<img src="${src}" alt="" draggable="false" decoding="async">`;
-  return `<div class="perf-vid" data-perf-video="${escapeAttr(item.path)}"></div>`;
+  // 视频：先放缩略图占位（避免首次黑屏），perfShowVideo ready 后 video 覆盖在上面
+  // thumbAny 返回 {url, duration, w, h} 对象，需取 .url
+  const thumb = thumbAny(item.path)?.url || '';
+  const cover = thumb ? `<img src="${thumb}" alt="" draggable="false" decoding="async" class="perf-vid-cover">` : '';
+  return `<div class="perf-vid" data-perf-video="${escapeAttr(item.path)}">${cover}</div>`;
 }
 
 /**
@@ -5666,7 +6618,7 @@ function perfCandidates(list, maxN) {
   return { items: idx.slice(0, Math.min(maxN, idx.length)).map((i) => list[i]), consume: () => {} };
 }
 
-/** 快切一帧：真实宽高比的两端对齐布局（不堆叠、占比大）+ 入场动画 + 错峰延迟 */
+/** 快切一帧：真实宽高比的两端对齐布局（不堆叠、占比大）+ 每卡独立入场动画 + 错峰延迟 */
 async function dealCardsFrame() {
   const overlay = $('perfOverlay');
   const c = perfCfg();
@@ -5675,14 +6627,19 @@ async function dealCardsFrame() {
   const gap = 6, pad = 8;
   const W = window.innerWidth, H = window.innerHeight;
   // 先取最多 24 个候选，布局前拿到全部真实宽高比
-  // （缺元数据时按 1:1/16:9 兜底会导致单行误判；512 缩略图大多已缓存）
+  // （缺元数据时按 1:1/16:9 兜底会导致单行误判；改用 perfEnsureAspect 直接 new Image 拿 naturalWidth）
   const cand = perfCandidates(list, 24);
-  await Promise.all(cand.items.map(async (it) => {
-    if (perfAspect(it).forced) { try { await loadThumb(it.path, it.kind, 512); } catch { /* 忽略 */ } }
-  }));
+  await Promise.all(cand.items.map(perfEnsureAspect));
   if (!perf.active || perf.mode !== 'cards' || myFrame !== perf._frame) return;
   let picked;
-  if (!(c.cardsCount > 0)) {
+  // 随机数量开关：开启时每帧在 [cardsCountMin, cardsCountMax] 区间内随机
+  let targetCount = c.cardsCount;
+  if (c.cardsRandomCount) {
+    const lo = Math.max(1, Math.min(50, c.cardsCountMin ?? 3));
+    const hi = Math.max(lo, Math.min(50, c.cardsCountMax ?? 12));
+    targetCount = lo + Math.floor(Math.random() * (hi - lo + 1));
+  }
+  if (!(targetCount > 0)) {
     // 自动数量：用固定目标行高（约屏高 1/2.6，一屏 2~3 行大卡）做贪心装箱，
     // 不断加入卡片直到排满视口高度。不能依赖 perfJustified 的结果反推数量——
     // 它为了填满高度会把单张宽图也放大到整行满高，任何"按填充率/总高"的
@@ -5700,20 +6657,35 @@ async function dealCardsFrame() {
     }
     picked = cand.items.slice(0, Math.max(1, n));
   } else {
-    picked = cand.items.slice(0, Math.min(24, c.cardsCount));
+    picked = cand.items.slice(0, Math.min(24, targetCount));
   }
   if (!picked.length) return;
-  cand.consume(picked.length);
-  const boxes = perfJustified(picked, W, H, gap, pad);
+  // 随机图片开启：从预加载随机队列取（媒体已在后台加载完毕，无白闪）
+  if (c.cardsRandom) {
+    picked = perfRandomQueue('_cardsQueue', perfMedia(), targetCount);
+    if (!picked.length) return;
+    // 随机分支：拿队列媒体的真实宽高比
+    await Promise.all(picked.map(perfEnsureAspect));
+    if (!perf.active || perf.mode !== 'cards' || myFrame !== perf._frame) return;
+  } else {
+    cand.consume(picked.length);
+  }
+  const fit = c.cardsFit === 'fill' ? 'fill' : 'full';
+  const boxes = perfJustified(picked, W, H, gap, pad, fit);
+  overlay.dataset.fit = fit; // CSS 按 data-fit 切换 object-fit
   const dur = Math.max(0, c.cardsFade ?? 450);
   const lo = Math.min(c.cardsSyncMin ?? 0, c.cardsSyncMax ?? 2000);
   const hi = Math.max(lo, c.cardsSyncMax ?? 2000);
-  overlay.dataset.anim = c.cardsAnim || 'zoomIn';
+  // 每卡独立动画（CSS 用 data-anim 而非 overlay.dataset.anim：保证每帧/每卡都能重新触发）
+  const FX_LIST = ['zoomIn', 'zoomOut', 'slideUp', 'slideDown', 'slideLeft', 'slideRight', 'blur', 'rotateIn', 'expand', 'swing', 'fade'];
   let html = '';
   for (const b of boxes) {
+    const anim = c.cardsRandomFx
+      ? FX_LIST[Math.floor(Math.random() * FX_LIST.length)]
+      : (c.cardsAnim || 'zoomIn');
     // 同步开启：每张卡片独立的随机入场延迟（错峰出现，充满随机）
     const delay = c.cardsSync && dur > 0 ? Math.round(lo + Math.random() * (hi - lo)) : 0;
-    html += `<div class="perf-card" style="left:${b.x}px;top:${b.y}px;width:${b.w}px;height:${b.h}px;` +
+    html += `<div class="perf-card" data-anim="${anim}" style="left:${b.x}px;top:${b.y}px;width:${b.w}px;height:${b.h}px;` +
       `transition-duration:${dur}ms;transition-delay:${delay}ms">${perfCardInner(b.item)}</div>`;
   }
   overlay.innerHTML = html;
@@ -5729,18 +6701,167 @@ async function dealCardsFrame() {
   overlay.querySelectorAll('.perf-card').forEach((el) => el.classList.add('on'));
 }
 
-// ─── 模式3 随机阵列：正常排序，视口快切跳动（优先跳到全新卡片区域） ───
+// ─── 模式3 阵列图案：弹出式，卡片随机整齐排列成图案（网格/条纹/团簇/环/菱形） ───
+const ARRAY_PATTERNS = ['grid', 'rows', 'cols', 'cluster', 'ring', 'diamond'];
+
 function startRandomArray() {
-  jumpRandomViewport(); // 立即第一跳
+  perfShuffle(perfMedia());
+  dealArrayFrame(); // 立即铺第一帧
   scheduleArrayTimer();
 }
 
 function scheduleArrayTimer() {
-  if (perf.timer) clearInterval(perf.timer);
-  perf.timer = setInterval(() => {
-    if (perf.paused) return;
-    jumpRandomViewport();
-  }, Math.max(300, (perfCfg().arrayInterval ?? 2) * 1000));
+  if (perf.timer) { clearTimeout(perf.timer); perf.timer = 0; }
+  const arm = (ms) => {
+    perf.timer = setTimeout(() => {
+      if (!perf.active || perf.mode !== 'array') return;
+      if (perf.paused) { arm(250); return; }
+      dealArrayFrame();
+      arm(Math.max(300, (perfCfg().arrayInterval ?? 2) * 1000));
+    }, ms);
+  };
+  arm(Math.max(300, (perfCfg().arrayInterval ?? 2) * 1000));
+}
+
+/**
+ * 生成一帧图案布局：随机一种图案 + 随机数量/大小，返回 [{item,x,y,w,h}]
+ * 所有图案都基于网格对齐，保证"随机但整齐"
+ */
+function arrayPatternLayout(picked, W, H) {
+  const pattern = ARRAY_PATTERNS[Math.floor(Math.random() * ARRAY_PATTERNS.length)];
+  const pad = 24, gap = 10;
+  const availW = W - pad * 2, availH = H - pad * 2;
+  const n = picked.length;
+  const boxes = [];
+  // 通用网格定位：rows × cols 均分布置，返回 cell 中心与尺寸
+  const gridCells = (rows, cols, regionW, regionH, offX = 0, offY = 0) => {
+    const cw = (regionW - (cols - 1) * gap) / cols;
+    const ch = (regionH - (rows - 1) * gap) / rows;
+    const cells = [];
+    for (let r = 0; r < rows; r++)
+      for (let c = 0; c < cols; c++)
+        cells.push({ x: offX + c * (cw + gap), y: offY + r * (ch + gap), w: cw, h: ch });
+    return cells;
+  };
+  if (pattern === 'grid') {
+    // 均分网格：行列数随机（2-4 列，1-3 行），卡数 = 行×列
+    const cols = Math.max(2, Math.min(4, Math.ceil(Math.sqrt(n))));
+    const rows = Math.max(1, Math.ceil(n / cols));
+    const cells = gridCells(rows, cols, availW, availH, pad, pad);
+    for (let i = 0; i < n; i++) boxes.push({ item: picked[i], ...cells[i] });
+  } else if (pattern === 'rows' || pattern === 'cols') {
+    // 横向条纹 / 纵向条纹：随机分带数（2-4），每带随机卡数
+    const bands = 2 + Math.floor(Math.random() * 3); // 2-4
+    const isRows = pattern === 'rows';
+    const bandSize = (isRows ? availH : availW) / bands;
+    let idx = 0;
+    for (let b = 0; b < bands && idx < n; b++) {
+      const inBand = Math.max(1, Math.round(n / bands)) + (b < n % bands ? 1 : 0);
+      const cells = isRows
+        ? gridCells(1, inBand, availW, bandSize - gap, pad, pad + b * bandSize)
+        : gridCells(inBand, 1, bandSize - gap, availH, pad + b * bandSize, pad);
+      for (let i = 0; i < inBand && idx < n; i++, idx++) boxes.push({ item: picked[idx], ...cells[i] });
+    }
+  } else if (pattern === 'cluster') {
+    // 中央团簇：1 张大主卡（约 1/3 屏）居中，周围环绕小卡（环形排列）
+    const mainW = availW * (0.28 + Math.random() * 0.08);
+    const mainH = availH * (0.42 + Math.random() * 0.1);
+    const mx = pad + (availW - mainW) / 2, my = pad + (availH - mainH) / 2;
+    boxes.push({ item: picked[0], x: mx, y: my, w: mainW, h: mainH });
+    const ringN = n - 1;
+    if (ringN > 0) {
+      const cx = pad + availW / 2, cy = pad + availH / 2;
+      const rx = mainW / 2 + 90, ry = mainH / 2 + 90;
+      const ringW = 130, ringH = 130;
+      for (let i = 0; i < ringN; i++) {
+        const a = (i / ringN) * Math.PI * 2 - Math.PI / 2;
+        const x = cx + Math.cos(a) * rx - ringW / 2;
+        const y = cy + Math.sin(a) * ry - ringH / 2;
+        boxes.push({ item: picked[i + 1], x, y, w: ringW, h: ringH });
+      }
+    }
+  } else if (pattern === 'ring') {
+    // 环形阵列：卡片均匀分布在圆环上（半径自适应）
+    const cx = pad + availW / 2, cy = pad + availH / 2;
+    const radius = Math.min(availW, availH) * (0.3 + Math.random() * 0.1);
+    const size = Math.max(90, Math.min(180, Math.floor((Math.min(availW, availH) * 0.8) / n)));
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+      const x = cx + Math.cos(a) * radius - size / 2;
+      const y = cy + Math.sin(a) * radius - size / 2;
+      boxes.push({ item: picked[i], x, y, w: size, h: size });
+    }
+  } else if (pattern === 'diamond') {
+    // 菱形阵列：1-2-3-2-1 或 2-3-2 等菱形行分布
+    const rowsSeq = n <= 3 ? [n] : n <= 5 ? [1, n - 2, 1] : n <= 9 ? [1, 2, n - 6 >= 0 ? n - 6 : 2, 2, 1] : [2, 3, n - 10 >= 0 ? n - 10 : 3, 3, 2];
+    const rows = rowsSeq.length;
+    const maxInRow = Math.max(...rowsSeq);
+    const cellH = (availH - (rows - 1) * gap) / rows;
+    let idx = 0;
+    for (let r = 0; r < rows && idx < n; r++) {
+      const inRow = rowsSeq[r];
+      const cellW = (availW - (maxInRow - 1) * gap) / maxInRow;
+      const rowW = inRow * cellW + (inRow - 1) * gap;
+      const startX = pad + (availW - rowW) / 2;
+      const y = pad + r * (cellH + gap);
+      for (let c = 0; c < inRow && idx < n; c++, idx++) {
+        boxes.push({ item: picked[idx], x: startX + c * (cellW + gap), y, w: cellW, h: cellH });
+      }
+    }
+  }
+  // 最后按媒体真实宽高比修正每个框（保持整齐的同时让比例不畸形）
+  for (const b of boxes) {
+    const a = perfAspect(b.item);
+    const ar = a.w / a.h;
+    const boxAr = b.w / b.h;
+    if (Math.abs(ar - boxAr) / boxAr > 0.4) {
+      // 差异过大：以高度为基准收缩宽度（保持整齐行高，只调宽度）
+      const newW = Math.min(b.w, b.h * ar);
+      b.x += (b.w - newW) / 2;
+      b.w = newW;
+    }
+  }
+  return boxes;
+}
+
+/** 铺一阵列图案帧 */
+async function dealArrayFrame() {
+  const overlay = $('perfOverlay');
+  const c = perfCfg();
+  const list = perfMedia();
+  const myFrame = (perf._frame = (perf._frame || 0) + 1);
+  const W = window.innerWidth, H = window.innerHeight;
+  // 随机数量：每次 6-14 张之间浮动（保证每次都不一样）
+  const want = 6 + Math.floor(Math.random() * 9);
+  const cand = perfCandidates(list, Math.max(want, 14));
+  await Promise.all(cand.items.map(async (it) => {
+    if (perfAspect(it).forced) { try { await loadThumb(it.path, it.kind, 512); } catch { /* 忽略 */ } }
+  }));
+  if (!perf.active || perf.mode !== 'array' || myFrame !== perf._frame) return;
+  const picked = cand.items.slice(0, want);
+  if (!picked.length) return;
+  cand.consume(picked.length);
+  const boxes = arrayPatternLayout(picked, W, H);
+  const dur = Math.max(0, c.cardsFade ?? 450);
+  // 每卡独立动画：随机开关开启则每卡随机，否则用统一设置
+  const FX_LIST = ['zoomIn', 'zoomOut', 'slideUp', 'slideDown', 'slideLeft', 'slideRight', 'blur', 'rotateIn', 'expand', 'swing', 'fade'];
+  let html = '';
+  for (const b of boxes) {
+    const anim = c.arrayRandomFx
+      ? FX_LIST[Math.floor(Math.random() * FX_LIST.length)]
+      : (c.arrayAnim || 'zoomIn');
+    const delay = c.cardsSync && dur > 0 ? Math.round(Math.random() * (c.cardsSyncMax ?? 2000)) : 0;
+    html += `<div class="perf-card" data-anim="${anim}" style="left:${b.x}px;top:${b.y}px;width:${b.w}px;height:${b.h}px;` +
+      `transition-duration:${dur}ms;transition-delay:${delay}ms">${perfCardInner(b.item)}</div>`;
+  }
+  overlay.innerHTML = html;
+  overlay.querySelectorAll('[data-perf-video]').forEach((n) => {
+    perfShowVideo(n.dataset.perfVideo, n);
+  });
+  perfPrefetch([...picked.map((it) => it.path), ...perfUpcoming(list)]);
+  perfPauseDetached();
+  void overlay.offsetWidth;
+  overlay.querySelectorAll('.perf-card').forEach((el) => el.classList.add('on'));
 }
 
 /** 快切跳动：优先跳到与当前视口无重叠的位置；内容不足一屏则纯随机 */
@@ -5764,13 +6885,14 @@ function jumpRandomViewport() {
   scroller.scrollTop = target; // 快切，无平滑
   // 跳动后等虚拟列表完成重建（两帧）立即挂载新位置视频，不必等 250ms 防抖
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (perf.active && perf.mode === 'array' && !perf.paused) setupAutoPreviews();
+    if (perf.active && (perf.mode === 'array' || perf.mode === 'waterfall') && !perf.paused) setupAutoPreviews();
   }));
 }
 
 // ─── 模式4 幻灯片：1-2 张大图/视频轮流展示，Ken Burns / 平移 / 翻转 / 圆形展开等 ───
 const SLIDE_FX = ['kenburns', 'panL', 'panR', 'fade', 'blur', 'flip', 'slideL', 'circle', 'blackout'];
 let slideTurn = 0;
+let slideDual = false; // 自动模式：当前是否双槽（竖版媒体左右并排）
 function startSlideshow() {
   const list = perfSlideMedia();
   if (!list.length) { // 无媒体：提示并回退瀑布流，避免黑屏
@@ -5780,39 +6902,102 @@ function startSlideshow() {
   }
   perfShuffle(list);
   slideTurn = 0;
+  slideDual = false;
   const overlay = $('perfOverlay');
-  // 0 = 自动：竖屏（高>宽）上下两张，横屏一张全屏大图；强制 2 张时按屏幕方向排列
+  // 0 = 自动：按媒体方向动态切换——竖版媒体左右并排 2 张，横版媒体单张全屏；
+  // 强制 2 张时按屏幕方向排列（竖屏窗口上下、横屏窗口左右）
   const cfgN = perfCfg().slideCount | 0;
+  const auto = cfgN === 0;
   const portrait = window.innerHeight > window.innerWidth;
-  const n = cfgN === 0 ? (portrait ? 2 : 1) : Math.min(2, Math.max(1, cfgN));
+  const n = auto ? 2 : Math.min(2, Math.max(1, cfgN)); // 自动模式常驻双槽，按媒体方向显隐
   overlay.innerHTML = '';
   for (let i = 0; i < n; i++) {
     const slot = document.createElement('div');
     slot.className = 'slide-slot';
-    if (n === 2) {
+    if (!auto && n === 2) {
       if (portrait) { slot.style.top = i === 0 ? '0' : '50%'; slot.style.height = '50%'; }
       else { slot.style.left = i === 0 ? '0' : '50%'; slot.style.width = '50%'; }
     }
     overlay.appendChild(slot);
-    swapSlide(slot, list); // 每格先上一张
   }
+  // 首轮上片：自动模式走 slideTick（按首个媒体方向定单/双槽），固定模式每格先上一张
+  if (auto) { layoutSlideSlots(overlay, false); slideTick(overlay, list); }
+  else overlay.querySelectorAll('.slide-slot').forEach((s) => swapSlide(s, list));
   perfPrefetch(perfUpcoming(list, 8));
   if (perf.timer) clearInterval(perf.timer);
   perf.timer = setInterval(() => {
     if (perf.paused) return;
-    const slots = overlay.querySelectorAll('.slide-slot');
-    if (!slots.length) return;
-    swapSlide(slots[slideTurn % slots.length], list);
-    slideTurn++;
-    perfPrefetch(perfUpcoming(list, 8));
-    perfPauseDetached();
+    slideTick(overlay, list);
   }, Math.max(500, (perfCfg().slideInterval ?? 5) * 1000));
 }
 
+/** 自动模式槽位布局：双槽=左右各半（竖版媒体并排），单槽=全屏（另一槽隐藏） */
+function layoutSlideSlots(overlay, dual) {
+  overlay.querySelectorAll('.slide-slot').forEach((s, i) => {
+    s.style.top = '0'; s.style.height = '100%';
+    if (dual) { s.style.display = ''; s.style.left = i === 0 ? '0' : '50%'; s.style.width = '50%'; }
+    else { s.style.display = i === 0 ? '' : 'none'; s.style.left = '0'; s.style.width = '100%'; }
+  });
+}
+
+/** 每个间隔换一次片：固定模式轮槽；自动模式先看媒体方向，竖版切双槽、横版切单槽。
+ *  fillOnly=true 表示首轮补位：不再翻转布局，避免一次 tick 内单/双槽来回跳导致两张叠在同一槽 */
+function slideTick(overlay, list, fillOnly) {
+  const slots = overlay.querySelectorAll('.slide-slot');
+  if (!slots.length) return;
+  const auto = (perfCfg().slideCount | 0) === 0;
+  if (auto) {
+    const item = perfNext(list);
+    if (!item) return;
+    const a = perfAspect(item);
+    let wantDual = fillOnly ? slideDual : a.h > a.w; // 竖版媒体：候选左右并排两张
+    // 宽度预算：两张并排按屏高折算的自然宽度之和超出屏宽（预留边距与 Ken Burns 运动余量）时，只显示一张
+    if (wantDual && !fillOnly) {
+      const otherPath = slideDual ? slots[1 - (slideTurn % 2)]?.dataset.path : null;
+      const otherItem = otherPath ? list.find((x) => x.path === otherPath) : null;
+      const oa = otherItem ? perfAspect(otherItem) : a; // 尚无同伴时按两张同宽估算
+      const sumW = window.innerHeight * (a.w / a.h + oa.w / oa.h);
+      if (sumW > window.innerWidth * 0.85) wantDual = false;
+    }
+    if (!fillOnly && wantDual !== slideDual) {
+      slideDual = wantDual;
+      layoutSlideSlots(overlay, slideDual);
+      slideTurn = 0;
+      if (!slideDual) {
+        // 双槽切单槽：摘下另一槽媒体（视频脱离后由下方 perfPauseDetached 统一暂停）
+        const extra = slots[1];
+        const m = extra.querySelector('.slide-img');
+        if (m) m.remove();
+        delete extra.dataset.path;
+      }
+    }
+    const target = slots[slideTurn % (slideDual ? 2 : 1)];
+    target.dataset.path = item.path; // 同步占位标记，防止补位判断在视频异步上片前误判空槽
+    swapSlide(target, list, item);
+    slideTurn++;
+    // 刚切成双槽时另一侧还是空的，立即补一张（补位不再翻转布局），避免半屏空白一个间隔
+    if (slideDual && !slots[1].dataset.path) slideTick(overlay, list, true);
+  } else {
+    swapSlide(slots[slideTurn % slots.length], list);
+    slideTurn++;
+  }
+  perfPrefetch(perfUpcoming(list, 8));
+  perfPauseDetached();
+}
+
 /** 在指定幻灯片槽位替换一个媒体：新图/视频带效果入场，旧媒体过渡后移出（视频回池暂停） */
-async function swapSlide(slot, list) {
+async function swapSlide(slot, list, forcedItem) {
   const c = perfCfg();
-  const item = perfNext(list);
+  // 随机图片开启：从预加载随机队列取（已提前加载，无白闪）
+  let item = forcedItem;
+  if (!item) {
+    if (c.slideRandom) {
+      const got = perfRandomQueue('_slideQueue', list, 1);
+      item = got[0];
+    } else {
+      item = perfNext(list);
+    }
+  }
   if (!item) return;
   // 随机动画开关开启：每张独立抽一种；否则用固定效果
   const fx = c.slideRandomFx !== false
@@ -5820,7 +7005,8 @@ async function swapSlide(slot, list) {
     : (c.slideEffect || 'kenburns');
   const dur = Math.max(0, (c.slideDuration ?? 0.9) * 1000);
   // 多格时每格隔 N 个间隔才轮一次：运镜时长按每格实际停留计算，保持持续运镜
-  const slotN = slot.parentElement.querySelectorAll('.slide-slot').length || 1;
+  // 只数可见槽（自动单槽模式下另一槽只是 display:none，不该计入）
+  const slotN = Array.from(slot.parentElement.querySelectorAll('.slide-slot')).filter((s) => s.style.display !== 'none').length || 1;
   const holdMs = (c.slideInterval ?? 5) * 1000 * slotN;
 
   let media;
@@ -5857,123 +7043,232 @@ async function swapSlide(slot, list) {
   }
 }
 
-// ─── 模式5 封面流（Cover Flow）：3D 横向翻转流，中央大图两侧斜立，自动推进 ───
-const COVER_VISIBLE = 3; // 每侧显示张数（共 7 张）
+// ─── 模式5 封面流（Cover Flow）：卡片与媒体绑定，推进时整排平滑横向流动 ───
+function coverVisible() { return Math.max(2, Math.min(4, perfCfg().coverSideCount ?? 3)); }
 let coverCenter = 0;
+let coverStage = null;
+let coverList = [];
+let coverCards = new Map(); // idx（媒体在本轮序列中的位置）-> 卡片对象；卡随媒体走
+let coverPrevCenter = -99;
+const coverPreloadSet = new Set(); // 已预加载的图片 URL
+
 function startCoverFlow() {
   const list = perfMedia();
   if (!list.length) { startPerfMode('waterfall'); return; }
-  perfShuffle(list);
+  if (!perfCfg().coverRandom) perfShuffle(list); // 随机图片关闭时按洗牌顺序播放
+  coverList = list;
   coverCenter = 0;
+  coverPrevCenter = -99;
+  coverCards = new Map();
+  coverPreloadSet.clear();
+  perf._coverQueue = null; // 随机图片队列会动态重建
   const overlay = $('perfOverlay');
   overlay.innerHTML = '<div class="cover-stage"></div>';
-  const stage = overlay.querySelector('.cover-stage');
-  const slots = [];
-  for (let o = -COVER_VISIBLE; o <= COVER_VISIBLE; o++) {
-    const card = document.createElement('div');
-    card.className = 'cover-card';
-    card.innerHTML = '<div class="cover-inner"><img alt="" draggable="false"></div>';
-    stage.appendChild(card);
-    const slot = { o, el: card, inner: card.querySelector('.cover-inner'), img: card.querySelector('img'), path: '' };
-    // 原图加载完成后用真实像素比例纠正卡框（初始按缩略图尺寸/兜底比例）
-    slot.img.addEventListener('load', () => {
-      if (slot.img.naturalWidth > 0 && slot.path) {
-        coverSlotSize(slot, slot.img.naturalWidth / slot.img.naturalHeight);
-      }
-    });
-    slots.push(slot);
-  }
-  renderCover(slots, list);
+  coverStage = overlay.querySelector('.cover-stage');
+  renderCover();
   if (perf.timer) clearInterval(perf.timer);
   perf.timer = setInterval(() => {
     if (perf.paused) return;
-    coverCenter++;
-    if (coverCenter >= list.length) { perfShuffle(list); coverCenter = 0; }
-    renderCover(slots, list);
+    if (perfCfg().coverRandom) {
+      // 随机图片：从预加载随机队列取出新的中央媒体（已提前加载，无白闪）
+      const got = perfRandomQueue('_coverQueue', list, coverVisible() * 2 + 3);
+      // 重建 coverList 为这个随机批次
+      coverList = got;
+      coverCenter++;
+      if (coverCenter >= coverList.length) {
+        coverCenter = 0;
+        for (const card of coverCards.values()) card.el.remove();
+        coverCards.clear();
+        perfClearVideos();
+        coverPreloadSet.clear();
+      }
+      renderCover();
+    } else {
+      coverCenter++;
+      if (coverCenter >= list.length) {
+        // 一轮结束：序列重排，旧卡整体清空重建，避免 idx→媒体映射突变造成的错帧
+        for (const card of coverCards.values()) card.el.remove();
+        coverCards.clear();
+        perfClearVideos();
+        coverPreloadSet.clear();
+        if (!perfCfg().coverRandom) perfShuffle(list);
+        coverCenter = 0;
+      }
+      renderCover();
+    }
   }, Math.max(500, (perfCfg().coverInterval ?? 2.5) * 1000));
 }
 
-/**
- * 按媒体宽高比写卡片框尺寸：在（中央 90vw×92vh，侧位 0.72 倍）最大框内等比贴合，
- * 使卡片边框与媒体边界完全重合，不再出现固定大框 + 内部 contain 留白
- */
-function coverSlotSize(s, ar) {
+/** 预加载即将成为中央/侧边的图片进内存，减少切换白闪 */
+function coverPreload(idxList) {
+  for (const idx of idxList) {
+    if (idx < 0 || idx >= coverList.length) continue;
+    const item = coverList[idx];
+    if (item.kind !== 'image') continue;
+    const src = perfFullSrc(item);
+    if (!src || coverPreloadSet.has(src)) continue;
+    coverPreloadSet.add(src);
+    const im = new Image();
+    im.decoding = 'async';
+    im.src = src;
+  }
+}
+
+/** 卡框尺寸：在（中央 90vw×92vh，侧位 0.72 倍）最大框内按媒体比例等比贴合，边框即媒体边界 */
+function coverApplySize(card, ar, atCenter) {
   if (!ar || ar <= 0 || !isFinite(ar)) return;
-  const k = s.o === 0 ? 1 : 0.72;
+  card.ar = ar;
+  const k = atCenter ? 1 : 0.72;
   const maxW = window.innerWidth * 0.9 * k;
   const maxH = window.innerHeight * 0.92 * k;
   let h = maxH, w = h * ar;
   if (w > maxW) { w = maxW; h = w / ar; }
-  s.el.style.width = `${w.toFixed(1)}px`;
-  s.el.style.height = `${h.toFixed(1)}px`;
+  card.el.style.width = `${w.toFixed(1)}px`;
+  card.el.style.height = `${h.toFixed(1)}px`;
 }
 
-function renderCover(slots, list) {
-  // 先把上一轮挂在卡片里的池视频全部摘出（推进后旧中央滑到侧位，不能继续在侧面播放）
-  for (const s of slots) {
-    const v = s.inner.querySelector('video');
-    if (v) v.remove();
-    s.inner.className = 'cover-inner'; // 清掉旧中央的入场动效类，侧位静止展示
-  }
-  for (const s of slots) {
-    const idx = coverCenter + s.o;
-    const abs = Math.min(COVER_VISIBLE, Math.abs(s.o));
-    const visible = idx >= 0 && idx < list.length;
-    s.el.style.opacity = visible ? String(1 - abs * 0.22) : '0';
-    s.el.style.zIndex = String(10 - abs);
-    // 位移 / 旋转 / 缩放：中央最大最前，两侧依次斜立后退
-    const tx = s.o * 32; // vw
-    const tz = -abs * 190;
-    const ry = s.o < 0 ? 38 : s.o > 0 ? -38 : 0;
-    const scale = s.o === 0 ? 1 : 1 - abs * 0.12;
-    s.el.style.transform =
-      `translate(-50%,-50%) translateX(${tx}vw) translateZ(${tz}px) rotateY(${ry}deg) scale(${scale})`;
-    if (!visible) { s.path = ''; s.img.removeAttribute('src'); continue; } // 边界外留空，不重复首张
-    const item = list[idx];
-    // 卡框按该媒体比例贴合（缩略图已知尺寸；未知先兜底，img.onload / 视频元数据再纠正）
-    const asp = perfAspect(item);
-    coverSlotSize(s, asp.w / asp.h);
-    // 同址重复赋值不会触发重载，无需短路（视频从中央退到侧位时还要补封面）
-    s.path = item.path;
-    const src = perfFullSrc(item);
-    if (src) { s.img.src = src; continue; }
-    // 两侧视频用封面帧；中央视频交给播放池直接播放（跳过封面加载）
-    if (s.o === 0) continue;
+/** 按相对中央的偏移写位移/旋转/透明度（CSS transition 负责平滑补间）
+ *  间距/深度/旋转随 coverSideCount 自适应；中央卡加正向 Z 提升，确保它在所有侧卡前面
+ *  （侧卡 rotateY 后其近端边缘可能越过 Z=0 平面，必须把中央卡主动推到更前） */
+function coverPlace(card, o) {
+  const V = coverVisible();
+  const abs = Math.min(V + 1, Math.abs(o));
+  const inView = Math.abs(o) <= V;
+  card.el.style.opacity = inView ? String(1 - Math.min(V, abs) * 0.22) : '0';
+  card.el.style.zIndex = String(10 - Math.min(V, abs));
+  // V=2 → 间距 38vw / 深度 260 / 旋转 46°；V=4 → 间距 22vw / 深度 150 / 旋转 32°
+  const spacing = 46 - V * 6;       // vw 间距
+  const depth = 320 - V * 42;       // px z 深度（每后退一级）
+  const tilt = 54 - V * 5;          // 旋转角
+  const tx = o * spacing;
+  // 中央卡前置 80px，离中央越近侧卡越靠前，越远越后退（层级感）
+  const tz = o === 0 ? 80 : 80 - abs * depth - 60;
+  const ry = o < 0 ? tilt : o > 0 ? -tilt : 0;
+  const scale = o === 0 ? 1 : 1 - Math.min(V, abs) * 0.12;
+  card.el.style.transform =
+    `translate(-50%,-50%) translateX(${tx}vw) translateZ(${tz}px) rotateY(${ry}deg) scale(${scale})`;
+}
+
+/** 创建一张与指定媒体绑定的卡片（尺寸/内容一次定型，之后只移动不变内容） */
+function createCoverCard(idx) {
+  const item = coverList[idx];
+  const el = document.createElement('div');
+  el.className = 'cover-card';
+  el.innerHTML = '<div class="cover-inner"><img alt="" draggable="false"></div>';
+  const inner = el.querySelector('.cover-inner');
+  const img = el.querySelector('img');
+  const card = { idx, el, inner, img, path: item.path, isVideo: item.kind === 'video', ar: 0 };
+  const asp = perfAspect(item);
+  coverApplySize(card, asp.w / asp.h, idx === coverCenter);
+  img.addEventListener('load', () => {
+    if (img.naturalWidth > 0) coverApplySize(card, img.naturalWidth / img.naturalHeight, card.idx === coverCenter);
+  });
+  if (item.kind === 'image') {
+    img.src = perfFullSrc(item); // 图片走原文件，保证清晰
+  } else {
+    // 侧位视频用高清封面帧；滑到中央时才换成池视频直接播放
     const cached = thumbAny(item.path);
     if (cached) {
-      s.img.src = cached.url;
-      if (cached.w > 0) coverSlotSize(s, cached.w / cached.h);
+      img.src = cached.url;
+      if (cached.w > 0) coverApplySize(card, cached.w / cached.h, idx === coverCenter);
     }
     loadThumb(item.path, item.kind, PERF_VIDEO_THUMB).then((t) => {
-      if (t && s.path === item.path) {
-        s.img.src = t.url;
-        if (t.w > 0) coverSlotSize(s, t.w / t.h);
+      if (t && card.path === item.path) {
+        img.src = t.url;
+        if (t.w > 0) coverApplySize(card, t.w / t.h, card.idx === coverCenter);
       }
     });
   }
-  // 中央位若是视频：从预判播放池取出直接播放（只播中央一张，两侧保持封面，控制解码开销）
-  const centerItem = list[coverCenter];
-  const centerSlot = slots.find((s) => s.o === 0);
-  if (centerItem && centerItem.kind === 'video' && centerSlot) {
-    perfShowVideo(centerItem.path, centerSlot.inner);
-    // 视频真实比例（可能是竖屏视频）拿到后纠正卡框，避免兜底 16:9 造成裁切
-    const pv = centerSlot.inner.querySelector('video');
-    if (pv) {
-      const fit = () => { if (pv.videoWidth > 0) coverSlotSize(centerSlot, pv.videoWidth / pv.videoHeight); };
-      if (pv.readyState >= 1) fit();
-      else pv.addEventListener('loadedmetadata', fit, { once: true });
+  return card;
+}
+
+function renderCover() {
+  const list = coverList;
+  const wanted = new Set();
+  const V = coverVisible();
+  // 1) 目标范围 ±VISIBLE：已有卡移动到新偏移；新卡先放屏外再两帧归位（横向滑入）
+  for (let idx = coverCenter - V - 1; idx <= coverCenter + V + 1; idx++) {
+    if (idx < 0 || idx >= list.length) continue;
+    wanted.add(idx);
+    let card = coverCards.get(idx);
+    if (!card) {
+      card = createCoverCard(idx);
+      card.idx = idx;
+      coverCards.set(idx, card);
+      const side = idx < coverCenter ? -1 : 1;
+      coverPlace(card, side * (V + 1)); // 挂载即位于屏外
+      coverStage.appendChild(card.el);
+      requestAnimationFrame(() => requestAnimationFrame(() => coverPlace(card, idx - coverCenter)));
+    } else {
+      coverPlace(card, idx - coverCenter); // 同一张卡：偏移变化 → transition 平滑流动
     }
   }
-  // 中央卡换入动效：按设置的切换效果重启动画，给切换一个明确的节奏点
-  if (centerSlot) {
-    const fx = perfCfg().coverEffect || 'zoom';
-    centerSlot.inner.className = `cover-inner cover-pop fx-${fx}`;
+  // 2) 离场卡：滑出屏外并淡出，过渡结束再移除
+  for (const [idx, card] of Array.from(coverCards)) {
+    if (!wanted.has(idx)) {
+      const side = idx < coverCenter ? -1 : 1;
+      coverPlace(card, side * (V + 1));
+      card.el.style.opacity = '0';
+      coverCards.delete(idx);
+      setTimeout(() => card.el.remove(), 700);
+    }
   }
+  // 3) 中央视频进播放池；退到侧位的视频摘除并恢复封面；卡框随中央/侧位身份平滑缩放
+  for (const card of coverCards.values()) {
+    const atCenter = card.idx === coverCenter;
+    const hasV = !!card.inner.querySelector('video');
+    if (card.isVideo && atCenter && !hasV) {
+      card.img.style.display = 'none';
+      perfShowVideo(card.path, card.inner);
+      const pv = card.inner.querySelector('video');
+      if (pv) {
+        const fit = () => { if (pv.videoWidth > 0) coverApplySize(card, pv.videoWidth / pv.videoHeight, true); };
+        if (pv.readyState >= 1) fit();
+        else pv.addEventListener('loadedmetadata', fit, { once: true });
+      }
+    } else if (card.isVideo && !atCenter && hasV) {
+      card.inner.querySelector('video').remove(); // 脱离即由 perfPauseDetached 暂停
+      card.img.style.display = '';
+    }
+    coverApplySize(card, card.ar, atCenter);
+  }
+  // 4) 新登基的中央卡：播放所选切换特效（作用于 inner，不影响卡片位移动画）
+  //    触发方式：animation:none 内联重置 + reflow + 清空内联让 CSS 类接管 ——
+  //    比 className 重写更可靠（同名类重复赋值时浏览器不一定重启动画）
+  const centerCard = coverCards.get(coverCenter);
+  if (centerCard && coverPrevCenter !== coverCenter) {
+    const c = perfCfg();
+    const COVER_FX_LIST = ['zoom', 'flip', 'slide', 'fade', 'rotate', 'zoomBlur', 'slideUp', 'flipX', 'elastic', 'curtain', 'glow'];
+    const fx = c.coverRandomFx
+      ? COVER_FX_LIST[Math.floor(Math.random() * COVER_FX_LIST.length)]
+      : (c.coverEffect || 'zoom');
+    const inner = centerCard.inner;
+    inner.style.animation = 'none';         // 强制取消当前动画（如有）
+    inner.className = 'cover-inner';        // 同步清掉 fx 类，避免残留
+    void inner.offsetWidth;                 // 强制 reflow，让 animation:none 生效
+    inner.style.animation = '';             // 清空内联 → CSS 类的 animation 属性接管
+    inner.className = `cover-inner cover-pop fx-${fx}`;
+  }
+  // 退位卡清掉入场特效类与内联：下次登基时干净起步
+  for (const card of coverCards.values()) {
+    if (card.idx !== coverCenter) {
+      if (card.inner.classList.contains('cover-pop') || card.inner.style.animation) {
+        card.inner.style.animation = '';
+        card.inner.className = 'cover-inner';
+      }
+    }
+  }
+  coverPrevCenter = coverCenter;
   perfPauseDetached();
-  // 预判：中央 + 推进方向未来几张，提前缓冲，翻转到即播
+  // 预判：中央 + 推进方向未来几张，提前缓冲，滑到即播
   const upcoming = [];
   for (let i = 0; i < 5 && coverCenter + i < list.length; i++) upcoming.push(list[coverCenter + i].path);
   perfPrefetch(upcoming);
+  // 预加载当前可见 ±V+1 的临近图片进内存，减少中央卡切换白闪
+  const V2 = coverVisible();
+  const preloadIdx = [];
+  for (let i = -V2 - 1; i <= V2 + 1; i++) preloadIdx.push(coverCenter + i);
+  coverPreload(preloadIdx);
 }
 
 // ─── 表演设置面板（半透明居中；主 TAB 选中即切换表演模式） ───
@@ -5992,12 +7287,26 @@ function syncPerfUI() {
     b.classList.toggle('active', b.dataset.perf === (c.mode || 'waterfall')));
   document.querySelectorAll('.perfPage').forEach((p) =>
     p.classList.toggle('hidden', p.id !== `perf-${c.mode || 'waterfall'}`));
+  // 瀑布流
   $('perfWfSpeed').value = c.waterfallSpeed ?? 120;
   $('perfWfSpeedVal').textContent = (c.waterfallSpeed ?? 120) + 'px/s';
+  const scrollMode = c.waterfallScrollMode === 'jump' ? 'jump' : 'smooth';
+  const wfScrollMode = $('perfWfScrollMode'); if (wfScrollMode) wfScrollMode.value = scrollMode;
   $('perfWfDirection').value = c.waterfallDirection ?? 'down';
   $('perfWfBottom').value = c.waterfallBottom ?? 'bounce';
   $('perfWfDwell').value = c.waterfallDwell ?? 1;
   $('perfWfDwellVal').textContent = (c.waterfallDwell ?? 1) + 's';
+  // 跳动速度（jump 模式下用）
+  const wfJump = $('perfWfJumpSpeed'); if (wfJump) wfJump.value = c.arrayInterval ?? 2;
+  const wfJumpVal = $('perfWfJumpSpeedVal'); if (wfJumpVal) wfJumpVal.textContent = (c.arrayInterval ?? 2) + 's';
+  // jump 模式显隐：方向/触底/停留行隐藏，跳动速度行显示
+  const wfRowIds = { smooth: ['perfWfDirectionRow', 'perfWfBottomRow', 'perfWfDwellRow'], jump: ['perfWfJumpSpeedRow'] };
+  for (const id of [...wfRowIds.smooth, ...wfRowIds.jump]) {
+    const el = $(id); if (!el) continue;
+    const showInSmooth = wfRowIds.smooth.includes(id);
+    el.classList.toggle('hidden', scrollMode === 'jump' ? !wfRowIds.jump.includes(id) : !showInSmooth);
+  }
+  // 卡片动画
   $('perfCardsCount').value = c.cardsCount ?? 0;
   $('perfCardsInterval').value = c.cardsInterval ?? 2;
   $('perfCardsIntervalVal').textContent = (c.cardsInterval ?? 2) + 's';
@@ -6009,8 +7318,20 @@ function syncPerfUI() {
   $('perfCardsSyncMin').value = c.cardsSyncMin ?? 0;
   $('perfCardsSyncMax').value = c.cardsSyncMax ?? 2000;
   $('perfCardsSyncRangeVal').textContent = `${c.cardsSyncMin ?? 0}–${c.cardsSyncMax ?? 2000}ms`;
+  // 卡片动画新控件
+  const rc = $('perfCardsRandomCount'); if (rc) rc.classList.toggle('on', c.cardsRandomCount === true);
+  const cmin = $('perfCardsCountMin'); if (cmin) cmin.value = c.cardsCountMin ?? 3;
+  const cmax = $('perfCardsCountMax'); if (cmax) cmax.value = c.cardsCountMax ?? 12;
+  const crr = $('perfCardsCountRangeRow'); if (crr) crr.classList.toggle('hidden', c.cardsRandomCount !== true);
+  const crf = $('perfCardsRandomFx'); if (crf) crf.classList.toggle('on', c.cardsRandomFx === true);
+  const crand = $('perfCardsRandom'); if (crand) crand.classList.toggle('on', c.cardsRandom === true);
+  const cfit = $('perfCardsFit'); if (cfit) cfit.value = c.cardsFit === 'fill' ? 'fill' : 'full';
+  // 阵列图案
   $('perfArrayInterval').value = c.arrayInterval ?? 2;
   $('perfArrayIntervalVal').textContent = (c.arrayInterval ?? 2) + 's';
+  const aa = $('perfArrayAnim'); if (aa) aa.value = c.arrayAnim ?? 'zoomIn';
+  const arf = $('perfArrayRandomFx'); if (arf) arf.classList.toggle('on', c.arrayRandomFx === true);
+  // 幻灯片
   $('perfSlideCount').value = String(c.slideCount ?? 0);
   $('perfSlideInterval').value = c.slideInterval ?? 5;
   $('perfSlideIntervalVal').textContent = (c.slideInterval ?? 5) + 's';
@@ -6018,9 +7339,14 @@ function syncPerfUI() {
   $('perfSlideDurationVal').textContent = (c.slideDuration ?? 0.9) + 's';
   $('perfSlideEffect').value = c.slideEffect ?? 'kenburns';
   $('perfSlideRandomFx').classList.toggle('on', c.slideRandomFx !== false);
+  const srand = $('perfSlideRandom'); if (srand) srand.classList.toggle('on', c.slideRandom === true);
+  // 封面流
   $('perfCoverInterval').value = c.coverInterval ?? 2.5;
   $('perfCoverIntervalVal').textContent = (c.coverInterval ?? 2.5) + 's';
   $('perfCoverEffect').value = c.coverEffect ?? 'zoom';
+  const csc = $('perfCoverSideCount'); if (csc) csc.value = String(c.coverSideCount ?? 3);
+  const covrf = $('perfCoverRandomFx'); if (covrf) covrf.classList.toggle('on', c.coverRandomFx === true);
+  const covrand = $('perfCoverRandom'); if (covrand) covrand.classList.toggle('on', c.coverRandom === true);
   $('perfMute').classList.toggle('on', c.mute !== false);
 }
 
@@ -6046,6 +7372,12 @@ $('perfWfSpeed').addEventListener('input', (e) => {
   $('perfWfSpeedVal').textContent = e.target.value + 'px/s';
   saveCfg();
 });
+$('perfWfScrollMode')?.addEventListener('change', (e) => {
+  ensurePerfCfg().waterfallScrollMode = e.target.value;
+  saveCfg();
+  syncPerfUI(); // 显隐 方向/触底 行 vs 跳动速度 行
+  if (perf.active && perf.mode === 'waterfall') startPerfMode('waterfall'); // 立即重启模式
+});
 $('perfWfDirection').addEventListener('change', (e) => {
   ensurePerfCfg().waterfallDirection = e.target.value;
   saveCfg();
@@ -6056,6 +7388,12 @@ $('perfWfDwell').addEventListener('input', (e) => {
   ensurePerfCfg().waterfallDwell = Number(e.target.value);
   $('perfWfDwellVal').textContent = e.target.value + 's';
   saveCfg();
+});
+$('perfWfJumpSpeed')?.addEventListener('input', (e) => {
+  ensurePerfCfg().arrayInterval = Number(e.target.value); // 复用 arrayInterval 字段
+  $('perfWfJumpSpeedVal').textContent = e.target.value + 's';
+  saveCfg();
+  if (perf.active && perf.mode === 'waterfall' && perf.scrollMode === 'jump') scheduleWaterfallJumpTimer();
 });
 // 模式2 子设置（数量/间隔/过渡变化即时生效）
 $('perfCardsCount').addEventListener('change', (e) => {
@@ -6103,12 +7441,64 @@ $('perfCardsSyncMax').addEventListener('input', (e) => {
   $('perfCardsSyncRangeVal').textContent = `${c.cardsSyncMin}–${c.cardsSyncMax}ms`;
   saveCfg();
 });
+// 卡片动画：随机数量 / 随机特效
+$('perfCardsRandomCount')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.cardsRandomCount = !(c.cardsRandomCount === true);
+  e.target.classList.toggle('on', c.cardsRandomCount);
+  syncPerfUI(); // 显隐数量范围行
+  saveCfg();
+  if (perf.active && perf.mode === 'cards') dealCardsFrame();
+});
+$('perfCardsCountMin')?.addEventListener('change', (e) => {
+  const c = ensurePerfCfg();
+  c.cardsCountMin = Math.max(1, Math.min(50, Number(e.target.value) || 3));
+  saveCfg();
+  if (perf.active && perf.mode === 'cards') dealCardsFrame();
+});
+$('perfCardsCountMax')?.addEventListener('change', (e) => {
+  const c = ensurePerfCfg();
+  c.cardsCountMax = Math.max(1, Math.min(50, Number(e.target.value) || 12));
+  saveCfg();
+  if (perf.active && perf.mode === 'cards') dealCardsFrame();
+});
+$('perfCardsRandomFx')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.cardsRandomFx = !(c.cardsRandomFx === true);
+  e.target.classList.toggle('on', c.cardsRandomFx);
+  saveCfg();
+  if (perf.active && perf.mode === 'cards') dealCardsFrame();
+});
+$('perfCardsRandom')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.cardsRandom = !(c.cardsRandom === true);
+  e.target.classList.toggle('on', c.cardsRandom);
+  saveCfg();
+  if (perf.active && perf.mode === 'cards') dealCardsFrame();
+});
+$('perfCardsFit')?.addEventListener('change', (e) => {
+  ensurePerfCfg().cardsFit = e.target.value;
+  saveCfg();
+  if (perf.active && perf.mode === 'cards') dealCardsFrame();
+});
 // 模式3 子设置
 $('perfArrayInterval').addEventListener('input', (e) => {
   ensurePerfCfg().arrayInterval = Number(e.target.value);
   $('perfArrayIntervalVal').textContent = e.target.value + 's';
   saveCfg();
   if (perf.active && perf.mode === 'array') scheduleArrayTimer();
+});
+$('perfArrayAnim')?.addEventListener('change', (e) => {
+  ensurePerfCfg().arrayAnim = e.target.value;
+  saveCfg();
+  if (perf.active && perf.mode === 'array') dealArrayFrame();
+});
+$('perfArrayRandomFx')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.arrayRandomFx = !(c.arrayRandomFx === true);
+  e.target.classList.toggle('on', c.arrayRandomFx);
+  saveCfg();
+  if (perf.active && perf.mode === 'array') dealArrayFrame();
 });
 // 模式4 幻灯片子设置
 $('perfSlideCount').addEventListener('change', (e) => {
@@ -6137,6 +7527,13 @@ $('perfSlideRandomFx').addEventListener('click', (e) => {
   e.target.classList.toggle('on', c.slideRandomFx);
   saveCfg();
 });
+$('perfSlideRandom')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.slideRandom = !(c.slideRandom === true);
+  e.target.classList.toggle('on', c.slideRandom);
+  saveCfg();
+  if (perf.active && perf.mode === 'slideshow') startPerfMode('slideshow');
+});
 // 模式5 封面流子设置
 $('perfCoverInterval').addEventListener('input', (e) => {
   ensurePerfCfg().coverInterval = Number(e.target.value);
@@ -6147,6 +7544,24 @@ $('perfCoverInterval').addEventListener('input', (e) => {
 $('perfCoverEffect').addEventListener('change', (e) => {
   ensurePerfCfg().coverEffect = e.target.value;
   saveCfg(); // 下一次推进时生效
+});
+$('perfCoverSideCount')?.addEventListener('change', (e) => {
+  ensurePerfCfg().coverSideCount = Math.max(2, Math.min(4, Number(e.target.value) || 3));
+  saveCfg();
+  if (perf.active && perf.mode === 'cover') startPerfMode('cover'); // 重建舞台
+});
+$('perfCoverRandomFx')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.coverRandomFx = !(c.coverRandomFx === true);
+  e.target.classList.toggle('on', c.coverRandomFx);
+  saveCfg(); // 下一次推进时生效
+});
+$('perfCoverRandom')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.coverRandom = !(c.coverRandom === true);
+  e.target.classList.toggle('on', c.coverRandom);
+  saveCfg();
+  if (perf.active && perf.mode === 'cover') startPerfMode('cover');
 });
 // 通用：静音（同时作用于预判播放池中的表演视频）
 $('perfMute').addEventListener('click', (e) => {
