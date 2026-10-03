@@ -1,0 +1,1537 @@
+@import "tailwindcss";
+
+/* Tailwind v4 自定义变体：深色模式基于 html.dark 类 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* 强调色（设置-外观可改，JS 实时写入 --accent / --accent-rgb / --accent-text / --accent-on） */
+:root {
+  --accent: #26fd5c;
+  --accent-rgb: 14,165,233;
+  --accent-text: #0ea5e9;
+  --accent-on: #ffffff;
+  /* 视觉体系变量（浅色主题值，深色由 .dark 覆盖） */
+  --panel: rgba(255,255,255,0.45);
+  --panel-2: rgba(255,255,255,0.40);
+  --modal-bg: rgba(246,246,250,0.92);
+  --text-dim: #5f5f70;
+  --border: rgba(0,0,0,0.10);
+}
+.dark {
+  --panel: rgba(24,24,32,0.55);
+  --panel-2: rgba(20,20,26,0.60);
+  --modal-bg: rgba(23,23,28,0.92);
+  --text-dim: #a9a9b8;
+  --border: rgba(255,255,255,0.08);
+}
+.accent-icon { color: var(--accent); }
+
+/* ═══════════════════════════════════════════════════════
+   Rainver 落雨影音 — 自定义样式
+   玻璃拟态、滚动条、媒体卡片、骨架屏等
+   ═══════════════════════════════════════════════════════ */
+
+/* Windows Mica 效果：整窗背景透明，由系统提供材质 */
+html, body {
+  background: transparent;
+}
+/* 壁纸与 Mica 均关闭时 → 使用纯色底，透明度仅由「窗口全局不透明度」控制 */
+html:not(.dark) body.solid-bg { background: #eef1f6; }
+html.dark body.solid-bg { background: #0d1117; }
+
+/* ─── 滚动条美化 ─── */
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* ─── 媒体网格卡片 ─── */
+.media-card {
+  position: relative;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+}
+.media-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.18);
+}
+.media-card.selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow: 0 0 14px rgba(var(--accent-rgb), .35);
+}
+.media-card .thumb {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  display: block;
+  background: rgba(128,128,128,0.15);
+}
+/* 视频时长角标 */
+.badge-duration {
+  position: absolute;
+  right: 4px; bottom: 4px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(0,0,0,0.65);
+  backdrop-filter: blur(4px);
+  z-index: 2;
+}
+
+/* ─── 视频卡片自动预览：覆盖播放层 + 悬浮控制（进度/音量） ─── */
+.thumb-box {
+  position: relative;
+  display: block;
+  width: 100%;
+  overflow: hidden;
+}
+.thumb-box .auto-preview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 1;
+  background: #000;
+}
+/* 悬浮控制条（玻璃拟态）：默认隐藏，鼠标悬浮卡片时淡入 */
+.card-ctrl {
+  position: absolute;
+  left: 6px; right: 6px; bottom: 6px;
+  z-index: 3;
+  padding: 6px 8px 5px;
+  border-radius: 10px;
+  background: rgba(12,14,20,0.55);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255,255,255,0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
+}
+.media-card:hover .card-ctrl {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+.card-ctl-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.card-ctl-btn {
+  width: 22px; height: 22px;
+  border-radius: 999px;
+  display: flex; align-items: center; justify-content: center;
+  color: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.10);
+  border: 1px solid rgba(255,255,255,0.12);
+  transition: background .15s;
+  flex-shrink: 0;
+}
+.card-ctl-btn:hover { background: rgba(255,255,255,0.22); }
+.card-ctl-btn svg { width: 13px; height: 13px; }
+.card-vol { width: 70px; height: 4px; }
+/* 类型角标（左下） */
+.badge-type {
+  position: absolute;
+  left: 4px; bottom: 4px;
+  width: 18px; height: 18px;
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  color: #fff;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(4px);
+}
+.badge-type svg { width: 11px; height: 11px; }
+
+/* ─── 画廊模式：卡片按媒体宽高比（不裁剪完整显示）+ 多列瀑布流 ─── */
+.gallery-masonry {
+  column-width: 260px; /* 具体值由 JS 按缩放滑块写入 */
+  column-gap: var(--gallery-gap, 14px); /* L156：设置面板可调 */
+  padding: 14px;
+  transition: column-width .16s ease-out; /* L70：缩放平滑过渡 */
+}
+.gallery-masonry > .media-card {
+  break-inside: avoid;
+  -webkit-column-break-inside: avoid;
+  display: block;
+  width: 100%;
+  margin: 0 0 var(--gallery-gap, 14px);
+}
+/* 完整显示不裁剪：object-fit contain（占位框比例来自媒体自身宽高比） */
+.gallery-thumb {
+  width: 100%; height: 100%;
+  object-fit: contain;
+  display: block;
+  background: rgba(0,0,0,.28);
+}
+.gallery-empty-thumb {
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim);
+  background: rgba(125,125,125,.10);
+}
+
+/* ─── 文件夹占位（不走缩略图管线） ─── */
+.folder-thumb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  background: rgba(125,125,125,.10);
+}
+/* 图标保持"正常图标尺寸"，不随卡片放大 */
+.folder-thumb svg { width: min(42px, 60%); height: min(42px, 60%); opacity: .9; }
+
+/* ─── 音频占位（无内嵌封面时显示音频图标） ─── */
+.audio-thumb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  background: rgba(125,125,125,.10);
+}
+.audio-thumb svg { width: min(42px, 60%); height: min(42px, 60%); opacity: .9; }
+#audioCover svg { width: 48px; height: 48px; opacity: .85; color: var(--accent); }
+#audioCover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* ─── 音频播放列表 ─── */
+.ap-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ap-item:hover { background: rgba(125,125,125,.14); }
+.ap-item.active { background: rgba(var(--accent-rgb), .20); font-weight: 600; }
+.ap-item .ap-idx { width: 22px; text-align: right; opacity: .45; font-size: 11px; flex-shrink: 0; }
+.ap-item .ap-dur { opacity: .5; font-size: 11px; flex-shrink: 0; }
+.ap-item .ap-del {
+  width: 18px; height: 18px; border-radius: 999px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; font-size: 11px;
+}
+.ap-item:hover .ap-del { opacity: .55; }
+.ap-item .ap-del:hover { background: rgba(239,68,68,.28); opacity: 1; }
+
+/* ─── 画廊卡片：文件名悬浮显示在卡片顶部 ─── */
+.gallery-card .gallery-name {
+  position: absolute;
+  left: 0; right: 0; top: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: #fff;
+  background: linear-gradient(to bottom, rgba(0,0,0,.75), rgba(0,0,0,0));
+  opacity: 0;
+  transition: opacity .18s ease;
+  pointer-events: none;
+  z-index: 3;
+}
+.gallery-card:hover .gallery-name { opacity: 1; }
+
+
+
+/* ─── 框选矩形 ─── */
+.marquee {
+  position: absolute;
+  z-index: 5;
+  border: 1px solid var(--accent);
+  background: rgba(var(--accent-rgb), .16);
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+
+/* ─── 列表行 ─── */
+.media-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.media-row:hover { background: rgba(125,125,125,0.12); }
+.media-row.selected { background: rgba(var(--accent-rgb), .16); outline: 1px solid var(--accent); }
+.media-row img { width: 36px; height: 36px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
+
+/* ─── 文件夹树 ─── */
+.tree-node {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.tree-node:hover { background: rgba(125,125,125,0.12); }
+.tree-node.active { background: rgba(var(--accent-rgb), .2); font-weight: 600; }
+.tree-node .arrow { width: 12px; text-align: center; opacity: .6; flex-shrink: 0; }
+
+/* ─── 骨架屏（缩略图加载占位） ─── */
+.skeleton {
+  background: linear-gradient(90deg, rgba(128,128,128,0.12) 25%, rgba(128,128,128,0.28) 50%, rgba(128,128,128,0.12) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.3s infinite;
+}
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ─── 缩放滑块 ─── */
+input[type="range"] { cursor: pointer; accent-color: var(--accent); }
+
+/* ─── 胶囊按钮（通用 chip） ─── */
+.chip {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.chip:hover { color: var(--text); border-color: var(--text-dim); }
+/* 实底强调 chip（收藏等关键动作） */
+.chip-on {
+  background: var(--accent);
+  color: var(--accent-on);
+  border-color: transparent;
+}
+.chip-on:hover { color: var(--accent-on); border-color: transparent; filter: brightness(1.12); }
+
+/* ─── 工具栏图标按钮（描边卡片） ─── */
+.tool-ico {
+  width: 30px; height: 28px;
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.tool-ico:hover { color: var(--accent-text); border-color: var(--accent); }
+.tool-ico:active { transform: scale(.92); }
+
+/* ─── 工具栏下拉（胶囊） ─── */
+.tool-select {
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color .15s;
+}
+.tool-select:hover, .tool-select:focus { border-color: var(--accent); }
+.tool-select option { background: var(--modal-bg); color: inherit; }
+
+/* ─── 搜索框（聚焦发光） ─── */
+.tool-search {
+  background: var(--panel);
+  color: inherit;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 14px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.tool-search:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 8px var(--accent), 0 0 14px rgba(var(--accent-rgb), .35);
+}
+.tool-search::placeholder { color: var(--text-dim); }
+
+/* ─── 视图分段按钮 ─── */
+.viewSeg { display: flex; gap: 4px; }
+.viewBtn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.viewBtn:hover { color: var(--text); border-color: var(--text-dim); }
+.viewBtn.active {
+  background: rgba(var(--accent-rgb), .18);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+/* ─── 收藏按钮：与视图按钮同风格（线框 + 中间透明），描边用强调色 ─── */
+.btn-fav {
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent-text);
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s, color .15s;
+}
+.btn-fav:hover { background: rgba(var(--accent-rgb), .18); }
+.btn-fav:active { transform: scale(.96); }
+/* 红心收藏 */
+.btn-fav-heart { color: #ef4444; border-color: #ef4444; }
+.btn-fav-heart:hover { background: rgba(239,68,68,.15); }
+/* L81：黄星收藏 */
+.btn-fav-star { display: inline-flex; align-items: center; gap: 4px; color: #eab308; border-color: #eab308; }
+.btn-fav-star:hover { background: rgba(250,204,21,.15); }
+
+/* L89：集锦箱两个按钮 —— 与收藏按钮同高同圆角（继承 .btn-fav） */
+.btn-col { display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px; }
+.btn-col-enter {
+  display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px;
+  color: #ec4899; border-color: #ec4899; /* 粉红进入按钮 */
+}
+.btn-col-enter:hover { background: rgba(236,72,153,.15); }
+
+/* L88/L96：集锦箱编号按钮 1-5（放在名称右侧，紧凑尺寸；外观沿用用户调整的 accent 描边风格） */
+.col-tab {
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent-text);
+  border-radius: 6px;
+  padding: 1px 5px;
+  min-width: 18px;
+  font-size: 10px;
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s, color .15s;
+}
+.col-tab:hover { background: rgba(var(--accent-rgb), .18); }
+.col-tab:active { transform: scale(.96); }
+.col-tab.on { background: var(--accent); color: var(--accent-on); border-color: transparent; }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* ─── 设置弹窗组件 ─── */
+.settingsTab {
+  padding: 8px 16px;
+  font-size: 13px;
+  border-radius: 8px 8px 0 0;
+  opacity: .65;
+  border-bottom: 2px solid transparent;
+  transition: all .15s;
+}
+.settingsTab:hover { opacity: 1; }
+.settingsTab.active {
+  opacity: 1;
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+.settingsPage { max-width: 560px; }
+/* 固定弹窗高度：切换 TAB 时尺寸不跳动 */
+.settingsCard { height: min(660px, 86vh); }
+
+.settingsRow {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px;
+}
+.settingsRow > label { flex-shrink: 0; color: var(--text-dim); }
+/* 模态卡片（设置弹窗 / 右键菜单共用：纯色不嵌套 blur） */
+.modal-card {
+  background: var(--modal-bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 18px 50px rgba(0,0,0,.5);
+}
+.settingsBtn {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.settingsBtn:hover { border-color: var(--accent); color: var(--accent-text); }
+.settingsBtnDanger {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(239,68,68,.45);
+  background: transparent;
+  color: #ef4444;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.settingsBtnDanger:hover { background: rgba(239,68,68,.14); border-color: #ef4444; }
+.settingsBtnPrimary {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  cursor: pointer;
+  transition: opacity .15s;
+}
+.settingsBtnPrimary:hover { opacity: .88; }
+.settingsInput {
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--border);
+  outline: none;
+  cursor: pointer;
+  transition: border-color .15s;
+}
+.settingsInput:hover, .settingsInput:focus { border-color: var(--accent); }
+.settingsSelect {
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--border);
+  outline: none;
+  cursor: pointer;
+  transition: border-color .15s;
+}
+.settingsSelect:hover, .settingsSelect:focus { border-color: var(--accent); }
+.settingsSelect option { background: var(--modal-bg); color: inherit; }
+/* 开关按钮（iOS 风格） */
+.settingsToggle {
+  width: 40px; height: 22px;
+  border-radius: 999px;
+  background: var(--border);
+  position: relative;
+  transition: background .15s;
+}
+.settingsToggle::after {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 18px; height: 18px;
+  border-radius: 999px;
+  background: #fff;
+  transition: left .15s;
+  box-shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+.settingsToggle.on { background: var(--accent); }
+.settingsToggle.on::after { left: 20px; }
+
+/* ─── 画廊表演：定格类覆盖层（卡片动画 / 幻灯片 / 封面流） ─── */
+#perfCard { height: 580px; } /* 固定尺寸：按设置项最多的 TAB 取高度，切换不跳动 */
+.perf-overlay {
+  /* 压暗 + 大半径：哪怕底层 filter 受合成层影响失效，透过本层也看不到清晰画廊 */
+  background: rgba(0,0,0,.66);
+  backdrop-filter: blur(30px);
+  -webkit-backdrop-filter: blur(30px);
+}
+/* 弹卡模式：直接模糊底层画廊本体（backdrop-filter 在部分合成层场景会失效），
+   同时掐断交互，滚轮/点击都到不了画廊 */
+#scroller.perf-bg-blur {
+  filter: blur(24px) scale(1.06);
+  pointer-events: none;
+}
+/* 弹卡里的视频与图片一样完整填充 */
+.perf-vid { width: 100%; height: 100%; }
+.perf-vid video {
+  width: 100%; height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #000;
+}
+.perf-card {
+  position: absolute;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0,0,0,.45);
+  background: rgba(125,125,125,.12);
+  will-change: opacity, transform, filter;
+}
+.perf-card img {
+  width: 100%; height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.perf-card-skel {
+  width: 100%; height: 100%;
+  background: rgba(125,125,125,.14);
+}
+/* 入场动画：起点态由 overlay[data-anim] 决定，.on 为终态；缓动更柔和 */
+.perf-card {
+  opacity: 0;
+  transition-property: opacity, transform, filter;
+  transition-timing-function: cubic-bezier(.22,.61,.36,1);
+}
+.perf-overlay[data-anim="zoomIn"]  .perf-card { transform: scale(.84); }
+.perf-overlay[data-anim="zoomOut"] .perf-card { transform: scale(1.12); }
+.perf-overlay[data-anim="slideUp"] .perf-card { transform: translateY(26px); }
+.perf-overlay[data-anim="blur"]    .perf-card { filter: blur(18px); }
+.perf-card.on { opacity: 1; transform: none; filter: none; }
+
+/* ─── 模式4 幻灯片 ─── */
+.slide-slot {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 100%;
+  overflow: hidden;
+  perspective: 1200px;
+}
+.slide-img {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transform-origin: 50% 50%;
+  animation-fill-mode: forwards;
+  animation-timing-function: cubic-bezier(.33,.0,.2,1);
+}
+.slide-img.fx-fade { animation-name: slideFade; }
+.slide-img.fx-kenburns {
+  opacity: 1;
+  transform-origin: var(--kb-origin, 50% 50%);
+  animation-name: kenBurnsIn;
+  animation-timing-function: linear;
+}
+.slide-img.fx-panL {
+  opacity: 1;
+  animation-name: kenBurnsPanL;
+  animation-timing-function: linear;
+}
+.slide-img.fx-panR {
+  opacity: 1;
+  animation-name: kenBurnsPanR;
+  animation-timing-function: linear;
+}
+.slide-img.fx-blur { animation-name: slideBlur; }
+.slide-img.fx-flip { animation-name: slideFlip; backface-visibility: hidden; }
+.slide-img.fx-slideL { animation-name: slideSlideL; }
+.slide-img.fx-circle { animation-name: slideCircle; clip-path: circle(0% at 50% 50%); }
+.slide-img.fx-blackout { animation-name: slideBlackout; }
+.slide-img.leave { opacity: 0 !important; animation: none; transition: opacity var(--slide-dur, .9s) ease; }
+
+@keyframes slideFade {
+  0% { opacity: 0; transform: scale(1.02); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes kenBurnsIn {
+  0% { opacity: 0; transform: scale(1); }
+  10% { opacity: 1; }
+  100% { opacity: 1; transform: scale(1.14); }
+}
+@keyframes kenBurnsPanL {
+  0% { opacity: 0; transform: scale(1.14) translateX(3%); }
+  12% { opacity: 1; }
+  100% { opacity: 1; transform: scale(1.14) translateX(-3%); }
+}
+@keyframes kenBurnsPanR {
+  0% { opacity: 0; transform: scale(1.14) translateX(-3%); }
+  12% { opacity: 1; }
+  100% { opacity: 1; transform: scale(1.14) translateX(3%); }
+}
+@keyframes slideBlur {
+  0% { opacity: 0; filter: blur(24px); transform: scale(1.04); }
+  100% { opacity: 1; filter: blur(0); transform: scale(1); }
+}
+@keyframes slideFlip {
+  0% { opacity: 0; transform: rotateY(90deg); }
+  100% { opacity: 1; transform: rotateY(0); }
+}
+@keyframes slideSlideL {
+  0% { opacity: 0; transform: translateX(100%); }
+  12% { opacity: 1; }
+  100% { opacity: 1; transform: translateX(0); }
+}
+@keyframes slideCircle {
+  0% { clip-path: circle(0% at 50% 50%); }
+  100% { clip-path: circle(150% at 50% 50%); }
+}
+@keyframes slideBlackout {
+  0% { opacity: 0; transform: scale(1.08); filter: brightness(0); }
+  25% { opacity: 1; }
+  55% { filter: brightness(1); }
+  100% { opacity: 1; transform: scale(1); filter: brightness(1); }
+}
+
+/* ─── 模式5 封面流 ─── */
+.cover-stage {
+  position: absolute;
+  inset: 0;
+  perspective: 1500px;
+  transform-style: preserve-3d;
+}
+.cover-card {
+  position: absolute;
+  left: 50%; top: 50%;
+  /* 仅初始占位；实际宽高由 JS 按每张媒体真实宽高比写内联值，保证卡片框=媒体边界 */
+  width: 640px; height: 360px;
+  border-radius: 18px;
+  transition: transform .65s cubic-bezier(.22,.61,.36,1), opacity .65s ease,
+              width .5s cubic-bezier(.22,.61,.36,1), height .5s cubic-bezier(.22,.61,.36,1);
+  transform-style: preserve-3d;
+  pointer-events: none;
+}
+.cover-inner {
+  position: relative;
+  width: 100%; height: 100%;
+  border-radius: 18px;
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgba(0,0,0,.6);
+  background: #0b0f16;
+}
+.cover-inner img,
+.cover-inner video {
+  width: 100%; height: 100%;
+  /* 卡片框按媒体比例贴合，cover 可做到像素级填满、边框与媒体边界重合 */
+  object-fit: cover;
+  display: block;
+}
+.cover-inner video { position: absolute; inset: 0; }
+/* 中央卡换入动效（切换效果可在设置中选择，作用于 inner，不与卡片位移动画打架） */
+.cover-inner.cover-pop { animation-duration: .6s; animation-timing-function: cubic-bezier(.22,.61,.36,1); animation-fill-mode: backwards; }
+.cover-inner.cover-pop.fx-zoom   { animation-name: coverPop; }
+.cover-inner.cover-pop.fx-flip   { animation-name: coverFlip; }
+.cover-inner.cover-pop.fx-slide  { animation-name: coverSlide; }
+.cover-inner.cover-pop.fx-fade   { animation-name: coverFade; }
+.cover-inner.cover-pop.fx-rotate { animation-name: coverRotate; }
+@keyframes coverPop {
+  0%   { transform: scale(.8); opacity: .2; }
+  55%  { transform: scale(1.06); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+@keyframes coverFlip {
+  0%   { transform: rotateY(80deg) scale(.9); opacity: 0; }
+  100% { transform: rotateY(0) scale(1); opacity: 1; }
+}
+@keyframes coverSlide {
+  0%   { transform: translateX(18%) scale(.92); opacity: 0; }
+  100% { transform: translateX(0) scale(1); opacity: 1; }
+}
+@keyframes coverFade {
+  0%   { opacity: 0; }
+  100% { opacity: 1; }
+}
+@keyframes coverRotate {
+  0%   { transform: rotateZ(-8deg) scale(.82); opacity: 0; }
+  60%  { transform: rotateZ(2deg) scale(1.04); opacity: 1; }
+  100% { transform: rotateZ(0) scale(1); opacity: 1; }
+}
+
+/* 快捷键行 */
+.shortcutRow {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  font-size: 13px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   右键菜单
+   ═══════════════════════════════════════════════════════ */
+.ctx-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-item:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.ctx-item svg { width: 15px; height: 15px; opacity: .75; flex-shrink: 0; }
+.ctx-item .ctx-sub { margin-left: auto; font-size: 11px; opacity: .45; padding-left: 18px; }
+.ctx-sep { height: 1px; margin: 4px 8px; background: var(--border); }
+.ctx-item.danger:hover { background: rgba(239,68,68,.25); }
+
+/* ═══════════════════════════════════════════════════════
+   专业播放器控制栏
+   ═══════════════════════════════════════════════════════ */
+/* 进度条（可点击/拖拽） */
+.player-seek {
+  position: relative;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.16);
+  cursor: pointer;
+  transition: height .12s;
+}
+.player-seek-lg { height: 6px; }
+.player-seek:hover { height: 8px; }
+.player-seek-fill {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.player-seek-knob {
+  position: absolute; top: 50%; left: 0%;
+  width: 13px; height: 13px;
+  border-radius: 999px;
+  background: #fff;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 6px rgba(0,0,0,.5);
+  opacity: 0;
+  transition: opacity .12s;
+  pointer-events: none;
+}
+.player-seek:hover .player-seek-knob { opacity: 1; }
+
+/* L131：进度条悬浮帧预览 */
+.seek-preview {
+  position: absolute;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 30;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgba(12,14,20,.78);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255,255,255,.14);
+  pointer-events: none;
+  white-space: nowrap;
+  box-shadow: 0 6px 22px rgba(0,0,0,.4);
+}
+.seek-preview.hidden { display: none; }
+.seek-preview img {
+  display: block;
+  width: 168px;
+  border-radius: 5px;
+  background: #000;
+}
+.seek-preview span {
+  display: block;
+  text-align: center;
+  font-size: 10px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: rgba(255,255,255,.82);
+  padding-top: 3px;
+}
+
+/* L194：面包屑首页图标按钮 */
+.crumb-home {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  color: inherit;
+  opacity: .75;
+  flex: none;
+}
+.crumb-home:hover { background: rgba(127,127,127,.18); opacity: 1; }
+
+/* L143：地址栏编辑输入框 */
+#addrInput {
+  flex: 1;
+  min-width: 160px;
+  height: 22px;
+  margin: 0 4px;
+  padding: 0 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(127,127,127,.35);
+  background: rgba(127,127,127,.12);
+  color: inherit;
+  outline: none;
+}
+#addrInput:focus { border-color: var(--accent); }
+
+/* L144：预览器控制条文件名超长省略号 */
+#videoFileName { max-width: 300px; }
+
+/* 控制按钮 */
+.player-ctl {
+  width: 36px; height: 36px;
+  border-radius: 999px;
+  display: flex; align-items: center; justify-content: center;
+  color: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.10);
+  backdrop-filter: blur(8px);
+  transition: background .15s, transform .1s;
+}
+.player-ctl:hover { background: rgba(255,255,255,0.25); color: #fff; }
+.player-ctl:active { transform: scale(0.92); }
+.player-ctl svg { width: 17px; height: 17px; }
+.player-ctl-sm { width: 30px; height: 30px; }
+.player-ctl-sm svg { width: 15px; height: 15px; }
+.player-ctl-main {
+  width: 46px; height: 46px;
+  background: var(--accent);
+  color: #fff;
+}
+.player-ctl-main:hover { background: var(--accent); filter: brightness(1.12); }
+.player-ctl-main svg { width: 20px; height: 20px; }
+/* L154：选中/开启态 = 关键色线框 + 中间淡淡的透明填充（不再实心） */
+.player-ctl.active {
+  background: rgba(var(--accent-rgb), .14);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+/* L152/L197：解码信息悬浮层 —— 增大 + 字体增大 + 左侧垂直居中 */
+.video-info-panel {
+  position: absolute;
+  top: 50%;
+  left: 18px;
+  transform: translateY(-50%);
+  z-index: 35;
+  min-width: 280px;
+  max-width: 460px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(12,14,20,.72);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,.14);
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(255,255,255,.88);
+  pointer-events: none;
+}
+.video-info-panel.hidden { display: none; }
+.vi-row { display: flex; gap: 12px; padding: 2.5px 0; }
+.vi-k { flex: none; width: 68px; opacity: .55; }
+.vi-v { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono, ui-monospace, monospace); }
+
+/* 线框 + 透明底（强调色描边）：播放键与上下文件键 */
+.player-ctl-line {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+.player-ctl-line:hover { background: rgba(var(--accent-rgb), .22); color: var(--accent); }
+.player-ctl-lg { width: 46px; height: 46px; }
+.player-ctl-lg svg { width: 20px; height: 20px; }
+
+/* 控制栏第二行：三列栅格，左右各 1fr → 中间控件组精确居中 */
+.player-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 10px;
+}
+.player-row > :first-child { justify-self: start; }
+.player-row > :last-child { justify-self: end; }
+/* 控制条左侧：时间 与 文件名 之间的竖线 */
+.player-sep { width: 1px; height: 12px; background: rgba(255,255,255,.22); margin: 0 6px; align-self: center; }
+
+/* 集锦箱：列表 / 图标 两种侧栏形态 */
+.collection-item { display: flex; align-items: center; gap: 6px; padding: 3px 6px;
+  border-radius: 6px; cursor: pointer; }
+.collection-item:hover { background: rgba(125,125,125,.12); }
+.collection-item svg { width: 14px; height: 14px; flex-shrink: 0; opacity: .8; }
+#collectionList.collapsed { display: none !important; } /* L116：!important 压过 .icon-mode 的 display:flex */
+/* L226：集锦箱最多显示两行高度，多出用滚动条 */
+#collectionList { max-height: 108px; min-height: 0; overflow-y: auto; flex-shrink: 0; }
+#collectionList.icon-mode { display: flex; flex-wrap: wrap; gap: 6px; }
+#collectionList.icon-mode .collection-item { flex-direction: column; width: 52px; padding: 6px 2px; gap: 3px; }
+#collectionList.icon-mode .collection-item svg { width: 22px; height: 22px; }
+#collectionList.icon-mode .ci-name { max-width: 50px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 10px; }
+.ci-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+
+/* 音量滑块 */
+.player-vol { width: 84px; height: 4px; }
+/* 音量数字：滑块只有一条线，看不出调到了多少 */
+.player-vol-text {
+  min-width: 26px;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255,255,255,0.6);
+  cursor: default;
+  user-select: none;
+}
+/* 音画偏移读数只在信息面板里出现（不再占控制条位置）。
+   面板本体是 pointer-events:none（否则会挡住画面点击），所以只给
+   「归零」这一颗按钮单独开 auto，其余文字仍然不吃点击。 */
+.vi-av-ok   { color: rgba(134,239,172,0.95); }
+.vi-av-bad  { color: rgba(252,165,165,0.95); }
+.vi-btn-reset {
+  pointer-events: auto;
+  flex: none; /* 兄弟 .vi-v 是 flex:1，别让按钮被挤没 */
+  cursor: pointer;
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.14);
+  border: 1px solid rgba(255,255,255,0.18);
+}
+.vi-btn-reset:hover { background: rgba(255,255,255,0.26); color: #fff; }
+/* 速度选择 */
+.player-select {
+  padding: 3px 8px;
+  font-size: 12px;
+  border-radius: 8px;
+  color: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.15);
+  outline: none;
+  cursor: pointer;
+}
+.player-select option { color: #1e293b; background: #fff; }
+
+/* ═══════════════════════════════════════════════════════
+   关键控件发光
+   ═══════════════════════════════════════════════════════ */
+.glow-accent {
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 65%, transparent),
+              inset 0 0 4px color-mix(in srgb, var(--accent) 25%, transparent);
+  transition: box-shadow .2s;
+}
+.glow-accent:hover {
+  box-shadow: 0 0 22px color-mix(in srgb, var(--accent) 95%, transparent),
+              inset 0 0 6px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.glow-btn {
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+.viewBtn.active {
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+
+/* L91：ESC 退出预览后 scroller 自动获得焦点时不显示 outline */
+#scroller:focus, #content:focus { outline: none; }
+
+/* ═══════════════════════════════════════════════════════
+   预览层悬浮顶栏（仅鼠标移到顶部区域才显示；隐藏时不可点击）
+   ═══════════════════════════════════════════════════════ */
+#viewerTopFloat { pointer-events: none; }
+#viewerTopFloat.viewer-show { opacity: 1; pointer-events: auto; }
+
+/* 沉浸式淡入淡出元素（上一项/下一项箭头等） */
+.viewer-fade {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .3s ease;
+}
+.viewer-fade.viewer-show { opacity: 1; pointer-events: auto; }
+
+/* ═══════════════════════════════════════════════════════
+   现代悬浮播放控制栏（玻璃拟态胶囊，随鼠标隐藏）
+   ═══════════════════════════════════════════════════════ */
+.player-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  /* 宽度由 JS 按视频实际显示宽度收紧（见 syncPlayerBarWidth） */
+  width: min(1600px, calc(100% - 32px));
+
+  z-index: 20;
+  padding: 12px 18px 14px;
+  border-radius: 18px;
+  background: rgba(12,14,20,0.55);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.10);
+  box-shadow: 0 16px 48px rgba(0,0,0,0.5);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(10px);
+  transition: opacity .45s ease, transform .45s ease; /* L84：离开缓慢消失 */
+}
+.player-bar.viewer-show {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* ═══════════════════════════════════════════════════════
+   标题栏按钮（卡片式：设置/主题中性，最小绿/最大黄/关闭红）
+   ═══════════════════════════════════════════════════════ */
+.titlebar-btn {
+  width: 36px; height: 30px;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.titlebar-btn:hover { color: var(--text); border-color: var(--accent); }
+.titlebar-btn:active { transform: scale(0.92); }
+/* 中性按钮（主题切换）：hover 提亮 */
+.titlebar-btn:hover#btnTheme { color: var(--text); }
+/* 设置：强调色（无发光） */
+.titlebar-btn-accent {
+  color: var(--accent-text);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.titlebar-btn-accent:hover {
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+/* L92：音乐进入按钮 —— 关键色的相反色（互补色，hue-rotate 180°） */
+#btnAudio {
+  color: var(--accent-text);
+  filter: hue-rotate(180deg) saturate(1.4);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+#btnAudio:hover {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: var(--accent);
+  filter: hue-rotate(180deg) saturate(1.4) brightness(1.12);
+}
+/* 最小化：绿 */
+#btnMin { color: #3fb950; border-color: rgba(63,185,80,.45); }
+#btnMin:hover { background: rgba(63,185,80,.16); color: #3fb950; border-color: #3fb950; }
+/* 最大化：黄 */
+#btnMax { color: #d29922; border-color: rgba(210,153,34,.45); }
+#btnMax:hover { background: rgba(210,153,34,.16); color: #e3b341; border-color: #d29922; }
+/* 关闭：红 */
+.titlebar-btn-close { color: #f85149; border-color: rgba(248,81,73,.45); }
+.titlebar-btn-close:hover {
+  background: #f85149; color: #fff; border-color: #f85149;
+  box-shadow: 0 0 14px rgba(248,81,73,.5);
+}
+
+.tree-node.dragging { opacity: .45; }
+
+/* L123：工具栏自动播放按钮点亮态（线框+中间透明，点亮显关键色） */
+.tool-ico.on { color: var(--accent); }
+
+/* 欢迎空态 */
+/* L132：空白首页 —— 顶部磁盘栏 + 居中欢迎内容 */
+.welcome-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.welcome-wrap .welcome-hero {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+.welcome-drivebar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 14px 18px 4px;
+}
+/* L149：水平长方形磁盘卡片（图标+容量进度条），下方显示卷标和盘符 */
+.drive-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  width: 218px;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+}
+.drive-card-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(127,127,127,.25);
+  background: rgba(127,127,127,.07);
+  transition: border-color .15s, background .15s, transform .1s;
+}
+.drive-card:hover .drive-card-inner {
+  border-color: var(--accent);
+  background: rgba(127,127,127,.14);
+}
+.drive-card:active .drive-card-inner { transform: scale(.97); }
+.drive-card-icon {
+  width: 38px;
+  height: 38px;
+  object-fit: contain;
+  flex: none;
+  pointer-events: none;
+}
+.drive-card-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+.drive-card-name {
+  font-size: 12px;
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drive-card-cap {
+  font-size: 10.5px;
+  opacity: .6;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.drive-card-bar {
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(127,127,127,.25);
+  overflow: hidden;
+  margin-top: 3px;
+}
+.drive-card-bar > div {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.drive-card-bottom {
+  font-size: 11px;
+  line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: .8;
+}
+
+.welcome-hero {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100%; gap: 14px; text-align: center;
+}
+
+/* ═══════════════════════════════════════════════════════
+   文件区标签页
+   ═══════════════════════════════════════════════════════ */
+.tab-item {
+  display: flex; align-items: center; gap: 6px;
+  max-width: 190px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.2;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.tab-item:hover { color: var(--text); }
+.tab-item.active {
+  background: rgba(var(--accent-rgb), .18);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.tab-item .tab-name { overflow: hidden; text-overflow: ellipsis; }
+.tab-item .tab-close {
+  width: 16px; height: 16px; flex-shrink: 0;
+  border-radius: 999px;
+  display: flex; align-items: center; justify-content: center;
+  opacity: .5;
+}
+.tab-item .tab-close:hover { background: rgba(239,68,68,.28); opacity: 1; }
+.tab-add {
+  width: 26px; height: 24px;
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  background: transparent;
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.tab-add:hover { color: var(--accent-text); border-color: var(--accent); }
+
+/* ═══════════════════════════════════════════════════════
+   沉浸模式：只留文件区（body.immersive 一键切换）
+   ═══════════════════════════════════════════════════════ */
+body.immersive #titlebar,
+body.immersive #sidebar,
+body.immersive #tabBar,
+body.immersive #toolbar,
+body.immersive #statusBar,
+body.immersive #infoPanel { display: none !important; }
+/* 沉浸模式：文件区全屏；无顶栏；鼠标移到顶部才显示退出按钮 */
+body.immersive #mainWrap { top: 0 !important; }
+body.immersive #immersionBar { display: flex; }
+#immersionBar { opacity: 0; transition: opacity .45s ease; }
+#immersionBar.immersion-show { opacity: 1; }
+#immersionBar .titlebar-btn { background: rgba(12,14,20,.55); backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px); color: #fff; border-radius: 8px; }
+#immersionToast { opacity: 0; transition: opacity .6s ease; }
+#immersionToast.show { opacity: 1; }
+
+/* 视频画面 canvas。
+   位图尺寸（cvs.width/height）由 JS 按解码帧设置，CSS 负责把它铺满整个舞台。
+   这里**不能**只写 max-width/max-height:100%：那只约束「不超出」，不会放大。
+   canvas 是 replaced element，固有尺寸 = 解码尺寸（全屏时可能只有 1280x720），
+   于是它会死死卡在 1280x720 居中显示 —— 这正是「视频不全屏播放」的原因。
+   正确做法：盒模型铺满舞台（stage 是 relative，absolute+inset:0 最稳，
+   不受 flex 尺寸解析影响），再用 object-fit:contain 让像素内容按原比例
+   内缩，两侧留黑边，和 <video>/<img> 的观感一致。 */
+#videoCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  object-position: center;
+  background: #000;
+  z-index: 0;
+}
+
+/* ═══════════════════════════════════════════════════════
+   标题栏竖线分隔（音乐按钮 / 窗口按钮）
+   ═══════════════════════════════════════════════════════ */
+.titlebar-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 3px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+/* ═══════════════════════════════════════════════════════
+   预览器：图片两侧文件切换箭头（视频隐藏）
+   ═══════════════════════════════════════════════════════ */
+.viewer-side-arrow {
+  position: absolute;
+  top: 50%;
+  z-index: 40; /* L112：层级在播放列表（z-30）之上 */
+  width: 48px; height: 48px;
+  display: flex; align-items: center; justify-content: center;
+  /* L112：去掉小圆圈，只留三角标志；不悬浮时无颜色 */
+  background: transparent;
+  border: 12px solid transparent; /* 扩大悬浮检测范围 */
+  color: transparent;
+  pointer-events: auto; /* 覆盖 .viewer-fade 的 none：隐藏时仍可悬浮唤醒 */
+  transform: translateY(-50%);
+  transition: opacity .3s ease, color .15s;
+}
+.viewer-side-arrow:hover { color: var(--accent); }
+.viewer-side-arrow:active { transform: translateY(-50%) scale(.93); }
+.viewer-side-arrow svg { width: 28px; height: 28px; }
+.viewer-side-arrow.hidden { display: none; }
+/* L112：撤回右箭头让位播放列表的调整，恢复两侧对称位置 */
+#viewerPrevSide { left: 22px; }
+#viewerNextSide { right: 22px; }
+#viewerPlaylist {
+  position: absolute;
+  top: 50%;
+  right: 16px;
+  transform: translateY(-50%) translateX(10px);
+  z-index: 30; 
+  width: 340px;
+  height: 66.67vh; /* L108：高度总是窗口的 2/3（宽度固定，不自适应） */
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  background: rgba(14,16,22,.42);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(255,255,255,.10);
+  box-shadow: 0 14px 44px rgba(0,0,0,.45);
+  overflow: hidden;
+  transition: opacity .3s ease, transform .3s ease;
+}
+#viewerPlaylist.viewer-show { transform: translateY(-50%) translateX(0); }
+/* 顶部：全部/视频/图片 3 按钮开关 */
+#vpTabs {
+  display: flex;
+  gap: 6px;
+  padding: 10px 10px 8px;
+  border-bottom: 1px solid rgba(255,255,255,.08);
+}
+.vp-tab {
+  flex: 1;
+  padding: 4px 0;
+  font-size: 12px;
+  line-height: 1;
+  border-radius: 8px;
+  color: rgba(255,255,255,.62);
+  background: rgba(255,255,255,.06);
+  border: 1px solid rgba(255,255,255,.08);
+  cursor: pointer;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.vp-tab:hover { background: rgba(255,255,255,.14); color: #fff; }
+.vp-tab.on { background: var(--accent); color: var(--accent-on); border-color: transparent; }
+/* 列表项 */
+#vpList { flex: 1; min-height: 0; overflow-y: auto; padding: 6px; }
+.vp-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 9px;
+  cursor: pointer;
+  font-size: 12px;
+  color: rgba(255,255,255,.80);
+  transition: background .50s;
+}
+.vp-item:hover { background: rgba(255,255,255,.10); }
+.vp-item.active { background: rgba(var(--accent-rgb), .22); color: #fff; }
+.vp-item .vp-ico { width: 14px; height: 14px; flex-shrink: 0; opacity: .7; }
+.vp-item .vp-ico svg { width: 100%; height: 100%; }
+.vp-item .vp-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ═══════════════════════════════════════════════════════
+   L101：预览器视频——最长边自适应屏幕，最短边保持比例
+   ═══════════════════════════════════════════════════════ */
+#viewerVideo {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* ═══════════════════════════════════════════════════════
+   图片总览图（右下角；尺寸由 JS 按宽高比写入）
+   ═══════════════════════════════════════════════════════ */
+#minimapImg { opacity: .92; }
+#minimapView {
+  border: 1.5px solid var(--accent);
+  background: rgba(var(--accent-rgb), .18);
+  box-shadow: 0 0 8px rgba(var(--accent-rgb), .55);
+  min-width: 8px;
+  min-height: 8px;
+}
+
+/* ═══════════════════════════════════════════════════════
+   侧边栏顶部：常用目录快捷入口
+   ═══════════════════════════════════════════════════════ */
+.quick-dir {
+  width: 38px; height: 34px;
+  border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.quick-dir:hover {
+  color: var(--accent-text);
+  background: rgba(var(--accent-rgb), .14);
+  border-color: var(--accent);
+}
+.quick-dir.active {
+  color: var(--accent-text);
+  background: rgba(var(--accent-rgb), .18);
+  border-color: var(--accent);
+}
+.quick-dir svg { width: 18px; height: 18px; }
+
+/* ═══════════════════════════════════════════════════════
+   网格视图：文件夹紧凑小图标条（不与媒体卡片共享尺寸）
+   ═══════════════════════════════════════════════════════ */
+.folder-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+}
+.folder-item {
+  width: 76px;
+  padding: 4px 2px;
+  border-radius: 9px;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.folder-item:hover { background: rgba(125,125,125,.14); }
+.folder-item.selected {
+  background: rgba(var(--accent-rgb), .16);
+  border-color: var(--accent);
+}
+.folder-item .fi-icon {
+  width: 38px; height: 38px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+}
+.folder-item .fi-icon svg { width: 28px; height: 28px; }
+.folder-item .fi-name {
+  font-size: 11px;
+  line-height: 12px;
+  text-align: center;
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* 媒体绝对定位层（文件夹条在文档流，媒体整体下移） */
+#gridLayer {
+  position: absolute;
+  left: 0; right: 0; top: 0;
+  will-change: transform;
+}
+
+/* 视频缓冲提示浮层
+ *
+ * pointer-events:none —— 浮层盖在画面正中，若吃掉点击，用户缓冲期间就点不了
+ * 暂停/进度条，也就无法打断这 1~3 秒的等待。
+ *
+ * 进度条两种状态：
+ *   · 已知进度（bufMs/PIPE_BUFFER_MS 有值）→ 用内联 width 走确定进度
+ *   · 未知进度（管线刚起、还没上报 buffered_ms）→ rv-buf-indeterminate
+ *     做来回滑动的条。**不能用空条**：一条空条配一个转圈，看起来像卡死；
+ *     会动的条至少传达「还在动」。
+ */
+#videoBufOverlay {
+  /* 缓冲期间画面本来就是静止的，用深色压一层让提示读得清 */
+  background: rgba(0, 0, 0, 0.55);
+}
+.rv-buf-indeterminate {
+  width: 38% !important;
+  animation: rv-buf-slide 1.1s ease-in-out infinite;
+}
+@keyframes rv-buf-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(263%); }   /* 40%(160px容器) 的位移刚好到右端 */
+}
+/* 尊重系统的「减少动态效果」设置：关掉动画但保留静态提示 */
+@media (prefers-reduced-motion: reduce) {
+  #videoBufOverlay .animate-spin,
+  .rv-buf-indeterminate {
+    animation: none;
+  }
+  .rv-buf-indeterminate { width: 100% !important; opacity: 0.45; }
+}
+

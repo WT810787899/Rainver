@@ -1,0 +1,52 @@
+[package]
+name = "rainver"
+version = "0.1.0"
+description = "Rainver 落雨影音 — 媒体管理器"
+license = "GPL-3.0-only"
+authors = ["you"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "devtools"] }
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_Graphics_Gdi",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+] }
+tauri-plugin-store = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+blake3 = "1"
+libloading = "0.8"          # 动态加载 libmpv（mpv-2.dll 缺失时优雅降级）
+image = { version = "0.25", features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+kamadak-exif = "0.6"        # EXIF 方向自动旋转
+id3 = "1"                    # mp3 元信息
+mp4ameta = "0.11"            # mp4/m4a 元信息
+metaflac = "0.2"             # flac 元信息
+symphonia = { version = "0.5", features = ["mp3", "wav", "ogg", "flac", "aac", "isomp4"] } # 时长解析
+num_cpus = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+drag = "2.1.1"
+
+[features]
+# 通过 sidecar 携带的 ffmpeg（置于 src-tauri/bin）
+ffmpeg-sidecar = []
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"

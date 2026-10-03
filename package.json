@@ -1,0 +1,25 @@
+{
+  "name": "rainver",
+  "version": "0.1.0",
+  "description": "Rainver 落雨影音 - 媒体管理器",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "npx @tailwindcss/cli -i ./src/input.css -o ./src/style.css --watch",
+    "build:css": "npx @tailwindcss/cli -i ./src/input.css -o ./src/style.css --minify",
+    "app": "cargo run --manifest-path src-tauri/Cargo.toml",
+    "app:release": "cargo run --release --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.0.0",
+    "@tauri-apps/cli": "^2.0.0"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.0.0",
+    "@tauri-apps/plugin-shell": "^2.0.0",
+    "@tauri-apps/plugin-store": "^2.0.0",
+    "web-demuxer": "^4.0.0"
+  }
+}

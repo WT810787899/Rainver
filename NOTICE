@@ -1,0 +1,55 @@
+Rainver 落雨影音
+Copyright (C) 2025-2026 Rainver contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+======================================================================
+Third-party components
+======================================================================
+
+This project uses or can make use of the following third-party
+components. Each component is licensed under its own license terms:
+
+- mpv (libmpv)
+  https://mpv.io/
+  License: GPL-2.0+ (official builds) / LGPL-2.1+ (LGPL builds)
+  Usage: video playback engine, loaded dynamically at runtime.
+  Note: mpv-2.dll is NOT bundled with this repository. Users should
+  obtain it from the official mpv distribution. If you distribute
+  mpv-2.dll along with binaries of this program, you must comply with
+  the corresponding license, including providing the source code of
+  the exact mpv build you distribute.
+
+- FFmpeg
+  https://ffmpeg.org/
+  License: LGPL-2.1+ or GPL-2.0+ (depending on build configuration)
+  Usage: thumbnail generation and media metadata extraction, invoked
+  as an external executable (or as an optional sidecar binary).
+  Note: FFmpeg binaries are NOT bundled with this repository. If you
+  distribute FFmpeg binaries, you must comply with the corresponding
+  license, including providing the source code of the exact build you
+  distribute.
+
+- web-demuxer
+  https://github.com/Momo707577045/web-demuxer
+  License: MIT
+  Usage: browser-side media demuxing (WebAssembly based on FFmpeg).
+
+- Tauri
+  https://tauri.app/
+  License: MIT / Apache-2.0
+
+- Tailwind CSS
+  https://tailwindcss.com/
+  License: MIT
