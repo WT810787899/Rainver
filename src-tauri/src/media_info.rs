@@ -32,6 +32,9 @@ pub struct MediaInfo {
     /// 封面/占位图绝对路径（音频与视频首帧共用缩略图缓存机制）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_path: Option<String>,
+    /// 视频编码（h264/hevc/…），前端据此预判播放引擎（浏览器不可解码 → 转码）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
 }
 /// 获取单个媒体文件的元信息（spawn_blocking，防止 IO 阻塞）
 #[tauri::command]
@@ -187,6 +190,7 @@ fn image_info(src: &Path) -> Result<MediaInfo, String> {
         artist: None,
         album: None,
         cover_path: Some(src.to_string_lossy().into_owned()),
+        video_codec: None,
     })
 }
 /// ffmpeg 探测图片尺寸（stderr 里的 "Video: … 1920x1080"）
@@ -235,6 +239,7 @@ fn video_info(src: &Path) -> Result<MediaInfo, String> {
         duration,
         width: w,
         height: h,
+        video_codec: parse_stream_codec(&err, "Video:"),
         title: None,
         artist: None,
         album: None,
@@ -277,6 +282,7 @@ fn audio_info(src: &Path, ext: &str, cache: &Path) -> Result<MediaInfo, String> 
         artist,
         album,
         cover_path,
+        video_codec: None,
     })
 }
 /// symphonia 探测音频时长

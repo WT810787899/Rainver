@@ -7,11 +7,6 @@
 mod config;
 mod files;
 mod fs;
-
-#[cfg(windows)]
-mod mpv;
-#[cfg(windows)]
-mod video;
 mod media_info;
 mod settings;
 mod thumb;
@@ -20,7 +15,7 @@ mod utils;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager,
+    Emitter, Manager,
 };
 
 fn main() {
@@ -47,17 +42,10 @@ fn main() {
                 })
                 .build(),
         )
-        // 视频画面帧的自定义协议。前端用 fetch('http://rvframe.localhost/f') 取最新帧，
-        // 拿到的是真正的二进制 ArrayBuffer（走 IPC 的 Raw 会被 Tauri 转成数字数组，见 video.rs）。
-        // Windows 上自定义协议被映射到 http://<scheme>.localhost/，所以 scheme 名不能带 http://。
-        .register_uri_scheme_protocol("rvframe", |_ctx, req| {
-            // 前端用 ?pts=<媒体毫秒> 告诉我们要「该时刻的帧」。比它旧的帧会在
-            // Rust 侧一次丢掉 —— 拖进度条 / 画面落后时靠这个追上，而不是一帧一帧挪。
-            video::frame_response(video::parse_want_pts(req.uri().query()))
-        })
         .invoke_handler(tauri::generate_handler![
             fs::list_directory,             // 扫描目录 → MediaItem 列表
             fs::list_directory_deep,        // L230：穿透递归扫描
+            fs::list_directory_stream,      // 流式扫描：每 500 条 emit dir-chunk，前端增量渲染
             fs::list_subfolders,            // 侧边树：子文件夹
             fs::pick_and_list,              // 选择根目录并扫描
             fs::list_drives,                // 磁盘根列表
@@ -69,27 +57,19 @@ fn main() {
             thumb::detect_ffmpeg,           // ffmpeg 自动检测（路径+版本）
             thumb::pick_ffmpeg,             // 手动选择 ffmpeg 可执行文件
             thumb::get_playable_path,       // 播放兼容：不支持的容器无损重封装为 mp4
+            thumb::extract_audio_track,     // 提取指定音轨并转码为 AAC（web-demuxer 不支持的音轨）
+            thumb::extract_video_only,      // 提取纯视频流（丢弃音轨），供 web-demuxer 播放
+            thumb::stream_audio,            // 实时转码音频为 fMP4，通过事件推送前端 MSE 播放
+            thumb::stop_audio_stream,       // 停止实时音频流
+            thumb::get_file_server_port,    // 获取本地文件 HTTP 服务器端口
+            thumb::transcode_stream,        // 硬件转码并流式输出（边转边播）
+            thumb::stop_transcode_stream,   // 停止流式转码（关闭查看器时）
+            thumb::transform_image,         // 旋转/翻转写回原图
+            thumb::cancel_all_previews,     // 取消所有预览重封装（全屏播放时释放资源）
+            thumb::transcode_to_playable,   // 视频编码不支持时转码为 H.264 mp4
             thumb::get_preview_path,        // 卡片预览专用：只重封装开头 N 秒
             thumb::cancel_preview,          // 卡片滚走时掐掉正在跑的重封装
             thumb::frame_at,                // L131：进度条悬浮帧预览
-            #[cfg(windows)]
-            mpv::mpv_available,             // mpv 引擎可用性探测
-            #[cfg(windows)]
-            mpv::mpv_load,                  // mpv 打开文件（只起音频）
-            #[cfg(windows)]
-            mpv::mpv_control,               // mpv 播放控制
-            #[cfg(windows)]
-            mpv::mpv_state,                 // mpv 播放状态轮询
-            #[cfg(windows)]
-            mpv::mpv_stop,                  // 停止 mpv 音频播放
-            #[cfg(windows)]
-            video::video_start,             // 视频画面：ffmpeg 解码 → 裸 RGBA 帧流
-            #[cfg(windows)]
-            video::video_status,            // 画面尺寸/硬解方式/结束状态
-            #[cfg(windows)]
-            video::video_stop,              // 停掉画面解码进程
-            #[cfg(windows)]
-            video::video_pause,             // 暂停：停进程但保留最后一帧（避免暂停黑屏）
             media_info::get_media_info,     // 单项元信息（含音频封面）
             media_info::get_media_props,    // 属性面板：帧率/分辨率/编码等
             config::load_config,            // 读取持久化配置
@@ -124,19 +104,30 @@ fn main() {
 
             // ─── 托盘 ───
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+            let perf = MenuItem::with_id(app, "perf", "表演模式", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &perf, &quit])?;
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("Rainver 落雨影音")
 
                 .menu(&menu)
+                // 左键只切换显示/隐藏，不弹菜单；菜单由右键打开
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(win) = app.get_webview_window("main") {
                             let _ = win.show();
                             let _ = win.set_focus();
+                        }
+                    }
+                    "perf" => {
+                        // 先呼出窗口再通知前端切换表演模式（隐藏时启动表演无意义）
+                        if let Some(win) = app.get_webview_window("main") {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                            let _ = app.emit("tray-perf", ());
                         }
                     }
                     "quit" => app.exit(0),
@@ -208,9 +199,7 @@ fn main() {
             // 所以在 Exit 上主动 kill + wait（wait 顺带回收进程句柄，
             // 否则每次启停都漏一个句柄，跑久了句柄表会耗尽）。
             if let tauri::RunEvent::Exit = event {
-                video::kill_all();
                 thumb::kill_all_remuxes();
-                mpv::shutdown();
             }
         });
 

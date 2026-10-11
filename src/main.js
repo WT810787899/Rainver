@@ -1,4 +1,4 @@
-﻿// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════
 // main.js — Rainver 落雨影音 前端逻辑
 //   虚拟滚动三视图 / 筛选排序搜索 / 收藏与磁盘根 / 设置 TAB 弹窗
 //   外观实时预览 / 自定义快捷键 / 画廊预览 / 配置持久化
@@ -8,6 +8,9 @@ import { getCurrentWindow } from './vendor/window.js';
 import { listen } from './vendor/event.js';
 import { LogicalSize, LogicalPosition, PhysicalPosition, PhysicalSize } from './vendor/dpi.js';
 import { renderAboutHtml, ABOUT } from './about.js';
+import { WebDemuxerPlayer, probeCached, probeResultSync, isMseSupported } from './web-player.js';
+
+console.log('[main.js] module loaded successfully');
 
 const win = getCurrentWindow();
 const APP_VERSION = ABOUT.version;
@@ -87,9 +90,6 @@ async function init() {
     saveCfg();
   }
 
-  // 兜底：页面重载 / HMR 后视频解码进程可能残留，启动时停掉
-  invoke('video_stop').catch(() => {});
-  invoke('mpv_stop').catch(() => {});
   // 默认快捷键迁移：旧默认是左右方向键，现默认 上一文件 A / 下一文件 D。
   // 仅在"仍是旧默认"（即用户没自定义过）时改写；方向键仍作为固定别名可用。
   const lsc = c.localShortcuts ?? (c.localShortcuts = {});
@@ -291,8 +291,27 @@ function setActiveTab(i) {
   if (state.cfg) state.cfg.activeTab = i;
 }
 
+// ─── 流式目录加载：Rust 每扫 500 条推一批（dir-chunk 事件），增量渲染 ───
+// 大目录不再等全量 JSON 一次序列化/解析完才显示；seq 代际防止换目录后旧批次混入
+let dirChunkSeq = 0;
+let dirChunkDone = true;
+let dirChunkPaint = false;
+listen('dir-chunk', (ev) => {
+  const { seq, items } = ev.payload ?? {};
+  if (dirChunkDone || seq !== dirChunkSeq || !Array.isArray(items) || !items.length) return;
+  state.items.push(...items);
+  if (dirChunkPaint) return;
+  dirChunkPaint = true;
+  requestAnimationFrame(() => {
+    dirChunkPaint = false;
+    if (!dirChunkDone) applyFilter(); // 过滤+排序+虚拟重绘（rAF 合帧，只渲染可见卡片）
+  });
+});
+
 async function openDirectory(dir, opts = {}) {
   if (!dir) return;
+  // 真正离开当前目录：释放画廊原图内存池（同目录内的筛选/排序/刷新不丢）
+  if (state.currentDir && state.currentDir !== dir) clearGalleryFullPool();
   state.collectionMode = false; // L74：点击新目录时退出集锦箱模式，正常响应
   syncCollectionModeBtn();
   // L230：deep = 穿透扫描（递归所有子目录）；普通导航显式退出穿透
@@ -311,19 +330,28 @@ async function openDirectory(dir, opts = {}) {
   if (state.cfg) state.cfg.lastDir = dir; // 此前只读不写，重启后无法恢复目录
   renderTabs();
   setStatus('加载中…');
+  // 流式扫描：先重置列表与失败缓存，再发起扫描（await 期间批次陆续到达并增量渲染）
+  resetSelection();
+  state.thumbFailed.clear(); // 换目录：允许重新尝试之前失败的缩略图
+  state.items = [];
+  renderBreadcrumb();
+  const seq = ++dirChunkSeq;
+  dirChunkDone = false;
+  let total = 0;
   try {
-    state.items = opts.deep
-      ? await invoke('list_directory_deep', { path: dir })
-      : await invoke('list_directory', { path: dir });
-    resetSelection();
-    state.thumbFailed.clear(); // 换目录：允许重新尝试之前失败的缩略图
-    renderBreadcrumb();
-
-
-    setStatus(opts.deep ? `穿透扫描：${state.items.length} 个文件（含全部子目录）` : '');
+    total = await invoke('list_directory_stream', { path: dir, deep: !!opts.deep, seq, includeAll: state.cfg?.mediaOnly === false });
   } catch (e) {
+    if (seq !== dirChunkSeq) return; // 已切走：残留批次由新代际接管
+    dirChunkDone = true;
+    state.items = []; // 失败：丢弃已到达的批次
     setStatus('加载失败: ' + e, true);
+    applyFilter();
+    saveCfg();
+    return;
   }
+  if (seq !== dirChunkSeq) return; // 期间已切换目录：本次结果作废
+  dirChunkDone = true;
+  setStatus(opts.deep ? `穿透扫描：${total} 个文件（含全部子目录）` : '');
   applyFilter();
   saveCfg();
   // L73：集锦箱点击定位 —— 跳到所在目录后选中并滚动到该文件
@@ -454,6 +482,20 @@ function setActiveThumbSize(v) {
   else state.cfg.thumbSize = v;
 }
 
+/** 缩放滑块可调范围（设置里可改，默认 60–240） */
+const zoomMin = () => state.cfg?.zoomMin ?? 60;
+const zoomMax = () => state.cfg?.zoomMax ?? 240;
+function applyZoomRange() {
+  const zmin = Math.min(zoomMin(), zoomMax());
+  const zmax = Math.max(zoomMin(), zoomMax());
+  const s = $('zoomSlider');
+  s.min = zmin; s.max = zmax;
+  // 当前缩放值超出新范围时收拢
+  const cur = activeThumbSize();
+  const cl = Math.min(zmax, Math.max(zmin, cur));
+  if (cl !== cur) { setActiveThumbSize(cl); s.value = cl; }
+}
+
 function renderVirtual() {
   const scrollTop = scroller.scrollTop;
   const viewH = scroller.clientHeight;
@@ -580,9 +622,11 @@ function renderVirtual() {
     // L36：扩大缩放范围；size>320 后斜率加大，最大(800)→列宽 1920，
     // 常见 1080p~4K 窗口均只显示 1 张
     const colW = galleryColW(size);
-    // 画廊视图过滤文件夹（只展示可预览的媒体）
+    // 画廊视图只展示可预览的媒体（文件夹/其他文件不参与，「仅显示媒体文件」开关不影响画廊）
     const tiles = [];
-    state.filtered.forEach((it, i) => { if (it.kind !== 'folder') tiles.push(galleryTile(it, i, colW)); });
+    state.filtered.forEach((it, i) => {
+      if (it.kind === 'image' || it.kind === 'video' || it.kind === 'audio') tiles.push(galleryTile(it, i, colW));
+    });
     sig = `y|${total}|${state.selVersion}|${size}|${Math.round(content.clientWidth)}|${state.galleryVer || 0}`;
     html = `<div class="gallery-rows">` + tiles.join('') + `</div>`;
 
@@ -605,6 +649,7 @@ function renderVirtual() {
   }
   requestThumbs();
   requestFullImgs(); // L155：画廊图片视口内原质量加载
+  prefetchGallerySizes(); // 画廊：提前让视口外 10 张卡片按真实尺寸定型
   scheduleAutoPreviews();
   lastRenderSig = sig;
   lastFilteredRef = state.filtered;
@@ -644,6 +689,10 @@ function thumbHtml(item, cls, style = '', reqSize = 512) {
   // 文件夹：直接画图标（不产生 data-thumb 骨架，避免被缩略图队列当媒体处理）
   if (item.kind === 'folder') {
     return `<div class="folder-thumb ${cls}"${style ? ` style="${style}"` : ''}>${FOLDER_ICO}</div>`;
+  }
+  // 其他文件（「仅显示媒体文件」关闭时）：通用文件图标，不进缩略图队列
+  if (item.kind === 'other') {
+    return `<div class="folder-thumb ${cls}"${style ? ` style="${style}"` : ''}>${kindIcon('other')}</div>`;
   }
   // L146：必须先查「精确尺寸」缓存；只有精确命中才能不带 data-thumb 直接出图。
   // 否则即便已有 512 小图，也要带着 data-thumb/data-size 渲染，
@@ -770,59 +819,224 @@ function itemRatioNum(item) {
   }
   return item.kind === 'video' ? 16 / 9 : 1;
 }
-/** 就地重排画廊卡片（对齐行布局，不重建 DOM，正在自动预览的视频不受影响） */
+/** 就地重排画廊卡片（不重建 DOM，正在自动预览的视频不受影响）。
+ *  排列方案（state.cfg.galleryLayout）：
+ *  · justified 对齐行：每行卡片等高、按比例缩放正好填满整行（默认）
+ *  · optimal  视口最优化：DP 选断点，行缩放偏离 1 最小（竖图不被压太小、横图不被撑太大）
+ *  · natural  自然行：不放大，按基准尺寸左对齐排满换行
+ *  · masonry  瀑布流：列宽固定，顺序填入最矮列
+ *  · balanced 平衡瀑布流：贪心填列后做列间搬移修正，各列总高度差最小
+ *  · hero     行首大图：每行首卡放大，其余卡按同行高度匹配剩余宽度 */
 function layoutGalleryNow() {
   const m = content.querySelector('.gallery-rows');
   if (!m) return;
   const gap = galleryGapPx();
-  // 基准行高由缩放滑块决定（与原列宽一致的尺寸感）
-  const targetH = galleryColW(state.cfg?.galleryThumbSize ?? 260);
+  // 基准尺寸由缩放滑块决定（行方案=基准行高，列方案=基准列宽）
+  const base = galleryColW(state.cfg?.galleryThumbSize ?? 260);
   const innerW = (content.clientWidth || m.clientWidth || scroller.clientWidth) - GALLERY_PAD * 2;
+  const layout = state.cfg?.galleryLayout ?? 'justified';
 
   const cards = [...m.children];
   const items = cards.map((card) => {
     const item = state.filtered[Number(card.dataset.idx)];
     const ratio = item ? itemRatioNum(item) : 1;
-    return { card, ratio, natW: targetH * ratio }; // 基准行高下卡片的自然宽度
+    return { card, ratio, natW: base * ratio }; // 基准行高下卡片的自然宽度
   });
 
-  let y = GALLERY_PAD;
-  let row = [];
-  let rowNatW = 0;
+  // 卡片就位 + thumb-box 填满卡片（覆盖原 aspect-ratio，由 object-fit 保证媒体不变形）
+  const place = (it, x, y, w, h) => {
+    it.card.style.width = w + 'px';
+    it.card.style.height = h + 'px';
+    it.card.style.left = x + 'px';
+    it.card.style.top = y + 'px';
+    const box = it.card.querySelector('.thumb-box');
+    if (box) { box.style.aspectRatio = 'auto'; box.style.height = '100%'; box.style.width = '100%'; }
+  };
 
-  const flushRow = (isLast) => {
-    if (!row.length) return;
-    const n = row.length;
+  // ── 列方案：瀑布流 / 平衡瀑布流 ──
+  if (layout === 'masonry' || layout === 'balanced') {
+    const cols = Math.max(1, Math.round((innerW + gap) / (base + gap)));
+    const colW = (innerW - (cols - 1) * gap) / cols;
+    const colH = new Array(cols).fill(GALLERY_PAD);
+    const colItems = Array.from({ length: cols }, () => []);
+    for (const it of items) {
+      let c = 0;
+      for (let i = 1; i < cols; i++) if (colH[i] < colH[c]) c = i;
+      const h = colW / it.ratio;
+      colItems[c].push({ it, h });
+      colH[c] += h + gap;
+    }
+    if (layout === 'balanced' && cols > 1) {
+      // 修正：把最高列的队尾卡片搬到最矮列，若能缩小高度差则接受（保持列内顺序）
+      for (let n = 0; n < items.length; n++) {
+        let hi = 0, lo = 0;
+        for (let i = 1; i < cols; i++) {
+          if (colH[i] > colH[hi]) hi = i;
+          if (colH[i] < colH[lo]) lo = i;
+        }
+        const range = colH[hi] - colH[lo];
+        if (range <= gap + 1) break;
+        const tail = colItems[hi][colItems[hi].length - 1];
+        if (!tail) break;
+        // 搬移后新高差更小才执行（队尾元素是唯一能不动其他卡位置的搬移对象）
+        const newHi = colH[hi] - tail.h - gap;
+        const newLo = colH[lo] + tail.h + gap;
+        const newRange = Math.max(newHi, newLo) - Math.min(newHi, newLo);
+        if (newRange >= range) break;
+        colItems[hi].pop();
+        colItems[lo].push(tail);
+        colH[hi] = newHi;
+        colH[lo] = newLo;
+      }
+    }
+    let maxH = 0;
+    for (let c = 0; c < cols; c++) {
+      let y = GALLERY_PAD;
+      for (const { it, h } of colItems[c]) {
+        place(it, GALLERY_PAD + c * (colW + gap), y, colW, h);
+        y += h + gap;
+      }
+      maxH = Math.max(maxH, colH[c]);
+    }
+    m.style.height = (maxH - gap + GALLERY_PAD) + 'px';
+    return;
+  }
+
+  // ── 行首大图：行首卡放大占约 55% 行宽，其余卡缩放适配、正好填满整行（含右侧空白） ──
+  if (layout === 'hero') {
+    const minH = base * 0.5, maxH = base * 2.2;
+    let y = GALLERY_PAD;
+    let i = 0;
+    const placeAlone = (it) => { // 末行不拉伸：按原始尺寸左对齐
+      const w = Math.min(it.natW, innerW);
+      place(it, GALLERY_PAD, y, w, w / it.ratio);
+      y += w / it.ratio + gap;
+    };
+    while (i < items.length) {
+      const hero = items[i];
+      if (i + 1 >= items.length) { placeAlone(hero); i++; continue; }
+      // 选同行 trailing 卡数 k：行高 H = (innerW − k·gap) / (hero比例 + Σ比例)，
+      // H 随 k 单调下降——过高继续加卡，过矮停止；取首卡宽度占比最接近 55% 的 k
+      let sumR = 0, bestK = -1, bestScore = Infinity, fallbackK = -1;
+      for (let k = 1; i + k < items.length; k++) {
+        sumR += items[i + k].ratio;
+        const H = (innerW - k * gap) / (hero.ratio + sumR);
+        if (H > maxH) continue;
+        if (H < minH) break;
+        fallbackK = k;
+        const score = Math.abs((H * hero.ratio) / innerW - 0.55);
+        if (score < bestScore) { bestScore = score; bestK = k; }
+      }
+      const k = bestK >= 0 ? bestK : fallbackK;
+      if (k < 0) { placeAlone(hero); i++; continue; } // 极端比例：行首卡单独成行
+      let sumR2 = 0;
+      for (let t = 1; t <= k; t++) sumR2 += items[i + t].ratio;
+      const H = (innerW - k * gap) / (hero.ratio + sumR2);
+      let x = GALLERY_PAD;
+      for (let t = 0; t <= k; t++) {
+        const it = items[i + t];
+        const w = H * it.ratio;
+        place(it, x, y, w, H);
+        x += w + gap;
+      }
+      y += H + gap;
+      i += k + 1;
+    }
+    m.style.height = (y - gap + GALLERY_PAD) + 'px';
+    return;
+  }
+
+  // ── 自然行：不放大，基准尺寸左对齐 ──
+  if (layout === 'natural') {
+    let y = GALLERY_PAD, x = GALLERY_PAD;
+    for (const it of items) {
+      let w = it.natW, h = base;
+      if (w > innerW) { w = innerW; h = innerW / it.ratio; } // 单卡超宽才缩
+      if (x !== GALLERY_PAD && x + w - GALLERY_PAD > innerW) { y += base + gap; x = GALLERY_PAD; }
+      place(it, x, y, w, h);
+      x += w + gap;
+    }
+    m.style.height = (y + base + GALLERY_PAD) + 'px';
+    return;
+  }
+
+  // ── 视口最优化：DP 断行，每张卡片都被照顾 —— 各行缩放贴近原始尺寸，
+  //    末行同样允许 1.4 内拉伸并重罚右侧留白，避免末行孤悬 ──
+  const buildRowsOptimal = () => {
+    const n = items.length;
+    const dp = new Array(n + 1).fill(Infinity);
+    const cut = new Array(n + 1).fill(0);
+    dp[n] = 0;
+    for (let i = n - 1; i >= 0; i--) {
+      let w = 0;
+      for (let j = i; j < n && j - i < 24; j++) { // 单行最多 24 卡，防止 O(n²) 失控
+        w += items[j].natW + (j > i ? gap : 0);
+        const scale = (innerW - (j - i) * gap) / (w - (j - i) * gap);
+        if (scale > 1.4 && j > i) continue; // 行太空：继续并入卡片（scale 随 j 单调降）
+        if (scale < 0.5) break;             // 行太挤：再加更小，停止
+        let cost;
+        if (j === n - 1) {
+          // 末行：同样允许 1.4 内拉伸；超过（右侧留白/孤悬）重罚
+          cost = Math.abs(1 - Math.min(scale, 1.4)) + (scale > 1.4 ? 1 : 0);
+        } else {
+          // 中间行：偏离 1 惩罚，压得太小（<0.55）额外重罚
+          cost = Math.abs(1 - Math.min(Math.max(scale, 0.55), 1.4));
+          if (scale < 0.55) cost += 2;
+        }
+        const total = cost + dp[j + 1];
+        if (total < dp[i]) { dp[i] = total; cut[i] = j + 1; }
+      }
+      if (!isFinite(dp[i])) { dp[i] = 2 + (dp[i + 1] ?? 0); cut[i] = i + 1; } // 单卡超宽兜底
+    }
+    const rows = [];
+    for (let i = 0; i < n;) {
+      const nxt = cut[i] > i ? cut[i] : i + 1;
+      rows.push([i, nxt]); i = nxt;
+    }
+    return rows;
+  };
+
+  const flushRow = (rowItems, isLast, targetH, y) => {
+    const n = rowItems.length;
     const totalGap = (n - 1) * gap;
-    const available = innerW - totalGap;
+    const rowNatW = rowItems.reduce((s, it) => s + it.natW, 0);
     // 按比例缩放使整行正好填满容器宽度；最后一行限制最大放大，避免单卡被拉得过大
-    let scale = available / rowNatW;
+    let scale = (innerW - totalGap) / rowNatW;
     if (isLast) scale = Math.min(scale, 1.4);
     scale = Math.min(scale, 1.4);
     const h = targetH * scale;
     let x = GALLERY_PAD;
-    for (const it of row) {
+    for (const it of rowItems) {
       const w = it.natW * scale;
-      it.card.style.width = w + 'px';
-      it.card.style.height = h + 'px';
-      it.card.style.left = x + 'px';
-      it.card.style.top = y + 'px';
-      // thumb-box 填满卡片（覆盖原 aspect-ratio，由 object-fit:contain 保证媒体不变形）
-      const box = it.card.querySelector('.thumb-box');
-      if (box) { box.style.aspectRatio = 'auto'; box.style.height = '100%'; box.style.width = '100%'; }
+      place(it, x, y, w, h);
       x += w + gap;
     }
-    y += h + gap;
-    row = []; rowNatW = 0;
+    return h;
   };
 
-  for (const it of items) {
-    const projectedW = rowNatW + it.natW + (row.length ? gap : 0);
-    if (row.length && projectedW > innerW) flushRow(false);
-    row.push(it);
-    rowNatW += it.natW;
+  let y = GALLERY_PAD;
+  if (layout === 'optimal' && items.length > 2) {
+    const rows = buildRowsOptimal();
+    rows.forEach(([a, b], k) => {
+      y += flushRow(items.slice(a, b), k === rows.length - 1, base, y) + gap;
+    });
+  } else {
+    // ── 对齐行（默认）：贪心填行 ──
+    let row = [];
+    let rowNatW = 0;
+    const flush = (isLast) => {
+      if (!row.length) return;
+      y += flushRow(row, isLast, base, y) + gap;
+      row = []; rowNatW = 0;
+    };
+    for (const it of items) {
+      const projectedW = rowNatW + it.natW + (row.length ? gap : 0);
+      if (row.length && projectedW > innerW) flush(false);
+      row.push(it);
+      rowNatW += it.natW;
+    }
+    flush(true);
   }
-  flushRow(true);
 
   m.style.height = (y - gap + GALLERY_PAD) + 'px';
 }
@@ -835,9 +1049,9 @@ function scheduleGalleryLayout() {
 
 
 // ═══════════════ 播放进度（续播 / 跨模式同步） ═══════════════
-// 卡片预览、单一播放（<video> 与 mpv）共用同一份 path -> 秒 记录：
-//   · 播放中持续写回（卡片 timeupdate / 播放器 timeupdate / mpv 状态轮询）
-//   · 打开时按记录位置 seek（卡片 loadedmetadata / 播放器 loadedmetadata / mpv 加载就绪后）
+// 卡片预览、单一播放（<video>）共用同一份 path -> 秒 记录：
+//   · 播放中持续写回（卡片 timeupdate / 播放器 timeupdate）
+//   · 打开时按记录位置 seek（卡片 loadedmetadata / 播放器 loadedmetadata）
 // 因此"返回上级 / 刷新 / 切视图 / 切换单一播放"都不会重头播放，
 // 且同一文件在任何模式下的进度条读数都一致。
 let progressDirty = false;
@@ -983,6 +1197,7 @@ function alignVisiblePreviews() {
 function poolPutPreview(path, v, ctrl) {
   const stale = previewPool.get(path);
   if (stale) {
+    stale.v._revealCleanup?.();
     stale.v.removeAttribute('src');
     stale.v.load();
   }
@@ -991,6 +1206,7 @@ function poolPutPreview(path, v, ctrl) {
   while (previewPool.size > PREVIEW_POOL_MAX) {
     const oldest = previewPool.keys().next().value;
     const e = previewPool.get(oldest);
+    e.v._revealCleanup?.();
     e.v.removeAttribute('src');
     e.v.load(); // 显式丢弃媒体资源，防止内存无限增长
     previewPool.delete(oldest);
@@ -1000,6 +1216,7 @@ function poolPutPreview(path, v, ctrl) {
 /** 清空预览池（目录/筛选变化后旧文件不再复用） */
 function clearPreviewPool() {
   for (const { v } of previewPool.values()) {
+    v._revealCleanup?.();
     v.removeAttribute('src');
     v.load();
   }
@@ -1014,6 +1231,12 @@ function detachPreview(v) {
   v.pause();
   v.remove();
   ctrl?.remove();
+  // web-demuxer 路径的视频不入池（player 绑定特定文件），直接销毁
+  if (v._webPlayer) { v._revealCleanup?.(); v._webPlayer.destroy(); v._webPlayer = null; return; }
+  // remux 尚未产出有效数据（快速滚走）→ 取消 Rust 端正在跑的 ffmpeg，释放 CPU/IO
+  if (path && REMUX_EXTS.has((path.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase()) && v.readyState < 2) {
+    invoke('cancel_preview', { path }).catch(() => {});
+  }
   if (path) poolPutPreview(path, v, ctrl);
 }
 
@@ -1114,32 +1337,108 @@ function makeCardCtrl(v) {
   return ctrl;
 }
 
+/**
+ * 视频首帧真正上屏后才加 v-ready 淡入（CSS 默认 opacity:0，露出下方缩略图）。
+ * 新建视频等 loadeddata/playing；池化重挂的视频 readyState 已≥2，等合成器实际呈现
+ * 一帧（rvfc / 两帧 rAF）；500ms 兜底，任何异常都不会永久只显示缩略图。
+ */
+function armPreviewReveal(v) {
+  v.classList.remove('v-ready');
+  v._revealCleanup?.();
+  let done = false;
+  const evs = ['loadeddata', 'canplay', 'playing', 'timeupdate'];
+  const reveal = () => {
+    if (done) return;
+    done = true;
+    v.classList.add('v-ready');
+    cleanup();
+  };
+  const onData = () => { if (v.readyState >= 2 && v.videoWidth > 0) reveal(); };
+  evs.forEach((e) => v.addEventListener(e, onData));
+  if (v.readyState >= 2 && v.videoWidth > 0 && typeof v.requestVideoFrameCallback === 'function') {
+    try { v.requestVideoFrameCallback(reveal); } catch { /* 忽略 */ }
+  }
+  const raf2 = requestAnimationFrame(() => requestAnimationFrame(onData));
+  const failsafe = setTimeout(reveal, 500);
+  function cleanup() {
+    evs.forEach((e) => v.removeEventListener(e, onData));
+    cancelAnimationFrame(raf2);
+    clearTimeout(failsafe);
+    v._revealCleanup = null;
+  }
+  v._revealCleanup = cleanup;
+}
+
 async function attachCardPreview(box, path) {
-  const playPath = await playableVideoSrc(path);
-  if (!box.isConnected) return; // 等待重封装期间卡片已被虚拟滚动重建
+  if (!box.isConnected) return;
   // 等待期间限制可能已收紧：超出上限则放弃本次挂载
   if (content.querySelectorAll('video.auto-preview').length >= autoPreviewLimit()) return;
+
+  const ext = (path.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase() || '';
+  const needsExt = REMUX_EXTS.has(ext);
+
   const v = document.createElement('video');
   v.className = 'auto-preview';
-  v.dataset.src = path; // 池化复用 key（remux 后的 src 可能与源路径不同）
-  // L238：卡片默认静音、默认音量 20%（均可在设置中配置）
+  v.dataset.src = path;
   v.volume = Math.min(1, Math.max(0, (state.cfg?.cardVolume ?? 20) / 100));
   v.muted = state.cfg?.cardMuted !== false;
   v.loop = true;
   v.playsInline = true;
   v.preload = 'metadata';
-  v.src = convertFileSrc(playPath);
-  // 起播位置：优先上次记录进度（与单一播放共享同一进度），否则跳过黑屏片头取约 10%
+
+  if (needsExt) {
+    // mkv/ts 等：用 ffmpeg 截取 30~120s 短片段 remux 为 mp4（有缓存，几百毫秒）
+    // 不再使用 web-demuxer（WASM 实例开销大，多卡片并发会拖垮主线程）
+    try {
+      const savedPos = progressGet(path);
+      const startSec = savedPos > 0 ? savedPos : 0;
+      const playPath = await invoke('get_preview_path', {
+        path,
+        start: startSec > 0 ? startSec : null,
+        seconds: null
+      });
+      if (!box.isConnected) return;
+      v.dataset.startSec = String(startSec);
+      v.src = convertFileSrc(playPath);
+    } catch {
+      if (!box.isConnected) return;
+      v.dataset.startSec = '0';
+      v.src = convertFileSrc(path); // 回退原文件（浏览器可能恰好支持）
+    }
+  } else {
+    v.dataset.startSec = '0';
+    v.src = convertFileSrc(path);
+  }
+
+  if (!box.isConnected) return;
+  if (content.querySelectorAll('video.auto-preview').length >= autoPreviewLimit()) {
+    return;
+  }
+
+  // 起播位置：预览片段从 startSec 开始，video.currentTime 是片段内偏移
+  let startSec = 0;
   v.addEventListener('loadedmetadata', () => {
     try {
+      if (!(v.dataset.startSec)) v.dataset.startSec = '0';
+      startSec = Number(v.dataset.startSec) || 0;
       if (!(v.duration > 0)) return;
       const saved = progressGet(path);
-      v.currentTime = saved > 0 && saved < v.duration - 0.5 ? saved : Math.min(3, v.duration * 0.1);
+      // saved 是原始文件时间，片段内偏移 = saved - startSec
+      const localPos = saved > startSec ? saved - startSec : 0;
+      v.currentTime = localPos < v.duration - 0.5 ? localPos : 0;
     } catch { /* 忽略 */ }
   }, { once: true });
-  // 进度记录：卡片预览播放中持续写回，单一播放/刷新后据此续播
-  v.addEventListener('timeupdate', () => { progressSet(path, v.currentTime); });
+  // 进度记录节流：1s 最多一次，避免多卡片 timeupdate 高频调用
+  let lastProgressTick = 0;
+  v.addEventListener('timeupdate', () => {
+    const now = performance.now();
+    if (now - lastProgressTick < 1000) return;
+    lastProgressTick = now;
+    startSec = Number(v.dataset.startSec) || 0;
+    progressSet(path, startSec + v.currentTime);
+  });
   if (!previewsSuspended()) v.play().catch(() => { /* 静音播放失败则保留缩略图 */ });
+  armPreviewReveal(v); // 首帧上屏前透明，下方缩略图兜底，杜绝黑块闪烁
   box.appendChild(v);
   box.appendChild(makeCardCtrl(v));
 }
@@ -1150,6 +1449,8 @@ function scheduleAutoPreviews() {
   clearTimeout(autoPreviewTimer);
   autoPreviewTimer = setTimeout(() => {
     setupAutoPreviews();
+    // 滚动停止后按最新视口补预视口外卡片尺寸（画廊；函数内部自行判断视图模式）
+    prefetchGallerySizes();
   }, 250);
 }
 
@@ -1195,8 +1496,10 @@ function setupAutoPreviews() {
     if (budget-- <= 0) break;
     const pooled = previewPool.get(c.path);
     if (pooled) {
-      // 池命中：直接复用（src 已加载，无需重新调取），起播统一由 resumeVisiblePreviews
+      // 池命中：直接复用（src 已加载，无需重新调取），重挂后同样等首帧重绘再淡入，
+      // 起播统一由 resumeVisiblePreviews
       previewPool.delete(c.path);
+      armPreviewReveal(pooled.v);
       c.box.appendChild(pooled.v);
       if (pooled.ctrl) c.box.appendChild(pooled.ctrl);
       continue;
@@ -1263,9 +1566,19 @@ function upgradeFullImg(box, attempt = 0) {
   img.dataset.fullDone = '1';
   const orig = convertFileSrc(box.dataset.fullimg);
   if (img.src === orig) return;
-  // 防闪烁：先后台加载完成再替换（旧缩略图一直保持显示）
+  const path = box.dataset.fullimg;
+  // 内存池命中（视口外已提前解码）：同步换出，0 空白
+  const cached = galleryFullPool.get(path);
+  if (cached && cached.complete && cached.naturalWidth > 0) { img.src = orig; return; }
+  // 防闪烁：先后台加载 + decode 完成再替换（旧缩略图一直保持显示）
   const pre = new Image();
-  pre.onload = () => { if (img.isConnected) img.src = orig; };
+  pre.decoding = 'async';
+  pre.onload = () => {
+    const apply = () => { if (img.isConnected) img.src = orig; };
+    if (pre.decode) pre.decode().then(apply, apply); else apply();
+    // 顺手入池：本次加载结果在目录内保留，滚走再滚回零等待
+    if (!galleryFullPool.has(path)) galleryFullPool.set(path, pre);
+  };
   pre.src = orig;
 }
 
@@ -1294,32 +1607,41 @@ function loadThumbForNode(node) {
         return;
       }
       // 缩略图尺寸就绪 → 校正画廊占位比例（L236：行布局需按真实比例重排）
+      // 注意：只做「就地改样式 + layoutGalleryNow」，绝不能 bump galleryVer ——
+      // 那会改变渲染签名，导致滚动期间整个 innerHTML 重建（画面闪烁/位置跳动）。
       const box = n.closest('.thumb-box');
       if (box && t.w > 0 && t.h > 0) {
         const prev = box.style.aspectRatio;
         box.style.aspectRatio = `${t.w} / ${t.h}`;
         if (state.cfg?.viewMode === 'gallery' && box.closest('.gallery-rows') && prev !== box.style.aspectRatio) {
-          state.galleryVer++;
           scheduleGalleryLayout();
         }
       }
       if (n.tagName === 'IMG') {
-        n.src = t.url;
+        // 大尺寸缩略图：先在离屏 Image 中解码完成再换 src，避免直接换 src 的解码空白闪烁
+        if (n.src !== t.url) {
+          const pre = new Image();
+          pre.onload = () => { if (n.isConnected) n.src = t.url; };
+          pre.src = t.url;
+        }
         // 大尺寸已就位 → 去掉懒加载标记，避免重渲染时重复请求
         n.removeAttribute('data-thumb');
         n.removeAttribute('data-kind');
         n.removeAttribute('data-size');
         return;
       }
+      // 骨架节点 → img：等离屏解码完成再替换，骨架一直保持显示，不闪空白
       const img = new Image();
-      img.src = t.url;
       img.draggable = false;
+      img.decoding = 'async';
       // 保留尺寸类，去掉占位类
       img.className = n.className.split(/\s+/)
         .filter((c) => c && !['skeleton', 'audio-thumb', 'folder-thumb'].includes(c))
         .join(' ') || 'thumb';
       if (n.dataset.idx !== undefined) img.dataset.idx = n.dataset.idx;
-      n.replaceWith(img);
+      img.onload = () => { if (n.isConnected) n.replaceWith(img); };
+      img.onerror = () => { /* 保留骨架占位 */ };
+      img.src = t.url;
     });
     const it = state.items.find((m) => m.path === path);
     if (it && t.duration) it.duration = t.duration;
@@ -1367,6 +1689,74 @@ async function loadThumb(path, kind, req = 512) {
   return p;
 }
 
+// ─── 画廊视口外卡片预载：提前取最近 10 张屏外卡片的原图并解码（图片），
+// 缩略图（含真实宽高）也顺带提前取回，卡片先按真实比例定型；
+// 原图解码结果留在内存池里——不离开目录就不丢，滚回时零等待、零替换闪烁 ───
+const GALLERY_AHEAD = 10;      // 视口外预取卡片数量
+const GALLERY_BAND = 500;      // 距视口该像素带内交给正常懒加载管线，带外才走数量预取
+const GALLERY_FULL_MAX = 400;  // 原图内存池上限（仅切目录/筛选时清空，防极端目录内存膨胀）
+const galleryFullPool = new Map(); // path -> HTMLImageElement（原图，已解码）
+
+/** 目录/筛选变化：释放画廊原图内存池（缩略图缓存 state.thumbCache 另有生命周期） */
+function clearGalleryFullPool() {
+  galleryFullPool.clear();
+}
+
+/** 预载一张原图（去重；完成后留在内存池），可选解码后回调 */
+function preloadGalleryFull(path) {
+  if (galleryFullPool.has(path)) return Promise.resolve(galleryFullPool.get(path));
+  const im = new Image();
+  im.decoding = 'async';
+  const done = new Promise((resolve) => {
+    im.onload = () => {
+      // 提前解码：赋给卡片 <img> 时直接走解码缓存，不再有"换 src 的空白帧"
+      (im.decode ? im.decode() : Promise.resolve()).then(
+        () => resolve(im),
+        () => resolve(im)
+      );
+    };
+    im.onerror = () => resolve(null);
+  });
+  im.src = convertFileSrc(path);
+  galleryFullPool.set(path, im);
+  if (galleryFullPool.size > GALLERY_FULL_MAX) {
+    const first = galleryFullPool.keys().next().value;
+    galleryFullPool.delete(first);
+  }
+  return done;
+}
+
+function prefetchGallerySizes() {
+  if ((state.cfg?.viewMode ?? 'grid') !== 'gallery') return;
+  const view = scroller.getBoundingClientRect();
+  const cands = [];
+  for (const card of content.querySelectorAll('.gallery-card[data-idx]')) {
+    const item = state.filtered[Number(card.dataset.idx)];
+    if (!item || (item.kind !== 'image' && item.kind !== 'video')) continue;
+    const r = card.getBoundingClientRect();
+    // 视口附近（含正常懒加载带）的卡片由 IntersectionObserver 负责，不在这里重复排
+    if (r.bottom >= view.top - GALLERY_BAND && r.top <= view.bottom + GALLERY_BAND) continue;
+    const gap = r.bottom < view.top ? view.top - r.bottom : r.top - view.bottom;
+    // 需要：原图（图片，未预载）或缩略图尺寸（任意，未知）
+    const needFull = item.kind === 'image' && !galleryFullPool.has(item.path);
+    const needThumb = !thumbAny(item.path);
+    if (!needFull && !needThumb) continue;
+    const node = card.querySelector('[data-thumb]');
+    cands.push({ card, node, item, gap, needFull, needThumb });
+  }
+  // 距视口最近的 10 张优先
+  cands.sort((a, b) => a.gap - b.gap);
+  for (const c of cands.slice(0, GALLERY_AHEAD)) {
+    // 图片：原图入内存池并预解码（滚入时 upgradeFullImg 命中即同步换出）
+    if (c.needFull) preloadGalleryFull(c.item.path).then((im) => {
+      // 解码完成后若卡片已在视口，立即就地替换，不必等 IO 回调
+      if (im && c.card.isConnected) upgradeFullImg(c.card.querySelector('.thumb-box'));
+    });
+    // 真实宽高未知：顺带取缩略图，到达后就地定型（loadThumbForNode 内含去重与并发队列）
+    if (c.needThumb && c.node) loadThumbForNode(c.node);
+  }
+}
+
 
 // ═══════════════ 元信息面板 ═══════════════
 async function showInfo(idx) {
@@ -1383,6 +1773,7 @@ async function showInfo(idx) {
   rows.push(['修改时间', new Date(item.modified * 1000).toLocaleString()]);
   if (item.duration) rows.push(['时长', fmtDur(item.duration)]);
   if (item.width) rows.push(['尺寸', `${item.width} × ${item.height}`]);
+  if (item.kind === 'video') rows.push(['播放引擎', engineLabel(item.path, idx)]);
   if (item.title) rows.push(['标题', item.title]);
   if (item.artist) rows.push(['艺术家', item.artist]);
   if (item.album) rows.push(['专辑', item.album]);
@@ -1396,12 +1787,13 @@ async function showInfo(idx) {
        </div>`;
   body.innerHTML = cover +
     rows.map(([k, v]) => `
-      <div class="flex gap-2 text-sm">
+      <div class="flex gap-2 text-sm"${k === '播放引擎' ? ' data-engine="1"' : ''}>
         <span class="opacity-50 w-16 shrink-0">${k}</span>
         <span class="break-all">${escapeHtml(String(v))}</span>
       </div>`).join('');
 
   if (item.kind === 'folder') return; // 无媒体元信息
+
   try {
 
     let info = state.infoCache.get(item.path);
@@ -1410,6 +1802,11 @@ async function showInfo(idx) {
       state.infoCache.set(item.path, info);
     }
     if (info.duration) { addInfoRow('时长', fmtDur(info.duration)); item.duration = info.duration; }
+    // 编码信息到达后重算引擎标签（容器可直连但编码浏览器不解时需改判为转码）
+    if (item.kind === 'video') {
+      const er = body.querySelector('[data-engine="1"] .break-all');
+      if (er) er.textContent = engineLabel(item.path, idx);
+    }
     if (info.width && item.kind === 'image') addInfoRow('尺寸', `${info.width} × ${info.height}`);
     if (info.title) addInfoRow('标题', info.title);
     if (info.artist) addInfoRow('艺术家', info.artist);
@@ -1451,6 +1848,7 @@ function addInfoRow(k, v) {
 // ═══════════════ 专业播放器控制 ═══════════════
 const vVideo = $('viewerVideo');
 const vAudio = $('audioPlayer');
+const viewerAudio = $('viewerAudio'); // web-demuxer 不支持音轨时的辅助播放器
 // L124：更圆润精致的播放/暂停图标（与旁侧线性图标大小和谐）
 const ICO_PLAY = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 7.5v9a1 1 0 0 0 1.52.86l7.5-4.5a1 1 0 0 0 0-1.72l-7.5-4.5A1 1 0 0 0 9 7.5z"/></svg>';
 const ICO_PAUSE = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 6.5A1.5 1.5 0 0 0 6.5 8v8A1.5 1.5 0 0 0 8 17.5h.5A1.5 1.5 0 0 0 10 16V8a1.5 1.5 0 0 0-1.5-1.5zM15.5 6.5A1.5 1.5 0 0 0 14 8v8a1.5 1.5 0 0 0 1.5 1.5h.5a1.5 1.5 0 0 0 1.5-1.5V8a1.5 1.5 0 0 0-1.5-1.5z"/></svg>';
@@ -1464,6 +1862,60 @@ const viewerItemPath = () => state.filtered[state.viewerIndex]?.path ?? '';
 
 
 /** 视频：进度/时间同步到控制栏 */
+// ─── 转码流时间轴 ───
+// fMP4 直播流没有总时长（duration=Infinity），拖进度/续播都无法用 currentTime 实现。
+// 前端维护 { offset, duration }：画面内相对时间 + 起播偏移 = 绝对时间；
+// 跳转 = 掐掉当前 ffmpeg，带 -ss 重启转码并换新流地址，音画随单一流自然同步。
+let tcTimeline = null;   // 非空 = 当前播转码流
+let tcSeekTimer = 0;
+let tcSeq = 0;           // 跳转序号：过期响应直接丢弃，防止旧流覆盖新流
+let activeEngine = null; // 转码返回的实际引擎标签（showInfo 重渲染时避免被预测标签覆盖）
+
+const tcCur = () => vVideo.currentTime + (tcTimeline ? tcTimeline.offset : 0);
+const tcDur = () => (tcTimeline ? (tcTimeline.duration || 0) : (vVideo.duration || 0));
+
+/** 转码流跳转（250ms 防抖，合并拖拽过程中的连续触发） */
+function seekTranscode(sec) {
+  clearTimeout(tcSeekTimer);
+  tcSeekTimer = setTimeout(() => doSeekTranscode(sec), 250);
+}
+
+async function doSeekTranscode(sec) {
+  const idx = state.viewerIndex;
+  const item = state.filtered[idx];
+  if (!item) return;
+  const seq = ++tcSeq;
+  const wasPlaying = !vVideo.paused;
+  vVideo.pause();
+  setStatus('跳转中…', false);
+  try {
+    const [info, port] = await Promise.all([
+      invoke('transcode_stream', { path: item.path, seekSecs: sec }),
+      invoke('get_file_server_port')
+    ]);
+    if (seq !== tcSeq || state.viewerIndex !== idx) return; // 已有更新的跳转或已切走
+    activeEngine = info.engine;
+    tcTimeline = { offset: sec, duration: item.duration || 0 };
+    vVideo.src = `http://127.0.0.1:${port}/stream/${info.id}`;
+    vVideo.playbackRate = Number($('videoSpeed')?.value) || 1;
+    applyPlayLoop();
+    if (wasPlaying || state.cfg?.videoAutoplay !== false) vVideo.play().catch(() => {});
+    setStatus('', false);
+    const engRow = $('infoBody').querySelector('[data-engine="1"] .break-all');
+    if (engRow) engRow.textContent = info.engine;
+  } catch (e) {
+    console.error('[transcode seek] 失败:', e);
+    setStatus(`跳转失败: ${e}`, true);
+  }
+}
+
+function clearTranscodeState() {
+  clearTimeout(tcSeekTimer);
+  tcSeq++;
+  tcTimeline = null;
+  activeEngine = null;
+}
+
 function bindVideoBar() {
   const fill = $('videoSeekFill'), knob = $('videoSeekKnob');
   const setP = (p) => {
@@ -1472,19 +1924,23 @@ function bindVideoBar() {
     knob.style.left = p * 100 + '%';
   };
   vVideo.addEventListener('timeupdate', () => {
-    setP(vVideo.duration ? vVideo.currentTime / vVideo.duration : 0);
-    $('videoCur').textContent = fmtDur(vVideo.currentTime) || '0:00';
-    viewerMediaDur = vVideo.duration || 0; // L131
-    progressSet(viewerItemPath(), vVideo.currentTime); // 与卡片预览共享进度
+    const dur = tcDur(), cur = tcCur();
+    setP(dur ? cur / dur : 0);
+    $('videoCur').textContent = fmtDur(cur) || '0:00';
+    viewerMediaDur = dur; // L131
+    progressSet(viewerItemPath(), cur); // 与卡片预览共享进度
   });
   vVideo.addEventListener('durationchange', () => {
-    $('videoDur').textContent = fmtDur(vVideo.duration) || '0:00';
-    viewerMediaDur = vVideo.duration || 0; // L131
+    const dur = tcDur();
+    $('videoDur').textContent = fmtDur(dur) || '0:00';
+    viewerMediaDur = dur; // L131
   });
-  // 进度条点击 / 拖拽 seek
+  // 进度条点击 / 拖拽 seek（转码流重启转码，直连流直接设 currentTime）
   initSeekDrag($('videoSeek'), (p) => {
-    if (mpvCtl('seekPercent', p * 100)) return;       // mpv 引擎
-    if (vVideo.duration) vVideo.currentTime = p * vVideo.duration;
+    const dur = tcDur();
+    if (!dur) return;
+    if (tcTimeline) seekTranscode(p * dur);
+    else vVideo.currentTime = p * dur;
   });
 }
 
@@ -1507,7 +1963,6 @@ function initSeekDrag(seekEl, onChange) {
 }
 
 function toggleVideoPlay() {
-  if (mpvCtl('toggle')) { showVideoBar(); return; }
   if (vVideo.paused) vVideo.play().catch(() => {}); else vVideo.pause();
   showVideoBar(); // 用户主动暂停/播放时亮出控制条
 }
@@ -1560,21 +2015,17 @@ $('videoPlay').addEventListener('click', toggleVideoPlay);
 vVideo.addEventListener('play', () => syncPlayIcon($('videoPlay'), false));
 vVideo.addEventListener('pause', () => syncPlayIcon($('videoPlay'), true));
 vVideo.addEventListener('ended', handlePlaybackEnded); // L130：按播放模式决定下一项
-let mpvMuted = false; // mpv 引擎独立静音态（mpv 播放时不操作 vVideo）
+// web-demuxer 路径下，用户拖动进度条时需要重新从目标位置 demux
+vVideo.addEventListener('seeking', () => {
+  if (webPlayer) webPlayer.seek(vVideo.currentTime).catch(() => {});
+});
 $('videoMute').addEventListener('click', () => {
-  if (mpvPlaying) {
-    mpvMuted = !mpvMuted;
-    mpvCtl('mute', mpvMuted ? 1 : 0);
-  } else {
-    vVideo.muted = !vVideo.muted;
-  }
-  const muted = mpvPlaying ? mpvMuted : vVideo.muted;
-  $('videoMute').classList.toggle('active', muted);
-  if (state.cfg) { state.cfg.videoMuted = muted; saveCfg(); } // 音量状态持久化
+  vVideo.muted = !vVideo.muted;
+  $('videoMute').classList.toggle('active', vVideo.muted);
+  if (state.cfg) { state.cfg.videoMuted = vVideo.muted; saveCfg(); } // 音量状态持久化
 });
 $('videoVol').addEventListener('input', (e) => {
   const vol = Number(e.target.value);
-  if (mpvCtl('volume', vol)) { mpvMuted = vol === 0; }
   vVideo.volume = vol / 100;
   vVideo.muted = vol === 0;
   $('videoMute').classList.toggle('active', vVideo.muted);
@@ -1588,19 +2039,15 @@ if (videoSpeedStored) {
   vVideo.playbackRate = Number(videoSpeedStored);
 }
 $('videoSpeed').addEventListener('change', (e) => {
-  mpvCtl('speed', Number(e.target.value));
   vVideo.playbackRate = Number(e.target.value);
   localStorage.setItem('videoSpeed', e.target.value);
 });
 
-// L235：视频画面缩放 0.5/1/1.5/2/4（HTML5 video 与 mpv canvas 统一用 CSS transform，
-// 以画面中心为原点；不影响原始帧截图）
+// L235：视频画面缩放 0.5/1/1.5/2/4（CSS transform，以画面中心为原点；不影响原始帧截图）
 function applyVideoZoom() {
   const z = Number($('videoZoom')?.value) || 1;
   const tf = z === 1 ? '' : `scale(${z})`;
   vVideo.style.transform = tf;
-  const vc = $('videoCanvas');
-  if (vc) vc.style.transform = tf;
 }
 const videoZoomStored = localStorage.getItem('videoZoom');
 if (videoZoomStored) $('videoZoom').value = videoZoomStored;
@@ -1618,7 +2065,11 @@ localStorage.removeItem('videoLoop');
 // 最大化态直接切全屏会损坏 tao 保存的 placement 导致退出全屏失效，
 // 由 Rust 端在主线程原子处理（IsZoomed 真实状态 + SW_RESTORE + 按需恢复最大化）
 async function toggleAppFullscreen() {
-  try { await invoke('toggle_fullscreen', { onlyExit: false }); } catch { /* 忽略 */ }
+  try {
+    await invoke('toggle_fullscreen', { onlyExit: false });
+    appFsActive = await win.isFullscreen(); // 切换后的真实状态
+  } catch { /* 忽略 */ }
+  syncFsDragBlock();
 }
 $('videoFull').addEventListener('click', viewerFullscreenAction); // L136：播放控件全屏=播放全屏
 $('btnFull').addEventListener('click', toggleAppFullscreen); // LOGO 旁：全局全屏
@@ -1634,6 +2085,64 @@ let viewerFsPrev = 'normal';
 let viewerFsActive = false;
 let viewerSavedGeo = null; // { x, y, w, h }（物理像素）
 let viewerSavedScroll = null; // { top, left } 进入预览前的画廊滚动位置
+
+// ─── 所有全屏模式禁止拖动窗口 ───
+// 全局全屏 / 播放全屏 / 沉浸（含表演复用）期间：摘除标题栏等拖动区属性，
+// 防止整屏窗口被拖离屏幕原位（露出桌面 / 破坏全屏几何）。退出时恢复。
+let appFsActive = false; // 全局全屏（LOGO 旁按钮）单独跟踪
+function syncFsDragBlock() {
+  const blocked = viewerFsActive || appFsActive || document.body.classList.contains('immersive');
+  document.querySelectorAll('[data-tauri-drag-region]').forEach((el) => {
+    if (blocked) {
+      if (el.hasAttribute('data-tauri-drag-region')) {
+        el.removeAttribute('data-tauri-drag-region');
+        el.dataset.fsDrag = '1'; // 标记为本功能摘除，退出时只恢复这些
+      }
+    } else if (el.dataset.fsDrag === '1') {
+      el.setAttribute('data-tauri-drag-region', '');
+      delete el.dataset.fsDrag;
+    }
+  });
+}
+
+// 退出预览器时窗口几何还原（无边框全屏 → maximized）：
+// SetWindowPlacement 恢复期间抑制画廊重排，等尺寸稳定（130ms 无新 resize）后
+// 只按最终尺寸布局一次并恢复滚动，黑场最后淡出，避免卡片跳动。
+// （进入方向已是 Win32 单次直切到最终尺寸，无需 settle，见 captureViewerBase）
+let viewerGeoPending = false;
+let viewerGeoQuietTimer = 0;
+let viewerGeoHardTimer = 0;
+function cancelViewerGeoSettle() {
+  viewerGeoPending = false;
+  clearTimeout(viewerGeoQuietTimer);
+  clearTimeout(viewerGeoHardTimer);
+}
+function finishViewerGeoSettle() {
+  if (!viewerGeoPending) return;
+  viewerGeoPending = false;
+  clearTimeout(viewerGeoQuietTimer);
+  clearTimeout(viewerGeoHardTimer);
+  renderVirtual(); // 最终尺寸落定，只重排这一次
+  // 重排后再恢复滚动，此时容器与进入预览前一致，位置精确还原
+  if (viewerSavedScroll) {
+    scroller.scrollTop = viewerSavedScroll.top;
+    scroller.scrollLeft = viewerSavedScroll.left;
+    viewerSavedScroll = null;
+  }
+  // 窗口几何已稳定：黑场 120ms 淡出后再隐藏，画廊已是最终尺寸、无跳动
+  $('viewer').classList.remove('viewer-cover');
+  setTimeout(() => {
+    $('viewer').classList.add('hidden');
+    $('viewer').classList.remove('viewer-in');
+  }, 130);
+}
+function beginViewerGeoSettle() {
+  cancelViewerGeoSettle();
+  viewerGeoPending = true;
+  // 每来一次 resize 都重新计时（见 window resize 监听）；900ms 硬兜底防止无 resize 事件时卡死
+  viewerGeoQuietTimer = setTimeout(finishViewerGeoSettle, 130);
+  viewerGeoHardTimer = setTimeout(finishViewerGeoSettle, 900);
+}
 
 const ICON_FS_EXPAND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>';
 const ICON_FS_COLLAPSE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3v3a2 2 0 0 1-2 2H3M16 3v3a2 2 0 0 0 2 2h3M8 21v-3a2 2 0 0 0-2-2H3M16 21v-3a2 2 0 0 1 2-2h3"/></svg>';
@@ -1667,17 +2176,27 @@ async function captureViewerBase() {
     } else if (mx) {
       viewerFsPrev = 'maximized';
       viewerFsActive = true;
-      // 最大化 → 真全屏（Win32 原生：铺满显示器含任务栏区，不靠 tao set_fullscreen）
+      // 最大化 → 无边框真全屏（Rust 端自实现：保存 maximized placement，
+      // SetWindowPos 单次直切到显示器整屏矩形，不经过 normal，退出时原子还原 maximized）
+      // 切换只产生一次"变大"的最终尺寸 resize：用黑场瞬现盖住画廊，等两帧上屏后再切，
+      // 切完立即按最终尺寸重排一次，内容就绪即淡入
+      $('viewer').classList.remove('hidden');
+      $('viewer').classList.add('viewer-cover');
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       await invoke('toggle_fullscreen', { onlyExit: false });
+      renderVirtual();
     } else {
       viewerFsPrev = 'normal';
       viewerFsActive = false;
     }
   } catch {
+    cancelViewerGeoSettle();
+    $('viewer').classList.remove('viewer-cover'); // 全屏切换失败：撤掉黑场
     viewerFsPrev = 'normal';
     viewerFsActive = false;
   }
   syncVideoFullBtn();
+  syncFsDragBlock();
 }
 
 /** 退出全屏并还原记录几何（仅一般模式用） */
@@ -1705,12 +2224,14 @@ async function enterViewerFs() {
   }
   viewerFsActive = true;
   syncVideoFullBtn();
+  syncFsDragBlock();
   setStatus('全屏播放（双击 / Enter 退出）');
 }
 async function exitViewerFs() {
   viewerFsActive = false;
   if (viewerFsPrev === 'normal' && viewerSavedGeo) await restoreViewerGeo();
   syncVideoFullBtn();
+  syncFsDragBlock();
   setStatus('已返回预览器播放模式');
 }
 // L98/L106：双击 / Enter 切换预览器全屏播放（一般模式进入/退出播放全屏）
@@ -1754,7 +2275,7 @@ function syncPlayModeBtn() {
 /** L247：按当前播放模式设置播放器循环状态（单曲循环=开，其余=关） */
 function applyPlayLoop() {
   const loop = playMode === 'one';
-  if (mpvPlaying) mpvCtl('loop', loop ? 1 : 0);
+  if (webPlayer) webPlayer.loop = loop;
   vVideo.loop = loop;
 }
 $('videoPlayMode').addEventListener('click', () => {
@@ -1769,7 +2290,7 @@ syncPlayModeBtn();
 /** L130：播放结束时按模式选下一项；无下一项返回 -1 */
 function pickAfterEnded() {
   if (playMode === 'once') return -1;
-  // L247：单曲循环模式下播放器自身 loop 已开启（HTML5/mpv 都不会触发 ended），
+  // L247：单曲循环模式下播放器自身 loop 已开启（HTML5 不会触发 ended），
   // 这里兜底：万一 ended 被触发，重播当前项
   if (playMode === 'one') return state.viewerIndex;
   if (playMode === 'random') {
@@ -1790,7 +2311,7 @@ function pickAfterEnded() {
   }
   return n;
 }
-/** vVideo ended / mpv EOF 统一入口 */
+/** vVideo ended 统一入口 */
 function handlePlaybackEnded() {
   const n = pickAfterEnded();
   if (n >= 0) openViewer(n, true);
@@ -1798,7 +2319,7 @@ function handlePlaybackEnded() {
 }
 
 // ═══════════════ L131/L145：悬浮进度条显示当前进度帧缩略图 ═══════════════
-let viewerMediaDur = 0; // 当前预览媒体总时长（vVideo 与 mpv 统一记录）
+let viewerMediaDur = 0; // 当前预览媒体总时长
 const seekPreviewEl = $('seekPreview');
 const seekPreviewImgEl = $('seekPreviewImg');
 const seekPreviewTEl = $('seekPreviewT');
@@ -1849,7 +2370,7 @@ async function clientExtractFrame(path, sec) {
   return extractCanvas.toDataURL('image/jpeg', 0.82); // 跨域失败会在此抛 SecurityError
 }
 
-/** IPC 抽帧（mpv 格式主路径 / 客户端抽帧失败的后备）；带 60ms 防抖 */
+/** IPC 抽帧（客户端抽帧失败的后备）；带 60ms 防抖 */
 let ipcDebounce = 0;
 function ipcExtractFrame(path, sec, key, myToken) {
   const d = ++ipcDebounce;
@@ -1863,7 +2384,7 @@ function ipcExtractFrame(path, sec, key, myToken) {
   }, 60);
 }
 
-/** 显示指定时间的帧（按整秒一档；vVideo 文件走客户端即时抽帧，mpv 走 IPC） */
+/** 显示指定时间的帧（按整秒一档；HTML5 可播文件走客户端即时抽帧，其余走 IPC） */
 function showSeekFrame(path, t, leftPx, barW) {
   const sec = Math.max(0, Math.round(t));
   seekPreviewTEl.textContent = fmtDur(t) || '0:00';
@@ -1874,7 +2395,9 @@ function showSeekFrame(path, t, leftPx, barW) {
   const hit = frameCache.get(key);
   if (hit) { if (seekPreviewImgEl.src !== hit) seekPreviewImgEl.src = hit; return; }
   const myToken = ++frameJobToken;
-  if (!mpvPlaying) {
+  // web-demuxer 路径（浏览器不支持的容器）走 IPC 抽帧
+  const needIpc = isWebPlayerActive();
+  if (!needIpc) {
     // HTML5 可播文件：客户端即时抽帧（L145）；失败再退回 IPC
     clientExtractFrame(path, sec).then((url) => {
       frameCache.set(key, url);
@@ -1885,9 +2408,9 @@ function showSeekFrame(path, t, leftPx, barW) {
   }
 }
 $('videoSeek').addEventListener('pointerenter', () => {
-  // L145：提前加载抽帧 video，首次悬浮即出图
+  // L145：提前加载抽帧 video，首次悬浮即出图（web-demuxer 路径不预加载）
   const path = viewerItemPath();
-  if (path && !mpvPlaying) ensureExtractSrc(path).catch(() => {});
+  if (path && !isWebPlayerActive()) ensureExtractSrc(path).catch(() => {});
 });
 $('videoSeek').addEventListener('pointermove', (e) => {
   const path = viewerItemPath();
@@ -2075,7 +2598,6 @@ function restorePlayerState() {
   $('videoVol').value = String(vv);
   vVideo.volume = vv / 100;
   vVideo.muted = !!c.videoMuted || vv === 0;
-  mpvMuted = vVideo.muted;
   $('videoMute').classList.toggle('active', vVideo.muted);
   // 独立音频模块
   const av = Math.max(0, Math.min(100, Number(c.audioVolume ?? 100)));
@@ -2169,275 +2691,328 @@ $('audioVol').addEventListener('input', (e) => {
 $('audioSpeed').addEventListener('change', (e) => { vAudio.playbackRate = Number(e.target.value); });
 
 
-// ═══════════════ 视频播放引擎（ffmpeg 解码 → canvas 画面 + mpv 音频） ═══════════════
-// 画面：video_start 启动 ffmpeg 解码为 JPEG 帧流，经 rvframe:// 协议 fetch 到 canvas
-// 音频：mpv_load 起 libmpv 纯音频（vo=null），mpv_control 控制播放/音量/倍速
-// 同步：音频时钟为主，拉帧时把音频 position 作为 pts 传给后端取对应帧
-let mpvEnabled = false;
-const MPV_EXTS = new Set(['ts', 'mts', 'm2ts', 'mkv', 'avi', 'flv', 'wmv', 'rm', 'rmvb', 'vob', '3gp', 'ogv']);
-invoke('mpv_available').then((ok) => { mpvEnabled = !!ok; }).catch(() => {});
+// ═══════════════ 视频播放引擎分流（HTML5 直连 / ffmpeg 硬件转码流） ═══════════════
+// 需要服务端转码的容器格式（浏览器不支持这些容器，编码通常可直解）
+const TRANSCODE_EXTS = new Set(['ts', 'mts', 'm2ts', 'mkv', 'avi', 'flv', 'wmv', 'rm', 'rmvb', 'vob', '3gp', 'ogv']);
 
-/** 文件是否应走 mpv 音频引擎（HTML5 不支持的容器格式） */
-function useMpvEngine(path) {
-  if (!mpvEnabled) return false;
+// ─── web-demuxer 播放器状态 ───────────────────────────
+// 全屏预览中走 web-demuxer + MSE 路径时使用的实例
+let webPlayer = null;
+function isWebPlayerActive() { return webPlayer !== null; }
+
+// 浏览器编码支持探测：canPlayType 运行时判定（HEVC 依赖 Windows 扩展，逐机不同）；
+// 不在表内的编码（wmv3/mpeg2video/prores/vvc…）Chromium 一律不支持 → 需转码
+const CODEC_PROBE = {
+  h264: 'video/mp4; codecs="avc1.42E01E"', avc1: 'video/mp4; codecs="avc1.42E01E"',
+  hevc: 'video/mp4; codecs="hvc1"', h265: 'video/mp4; codecs="hvc1"',
+  vp9: 'video/mp4; codecs="vp09.00.10.08"', av1: 'video/mp4; codecs="av01.0.04M.08"',
+  vp8: 'video/webm; codecs="vp8"', theora: 'video/ogg; codecs="theora"',
+};
+let codecProbeEl = null;
+const codecProbeCache = new Map();
+function browserCanPlay(codec) {
+  const c = String(codec || '').toLowerCase();
+  if (!c) return true; // 未探测到编码：按容器判断
+  if (codecProbeCache.has(c)) return codecProbeCache.get(c);
+  const mime = CODEC_PROBE[c];
+  codecProbeEl ||= document.createElement('video');
+  const ok = mime ? !!codecProbeEl.canPlayType(mime) : false;
+  codecProbeCache.set(c, ok);
+  return ok;
+}
+
+/**
+ * 判断指定视频文件将使用的播放引擎，返回中文标签。
+ * @param {string} path 文件路径
+ * @param {number} [idx] 该项在 filtered 中的索引（用于判断是否正在播放）
+ */
+function engineLabel(path, idx) {
   const ext = (path.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase() || '';
-  return MPV_EXTS.has(ext);
+  const isPlaying = idx != null && state.viewerIndex === idx;
+  if (isPlaying) {
+    // 优先展示转码返回的实际引擎（如「h264_nvenc · GPU 零拷贝」）
+    if (activeEngine) return activeEngine;
+    // 播放中的 src 是 HTTP 流说明走了转码
+    if (vVideo.src && vVideo.src.includes('/stream/')) return 'ffmpeg 硬件转码 · 流式';
+    return 'HTML5 · video';
+  }
+  if (TRANSCODE_EXTS.has(ext)) return 'ffmpeg 硬件转码 · 流式';
+  // 容器可直连但编码浏览器不解（如 mp4 里的 hevc/vvc）→ 播放时实际会回退转码
+  const vc = state.infoCache.get(path)?.videoCodec;
+  if (vc && !browserCanPlay(vc)) return 'ffmpeg 硬件转码 · 流式';
+  return 'HTML5 · video';
 }
 
-// 播放状态
-let mpvSession = -1;      // 对应 state.viewerIndex，防止异步竞态
-let mpvTimer = null;
-let mpvPlaying = false;   // 是否处于视频播放模式（当前预览项）
-let mpvPendingSeek = 0;   // 续播：文件就绪后要跳到的秒数（只做一次）
-let mpvPath = '';         // 当前播放的文件路径（进度记录用）
-let mpvEndHandled = false; // EOF 事件去重
-let mpvPosition = 0;      // 当前播放位置（秒，供 Q/E seek 等读取）
-let videoGen = 0;         // 会话代令牌：stop 时递增，使在途 rAF/fetch 回调失效
-let videoPrimed = false;  // 画面缓冲是否已攒够（primed 后才启动音频）
-let videoRafId = 0;       // 拉帧 rAF 句柄
-let videoRate = 1;        // 播放速率
-let videoLoop = false;    // 是否循环
-const videoCanvas = $('videoCanvas');
-const videoCtx = videoCanvas?.getContext('2d');
+// ─── 预览器邻居预载：图片上下 3 张离屏解码，切换零闪屏；直连视频上下 1 个预热缓冲 ───
+const VIEWER_IMG_PREFETCH = 3;
+const viewerImgPool = new Map();  // idx -> HTMLImageElement（离屏解码，浏览器缓存复用）
+// 图片写回原图后的破缓存参数：保存过的文件 URL 追加 ?t=，绕开 WebView 旧图缓存
+let imgBust = '';
+// 写回后新图的 blob URL（fetch cache:'reload' 强制绕过 WebView 缓存，关闭预览时 revoke）
+let savedBlobUrl = '';
+const viewerVidWarm = new Map();  // idx -> HTMLVideoElement（离屏缓冲）
+let viewerWarmBox = null;
+let viewerCurKind = null;         // 当前预览器媒体类型（image/video/null），切换保留旧帧用
 
-// rvframe 帧头偏移（小端）
-const FH_W = 0, FH_H = 4, FH_SEQ = 8, FH_PTS = 16, FH_BUF = 20, FH_FLAGS = 24;
-const FLAG_PRIMED = 1;
-const FRAME_HEADER = 28;
-
-// （canvas 方案下无需预读池：每次切换直接 video_start，开销可接受）
-function prefetchNeighbors() {}
-function prefetchClear() {}
-
-// （canvas 方案下视频铺满舞台由 CSS object-fit:contain 处理，无需手动几何/遮罩）
-function updateViewerShade() {}
-function setMainWrapHole() {}
-function syncMpvGeometry() {}
-function setMpvGeometryOnly() {}
-function applyMpvShade() {}
-function computeMpvGeometry() { return null; }
-function mpvLayoutLoop() {}
-
-/** 轮询播放状态 → 更新控制条（进度/时间/按钮） */
-async function mpvPoll() {
-  if (!mpvPlaying) return;
+/** 把 vVideo 当前帧冻结到 canvas 遮罩盖住舞台（新视频就绪前旧帧不消失） */
+function showVideoFreeze() {
+  const box = $('videoFreeze');
+  if (!box || vVideo.videoWidth <= 0) return;
+  const c = box.querySelector('canvas');
   try {
-    const s = await invoke('mpv_state');
-    if (!mpvPlaying || !s.loaded) return;
-    mpvPosition = s.position || 0;
-    // 续播：时长就绪后跳到记录位置（只做一次）
-    if (mpvPendingSeek > 0 && s.duration > 0) {
-      const target = mpvPendingSeek;
-      mpvPendingSeek = 0;
-      if (target < s.duration - 0.5) mpvCtl('seek', target);
-    }
-    // 进度记录
-    progressSet(mpvPath, s.position);
-    // 进度/时长
-    if (s.duration > 0) {
-      const p = Math.min(1, s.position / s.duration);
-      $('videoSeekFill').style.width = p * 100 + '%';
-      $('videoSeekKnob').style.left = p * 100 + '%';
-    }
-    $('videoCur').textContent = fmtDur(s.position) || '0:00';
-    $('videoDur').textContent = fmtDur(s.duration) || '0:00';
-    viewerMediaDur = s.duration || 0;
-    // 播放/暂停按钮
-    syncPlayIcon($('videoPlay'), s.paused);
-    // 播放结束按播放模式选下一项（去重触发）
-    if (s.ended) {
-      if (!mpvEndHandled) { mpvEndHandled = true; handlePlaybackEnded(); }
-    } else {
-      mpvEndHandled = false;
-    }
-    // 暂停时保持控制条常显
-    if (s.paused) showVideoBar();
-  } catch { /* 忽略 */ }
+    c.width = vVideo.videoWidth;
+    c.height = vVideo.videoHeight;
+    c.getContext('2d').drawImage(vVideo, 0, 0);
+    box.classList.remove('hidden');
+    box.classList.add('flex');
+  } catch { /* 帧不可绘制时放弃遮罩（极少见），退回普通切换 */ }
+}
+function hideVideoFreeze() {
+  const box = $('videoFreeze');
+  if (!box) return;
+  box.classList.add('hidden');
+  box.classList.remove('flex');
 }
 
-// 会话代令牌：stop 时递增，使在途的 rAF/fetch 回调失效
-let mpvGen = 0;
+// 预览层入场：内容首帧就绪前保持透明（CSS：#viewer opacity:0 → .viewer-in 淡入），
+// 消除"空舞台先黑几帧再出内容"；最大化进入时预览层已是 viewer-cover 黑场，直接转 in
+let viewerRevealFailsafe = 0;
+function revealViewer() {
+  // cover 纯黑场 → in 正常态（同为不透明，无跳变；恢复淡入过渡）
+  $('viewer').classList.add('viewer-in');
+  $('viewer').classList.remove('viewer-cover');
+  clearTimeout(viewerRevealFailsafe);
+}
+/** 打开预览器：先挂载但不淡入，内容分支在首帧就绪后调 revealViewer */
+function armViewerReveal() {
+  $('viewer').classList.remove('viewer-in');
+  clearTimeout(viewerRevealFailsafe);
+  // 兜底：本地文件解码异常/事件丢失时，最多 500ms 后强制淡入，绝不卡在透明状态
+  viewerRevealFailsafe = setTimeout(revealViewer, 500);
+}
 
-/** 从 rvframe 协议取一帧并画到 canvas；返回 { primed, bufferedMs } */
-async function fetchVideoFrame(gen, ptsMs) {
-  if (gen !== mpvGen || !videoCtx) return null;
+function ensureWarmBox() {
+  if (!viewerWarmBox) {
+    viewerWarmBox = document.createElement('div');
+    // 放在屏外但仍参与缓冲（display:none 在部分内核下会暂停媒体预取）
+    viewerWarmBox.style.cssText =
+      'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0;pointer-events:none;z-index:-1;overflow:hidden';
+    document.body.appendChild(viewerWarmBox);
+  }
+  return viewerWarmBox;
+}
+
+/** 从 from 起沿 dir（±1）找第 step 个可预览项（image/video），环形查找；无则 -1 */
+function nthViewable(from, dir, step) {
+  const n = state.filtered.length;
+  let cur = from, found = 0;
+  for (let k = 0; k < n; k++) {
+    cur = (((cur + dir) % n) + n) % n;
+    const it = state.filtered[cur];
+    if (it?.kind === 'image' || it?.kind === 'video') {
+      if (++found === step) return cur;
+    }
+  }
+  return -1;
+}
+
+/** 视频是否浏览器可直连（mkv/ts 等需服务端转码，预热会打断当前转码流，不预热） */
+function directPlayableVideo(path) {
+  const ext = (path.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase() || '';
+  return !!ext && !TRANSCODE_EXTS.has(ext);
+}
+
+/** openViewer 后调用：把上下 3 张图片预解码、上下 1 个直连视频预缓冲，切换时即时呈现 */
+function prefetchNeighbors(idx) {
+  const wantImgs = new Map(); // idx -> path
+  const wantVids = new Map();
+  for (const dir of [-1, 1]) {
+    for (let s = 1; s <= VIEWER_IMG_PREFETCH; s++) {
+      const i = nthViewable(idx, dir, s);
+      if (i < 0) continue;
+      const it = state.filtered[i];
+      if (!it) continue;
+      if (it.kind === 'image') wantImgs.set(i, it.path);
+      else if (s === 1 && directPlayableVideo(it.path)) wantVids.set(i, it.path);
+    }
+  }
+  // 图片池：移除窗口外的，补入新的
+  for (const i of viewerImgPool.keys()) {
+    if (!wantImgs.has(i)) { const im = viewerImgPool.get(i); im.src = ''; viewerImgPool.delete(i); }
+  }
+  for (const [i, p] of wantImgs) {
+    if (!viewerImgPool.has(i)) {
+      const im = new Image();
+      im.decoding = 'async';
+      im.src = convertFileSrc(p) + imgBust;
+      // 显式解码：切到该图时 img.src 赋值即呈现，无需再等解码
+      if (im.decode) im.decode().catch(() => {});
+      viewerImgPool.set(i, im);
+    }
+  }
+  // 视频预热：仅保留 ±1
+  for (const i of viewerVidWarm.keys()) {
+    if (!wantVids.has(i)) {
+      const v = viewerVidWarm.get(i);
+      v.pause(); v.removeAttribute('src');
+      try { v.load(); } catch { /* 忽略 */ }
+      v.remove();
+      viewerVidWarm.delete(i);
+    }
+  }
+  for (const [i, p] of wantVids) {
+    if (viewerVidWarm.has(i)) continue;
+    const v = document.createElement('video');
+    v.muted = true;
+    v.preload = 'auto';
+    v.playsInline = true;
+    // 预热时直接 seek 到续播点：切过去后即使要重建播放，目标片段也已在缓存中
+    const resume = progressGet(p);
+    if (resume > 0) {
+      const onMeta = () => {
+        if (v.duration) v.currentTime = Math.min(resume, v.duration - 0.5);
+        v.removeEventListener('loadedmetadata', onMeta);
+      };
+      v.addEventListener('loadedmetadata', onMeta);
+    }
+    v.src = convertFileSrc(p);
+    ensureWarmBox().appendChild(v);
+    viewerVidWarm.set(i, v);
+  }
+}
+
+/** 关闭预览器：释放全部预载资源 */
+function prefetchClear() {
+  for (const im of viewerImgPool.values()) im.src = '';
+  viewerImgPool.clear();
+  for (const v of viewerVidWarm.values()) {
+    v.pause();
+    v.removeAttribute('src');
+    try { v.load(); } catch { /* 忽略 */ }
+    v.remove();
+  }
+  viewerVidWarm.clear();
+}
+
+// ═══════════════ 辅助音轨（ffmpeg 转码后与视频同步） ═══════════════
+// 用于 web-demuxer 不支持的音轨（如 eac3/dts）：ffmpeg 转码为 AAC，
+// 由隐藏的 viewerAudio 播放，监听 vVideo 事件保持同步。
+let extAudioCleanup = null;
+
+let audioMediaSource = null;
+let audioSourceBuffer = null;
+let audioChunkQueue = [];
+let audioAppendPending = false;
+let audioUnlistenChunk = null;
+let audioUnlistenEnd = null;
+
+async function setupExternalAudio(path, audioIndex, viewerIdx) {
+  // 清理上一次
+  if (extAudioCleanup) { extAudioCleanup(); extAudioCleanup = null; }
+
   try {
-    const url = ptsMs != null
-      ? `http://rvframe.localhost/f?pts=${Math.round(ptsMs)}`
-      : 'http://rvframe.localhost/f';
-    const res = await fetch(url, { cache: 'no-store' });
-    if (gen !== mpvGen) return null;
-    const buf = await res.arrayBuffer();
-    if (buf.byteLength < FRAME_HEADER) return null;
-    const dv = new DataView(buf);
-    const w = dv.getUint32(FH_W, true);
-    const h = dv.getUint32(FH_H, true);
-    const bufferedMs = dv.getUint32(FH_BUF, true);
-    const flags = dv.getUint32(FH_FLAGS, true);
-    const primed = (flags & FLAG_PRIMED) !== 0;
-    if (w > 0 && h > 0 && buf.byteLength > FRAME_HEADER) {
-      const jpeg = buf.slice(FRAME_HEADER);
-      const blob = new Blob([jpeg], { type: 'image/jpeg' });
-      const bmp = await createImageBitmap(blob);
-      if (gen !== mpvGen) { bmp.close(); return { primed, bufferedMs }; }
-      if (videoCanvas.width !== w || videoCanvas.height !== h) {
-        videoCanvas.width = w;
-        videoCanvas.height = h;
-      }
-      videoCtx.drawImage(bmp, 0, 0);
-      bmp.close();
-    }
-    return { primed, bufferedMs };
-  } catch { return null; }
-}
+    setStatus('音轨解码中…', false);
 
-/** 拉帧循环：rAF 驱动，按音频时钟取帧（primed 前不启动音频） */
-function videoFrameLoop(gen) {
-  if (gen !== mpvGen || !mpvPlaying) return;
-  (async () => {
-    // 用音频 position 作为 pts 取对应帧（音画同步）；音频未起时 pts=null 严格 FIFO
-    let pts = null;
-    if (videoPrimed) {
-      try {
-        const st = await invoke('mpv_state');
-        if (st && st.loaded && !st.paused) pts = st.position * 1000;
-      } catch { /* 忽略 */ }
-    }
-    const r = await fetchVideoFrame(gen, pts);
-    if (gen !== mpvGen || !mpvPlaying) return;
-    if (r) {
-      if (r.primed && !videoPrimed) {
-        // 缓冲攒够：启动音频
-        videoPrimed = true;
-        $('videoBufOverlay').classList.add('hidden');
+    // 创建 MediaSource
+    audioMediaSource = new MediaSource();
+    viewerAudio.src = URL.createObjectURL(audioMediaSource);
+    viewerAudio.playbackRate = vVideo.playbackRate;
+
+    await new Promise((resolve, reject) => {
+      const onOpen = () => {
+        audioMediaSource.removeEventListener('sourceopen', onOpen);
         try {
-          await invoke('mpv_load', { path: mpvPath, autoplay: true });
-          mpvCtl('volume', state.cfg?.videoVolume ?? 100);
-          if (state.cfg?.videoMuted) mpvCtl('mute', 1);
-          mpvCtl('speed', videoRate);
-          mpvCtl('loop', videoLoop ? 1 : 0);
-        } catch (e) { setStatus('音频启动失败: ' + e, true); }
+          audioSourceBuffer = audioMediaSource.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+          audioSourceBuffer.mode = 'segments';
+          audioSourceBuffer.addEventListener('updateend', flushAudioQueue);
+          resolve();
+        } catch (e) { reject(e); }
+      };
+      audioMediaSource.addEventListener('sourceopen', onOpen);
+      setTimeout(() => reject(new Error('sourceopen timeout')), 5000);
+    });
+
+    // 启动 ffmpeg 实时转码音频为 fMP4
+    await invoke('stream_audio', { path, audioIndex });
+
+    // 监听音频数据块
+    audioUnlistenChunk = await listen('audio-chunk', (e) => {
+      const bin = atob(e.payload);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      audioChunkQueue.push(bytes.buffer);
+      flushAudioQueue();
+    });
+
+    audioUnlistenEnd = await listen('audio-end', () => {
+      // 流结束，等队列排空后标记 MediaSource 结束
+      const check = () => {
+        if (audioChunkQueue.length === 0 && audioSourceBuffer && !audioSourceBuffer.updating) {
+          try { audioMediaSource?.endOfStream(); } catch {}
+        } else {
+          setTimeout(check, 200);
+        }
+      };
+      check();
+    });
+
+    setStatus('', false);
+
+    // 同步播放状态：video 驱动 audio
+    const onPlay = () => { viewerAudio.play().catch(() => {}); };
+    const onPause = () => { viewerAudio.pause(); };
+    const onSeek = () => {
+      const t = vVideo.currentTime;
+      if (Math.abs(viewerAudio.currentTime - t) > 0.5) {
+        try { viewerAudio.currentTime = t; } catch {}
       }
-      // 缓冲进度条
-      const bar = $('videoBufBar');
-      if (bar && r.bufferedMs > 0) bar.style.width = Math.min(100, r.bufferedMs / 30) + '%';
-    }
-    if (gen === mpvGen && mpvPlaying) {
-      videoRafId = requestAnimationFrame(() => videoFrameLoop(gen));
-    }
-  })();
-}
+    };
+    const onRate = () => { viewerAudio.playbackRate = vVideo.playbackRate; };
+    const onEnded = () => { viewerAudio.pause(); };
 
-function startMpvSession(item, autoplay) {
-  const path = item.path;
-  mpvPlaying = true;
-  mpvEndHandled = false;
-  mpvPath = path;
-  mpvPendingSeek = progressGet(path);
-  const gen = ++mpvGen;
-  videoPrimed = false;
-  videoRate = Number($('videoSpeed')?.value) || 1;
-  // L247：按播放模式设置循环（单曲循环=开，其余=关）
-  videoLoop = playMode === 'one';
-  applyPlayLoop();
+    vVideo.addEventListener('play', onPlay);
+    vVideo.addEventListener('pause', onPause);
+    vVideo.addEventListener('seeked', onSeek);
+    vVideo.addEventListener('ratechange', onRate);
+    vVideo.addEventListener('ended', onEnded);
 
-  // 显示 canvas，隐藏 HTML5 video
-  videoCanvas.classList.remove('hidden');
-  $('viewerVideo').classList.add('hidden');
+    extAudioCleanup = () => {
+      vVideo.removeEventListener('play', onPlay);
+      vVideo.removeEventListener('pause', onPause);
+      vVideo.removeEventListener('seeked', onSeek);
+      vVideo.removeEventListener('ratechange', onRate);
+      vVideo.removeEventListener('ended', onEnded);
+    };
 
-  // 显示缓冲提示
-  const bufOverlay = $('videoBufOverlay');
-  if (bufOverlay) {
-    bufOverlay.classList.remove('hidden');
-    $('videoBufBar').style.width = '0%';
+    if (!vVideo.paused) viewerAudio.play().catch(() => {});
+  } catch (e) {
+    console.warn('[external-audio] 实时音频失败，无声播放:', e);
+    setStatus('音轨解码失败，无声播放', true);
   }
-
-  const dpr = window.devicePixelRatio || 1;
-  const stage = $('viewerStage');
-  const maxW = Math.max(2, Math.round((stage?.clientWidth || 1280) * dpr));
-  const maxH = Math.max(2, Math.round((stage?.clientHeight || 720) * dpr));
-
-  (async () => {
-    try {
-      const dims = await invoke('video_start', {
-        path,
-        startAt: mpvPendingSeek > 0 ? mpvPendingSeek : 0,
-        rate: videoRate,
-        loopFile: videoLoop,
-        maxW,
-        maxH,
-        bufferMs: 3000,
-      });
-      if (gen !== mpvGen) return;
-      // 回写元数据（供下次切换使用）
-      if (dims && dims.srcW > 0) {
-        item.width = dims.srcW;
-        item.height = dims.srcH;
-      }
-      jsDiag(`videoStart ok ${dims?.w}x${dims?.h} fps=${dims?.fps} hw=${dims?.hwaccel}`);
-      // 启动拉帧循环
-      videoFrameLoop(gen);
-    } catch (err) {
-      if (gen === mpvGen) {
-        jsDiag(`videoStart FAIL: ${err}`);
-        setStatus('视频播放失败: ' + err, true);
-      }
-    }
-  })();
-
-  clearInterval(mpvTimer);
-  mpvTimer = setInterval(mpvPoll, 200);
 }
 
-let mpvStopPromise = Promise.resolve();
-
-async function stopMpvSession() {
-  const wasPlaying = mpvPlaying;
-  mpvPlaying = false;
-  mpvGen++;
-  mpvPendingSeek = 0;
-  videoPrimed = false;
-  if (videoRafId) { cancelAnimationFrame(videoRafId); videoRafId = 0; }
-  clearInterval(mpvTimer);
-  videoCanvas.classList.add('hidden');
-  $('videoBufOverlay')?.classList.add('hidden');
-  if (!wasPlaying) return mpvStopPromise;
-  flushProgress();
-  mpvStopPromise = mpvStopPromise.then(async () => {
-    try { await invoke('video_stop'); } catch { /* 忽略 */ }
-    try { await invoke('mpv_stop'); } catch { /* 忽略 */ }
-  });
-  return mpvStopPromise;
-}
-
-// 控制条适配：mpv 播放时转发到 mpv_control（音频）+ 必要时 video_pause（画面）
-function mpvCtl(action, value) {
-  if (!mpvPlaying) return false;
-  switch (action) {
-    case 'toggle':
-    case 'pause':
-    case 'play':
-      invoke('mpv_control', { action, value: value ?? null }).catch(() => {});
-      // 画面同步暂停/播放：pause 时保留最后一帧，play 时重启解码
-      if (action === 'pause' || action === 'toggle') {
-        invoke('video_pause').catch(() => {});
-      }
-      break;
-    case 'seek':
-    case 'seekPercent':
-    case 'volume':
-    case 'mute':
-    case 'speed':
-      invoke('mpv_control', { action, value: value ?? null }).catch(() => {});
-      if (action === 'speed') videoRate = Number(value) || 1;
-      if (action === 'loop') videoLoop = value > 0.5;
-      break;
-    case 'loop':
-      invoke('mpv_control', { action, value: value ?? null }).catch(() => {});
-      videoLoop = value > 0.5;
-      break;
+function flushAudioQueue() {
+  if (!audioSourceBuffer || audioSourceBuffer.updating || audioChunkQueue.length === 0) return;
+  audioAppendPending = true;
+  const chunk = audioChunkQueue.shift();
+  try {
+    audioSourceBuffer.appendBuffer(chunk);
+  } catch (e) {
+    console.warn('[audio] appendBuffer failed:', e);
   }
-  return true;
+}
+
+function cleanupExternalAudio() {
+  if (extAudioCleanup) { extAudioCleanup(); extAudioCleanup = null; }
+  audioUnlistenChunk?.(); audioUnlistenChunk = null;
+  audioUnlistenEnd?.(); audioUnlistenEnd = null;
+  audioChunkQueue = [];
+  audioSourceBuffer = null;
+  audioMediaSource = null;
+  invoke('stop_audio_stream').catch(() => {});
+  viewerAudio.pause();
+  viewerAudio.removeAttribute('src');
+  viewerAudio.load();
 }
 
 // ═══════════════ 画廊预览 ═══════════════
@@ -2461,12 +3036,15 @@ async function openViewer(idx, quiet = false) {
   // L90：仅首次打开（预览层之前是隐藏的）才短暂亮出悬浮控件；切换文件不唤醒
   const wasHidden = $('viewer').classList.contains('hidden');
   if (wasHidden) {
-    await captureViewerBase(); // L129：首次打开捕获窗口基准状态
-    // 保存画廊视口滚动位置，关闭预览时恢复
+    // 必须先存滚动位置：captureViewerBase 会让窗口最大化→真全屏，视口变高时
+    // 浏览器会把 scrollTop 向小钳制，await 之后再存就已经是被钳过的错误值
     viewerSavedScroll = { top: scroller.scrollTop, left: scroller.scrollLeft };
+    cancelViewerGeoSettle(); // 极端情况下过渡未完成又重新进入：作废旧 settle
+    await captureViewerBase(); // L129：首次打开捕获窗口基准状态
   }
   viewerWakePending = !quiet && wasHidden;
   $('viewer').classList.remove('hidden');
+  if (wasHidden) armViewerReveal(); // 首帧就绪前透明，由各内容分支 revealViewer 淡入
   if (viewerWakePending) wakeViewerUI();
   $('viewerTitle').textContent = item.name;
   // L62：控制条左侧显示缩略文件名
@@ -2475,13 +3053,13 @@ async function openViewer(idx, quiet = false) {
   $('viewerIndex').textContent = `${idx + 1} / ${state.filtered.length}`;
   vpMarkActive(); // L99：同步播放列表高亮
   updateVideoInfoPanel(); // L152：解码信息悬浮层随文件切换刷新（未开启时内部自动隐藏）
-  $('viewerImg').classList.add('hidden');
-  $('viewerVideo').classList.add('hidden');
-  videoCanvas.classList.add('hidden');
+  // 媒体层不再一刀切隐藏：切换期间旧帧保留在舞台上（图片旧图/视频冻结帧），
+  // 新内容首帧就绪后再遮盖，做到接近 0 帧切换
+  const prevKind = viewerCurKind;
+  viewerCurKind = item.kind;
   $('videoBar').classList.add('hidden');
   $('imgDock').classList.add('hidden'); // L233：停靠区仅图片模式显示
   resetImageTransform(); // 翻转/旋转/缩放/平移为视图级状态，切换项即复位
-  stopMpvSession(); // 停止上一个视频会话
   // L34：侧切换箭头仅图片显示（视频不显示）；光标复位
   setViewerSideArrows(item.kind === 'image');
   viewerImg.style.cursor = item.kind === 'image' ? 'grab' : '';
@@ -2489,49 +3067,169 @@ async function openViewer(idx, quiet = false) {
   vVideo.pause();
   // L249：打开视频预览时不暂停音频后台播放（音频播放器独立于视频）
   setViewerSuspension(true); // 单一播放期间暂停文件区列表预览
+  // 释放画廊预览和上一个转码流占用的 CPU/GPU/IO，避免拖垮全屏播放
+  invoke('cancel_all_previews').catch(() => {});
+  invoke('stop_transcode_stream').catch(() => {});
 
-  const src = convertFileSrc(item.path);
+  // 图片 URL 带破缓存参数（imgBust 仅在写回原图后变化，保证池与显示 URL 一致）
+  const src = convertFileSrc(item.path) + (item.kind === 'image' ? imgBust : '');
   if (item.kind === 'image') {
     $('imgDock').classList.remove('hidden'); // L233：竖排缩放条停靠区
-    // 渐进加载：先显示已缓存的缩略图（瞬时），全尺寸原图解码完成后再无缝替换
-    const t = thumbAny(item.path);
-    if (t) {
-      $('viewerImg').src = t.url;
-      $('viewerImg').classList.remove('hidden');
-      const full = new Image();
-      full.onload = () => {
-        // 仍在预览同一项时才替换，避免竞态闪烁
-        if (state.viewerIndex === idx) $('viewerImg').src = src;
+    const img = $('viewerImg');
+    const stillHere = () => state.viewerIndex === idx;
+    // 清场桥接：视频→图片先冻结旧视频帧，再隐藏视频层（两者都是 flex 项，
+    // 不隐藏视频会把图片挤到一侧）；图片 decode 就绪后揭掉冻结帧。
+    if (prevKind === 'video') showVideoFreeze();
+    $('viewerVideo').classList.add('hidden');
+    const revealImage = () => {
+      if (!stillHere()) return;
+      img.classList.remove('hidden');
+      hideVideoFreeze();
+    };
+    const pre = viewerImgPool.get(idx);
+    if (pre && pre.complete && pre.naturalWidth > 0) {
+      // 上下 3 张预载命中：原图已下载解码，直接换出，0 帧切换
+      img.src = src;
+      revealImage();
+      revealViewer();
+    } else if (prevKind === 'image' && img.src && !img.classList.contains('hidden')) {
+      // 图片间切换：旧图保持在屏幕上，新原图后台 decode 完成再换（绝不先显示小图）
+      const loader = new Image();
+      loader.decoding = 'async';
+      loader.onload = () => {
+        const go = () => { if (stillHere()) { img.src = src; } };
+        if (loader.decode) loader.decode().then(go, go); else go();
       };
-      full.src = src;
+      loader.src = src;
     } else {
-      $('viewerImg').src = src;
-      $('viewerImg').classList.remove('hidden');
+      // 视频→图片：冻结帧盖住舞台，图片层隐藏直至就绪
+      // 首次打开：无旧帧，用缩略图瞬时兜底
+      img.classList.add('hidden');
+      if (prevKind === null) {
+        const t = thumbAny(item.path);
+        if (t) { img.src = t.url; img.classList.remove('hidden'); }
+      }
+      const loader = new Image();
+      loader.decoding = 'async';
+      loader.onload = () => {
+        const go = () => { if (stillHere()) { img.src = src; revealImage(); revealViewer(); } };
+        if (loader.decode) loader.decode().then(go, go); else go();
+      };
+      loader.src = src;
     }
   } else if (item.kind === 'video') {
     jsDiag(`openViewer video idx=${idx} name=${item.name} meta=${item.width}x${item.height}`);
     syncPlayIcon($('videoPlay'), true);
     const autoplay = state.cfg?.videoAutoplay !== false;
-    if (useMpvEngine(item.path)) {
-      // HTML5 不支持的容器（ts/mkv/avi…）→ ffmpeg 解码 + canvas 画面 + mpv 音频
-      stopMpvSession().then(() => {
-        if (state.viewerIndex !== idx) return;
-        mpvSession = idx;
-        startMpvSession(item, autoplay);
+    const ext = (item.path.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase() || '';
+    const needsExt = TRANSCODE_EXTS.has(ext);
+    clearTranscodeState(); // 复位转码流时间轴（新项按需重建）
+
+    if (webPlayer) { webPlayer.destroy(); webPlayer = null; }
+    // 清场桥接：视频→视频先冻结旧帧；图片→视频保留旧图片层。
+    // 视频层先隐藏（防止与图片并排挤占布局），首帧 canplay 后再揭开。
+    if (prevKind === 'video') {
+      showVideoFreeze();
+      revealViewer(); // 冻结帧就是有效画面，直接淡入，不再等 canplay
+    }
+    $('viewerVideo').classList.add('hidden');
+    let freezeRevealed = false;
+    const revealNewFrame = () => {
+      if (state.viewerIndex !== idx || freezeRevealed) return;
+      freezeRevealed = true;
+      $('viewerVideo').classList.remove('hidden');
+      hideVideoFreeze();
+      $('viewerImg').classList.add('hidden');
+      revealViewer();
+    };
+    vVideo.addEventListener('canplay', revealNewFrame, { once: true });
+    vVideo.addEventListener('playing', revealNewFrame, { once: true });
+    setTimeout(() => { if (state.viewerIndex === idx) revealNewFrame(); }, 15000); // 兜底防卡死
+
+    vVideo.pause();
+    vVideo.removeAttribute('src');
+    vVideo.load();
+
+    if (needsExt) {
+      // 浏览器不支持的容器 → ffmpeg 硬件转码 + HTTP 流（边转边播）
+      (async () => {
+        cleanupExternalAudio();
+        // 视频层保持隐藏直至 canplay（revealNewFrame 统一揭开），转码期间由冻结帧遮盖
+
+        try {
+          setStatus('硬件转码中…', false);
+          // 续播随转码启动一并传给 -ss，直播流上设 currentTime 无效
+          const resume = progressGet(item.path);
+          const seekSec = resume > 0 && item.duration && resume < item.duration - 0.5 ? resume : null;
+          const [info, port] = await Promise.all([
+            invoke('transcode_stream', { path: item.path, seekSecs: seekSec }),
+            invoke('get_file_server_port')
+          ]);
+          if (state.viewerIndex !== idx) return;
+          setStatus('', false);
+
+          activeEngine = info.engine;
+          tcTimeline = { offset: seekSec || 0, duration: item.duration || 0 };
+          vVideo.src = `http://127.0.0.1:${port}/stream/${info.id}`;
+          vVideo.playbackRate = Number($('videoSpeed')?.value) || 1;
+          applyPlayLoop();
+          // fMP4 流可能不触发 durationchange，显式刷新时长显示
+          $('videoDur').textContent = fmtDur(tcTimeline.duration) || '0:00';
+          viewerMediaDur = tcTimeline.duration;
+          if (autoplay) vVideo.play().catch(() => {});
+
+          const engRow = $('infoBody').querySelector('[data-engine="1"] .break-all');
+          if (engRow) engRow.textContent = info.engine;
+        } catch (e) {
+          console.error('[transcode_stream] 失败:', e);
+          setStatus(`转码失败: ${e}`, true);
+          revealNewFrame(); // 出错也揭开冻结帧，避免旧画面停留 15s
+        }
         revealVideoBar();
-      });
+      })();
     } else {
       // HTML5 可播格式（mp4/webm/ogg…）→ 直接用 <video> 标签
-      stopMpvSession();
-      videoCanvas.classList.add('hidden');
-      $('viewerVideo').classList.remove('hidden');
+      // 如果编码不支持（如 mp4 中的 hevc），播放失败后回退到 ffmpeg 转码
+      cleanupExternalAudio();
+      // 视频层保持隐藏直至 canplay（图片→视频时旧图片继续显示，不并排挤占）
       (async () => {
         const playPath = await playableVideoSrc(item.path);
         if (state.viewerIndex !== idx) return;
         const resume = progressGet(item.path);
         vVideo.src = convertFileSrc(playPath);
         vVideo.playbackRate = Number($('videoSpeed')?.value) || 1;
-        applyPlayLoop(); // L247：单曲循环模式下开启 loop
+        applyPlayLoop();
+
+        // 编码不支持时回退到 ffmpeg 转码
+        const onError = async () => {
+          vVideo.removeEventListener('error', onError);
+          console.warn('[HTML5] 播放失败，回退到 ffmpeg 转码');
+          try {
+            setStatus('硬件转码中…', false);
+            const resume = progressGet(item.path);
+            const seekSec = resume > 0 && item.duration && resume < item.duration - 0.5 ? resume : null;
+            const [info, port] = await Promise.all([
+              invoke('transcode_stream', { path: item.path, seekSecs: seekSec }),
+              invoke('get_file_server_port')
+            ]);
+            if (state.viewerIndex !== idx) return;
+            setStatus('', false);
+            activeEngine = info.engine;
+            tcTimeline = { offset: seekSec || 0, duration: item.duration || 0 };
+            vVideo.src = `http://127.0.0.1:${port}/stream/${info.id}`;
+            $('videoDur').textContent = fmtDur(tcTimeline.duration) || '0:00';
+            viewerMediaDur = tcTimeline.duration;
+            if (autoplay) vVideo.play().catch(() => {});
+            const engRow = $('infoBody').querySelector('[data-engine="1"] .break-all');
+            if (engRow) engRow.textContent = info.engine;
+          } catch (e) {
+            console.error('[transcode fallback] 失败:', e);
+            setStatus(`播放失败: ${e}`, true);
+            revealNewFrame();
+          }
+        };
+        vVideo.addEventListener('error', onError);
+
         const onMeta = () => {
           if (resume > 0 && vVideo.duration) {
             vVideo.currentTime = Math.min(resume, vVideo.duration - 0.5);
@@ -2544,18 +3242,40 @@ async function openViewer(idx, quiet = false) {
       })();
     }
   }
+  // 预载上下 3 张图片（离屏解码）+ 上下 1 个直连视频（预缓冲），切换零闪屏
+  prefetchNeighbors(idx);
   showInfo(idx);
 }
 
 function closeViewer() {
   jsDiag('closeViewer');
   prefetchClear();
-  $('viewer').classList.add('hidden');
+  viewerCurKind = null;
+  hideVideoFreeze();
+  clearTimeout(zoomBadgeTimer);
+  clearTimeout(zoomBadgeHideTimer);
+  clearTimeout(viewerRevealFailsafe);
+  $('viewer').classList.remove('viewer-in'); // 几何变化路径保留黑场 cover 至 settle，见下方
+  $('viewerZoomBadge').classList.add('hidden');
   $('viewerPlaylist').classList.remove('viewer-show'); // L99：关预览时收起播放列表
-  stopMpvSession();
+  if (webPlayer) { webPlayer.destroy(); webPlayer = null; }
+  cleanupExternalAudio();
+  clearTranscodeState(); // 复位转码流时间轴并作废在途跳转
+  invoke('stop_transcode_stream').catch(() => {}); // 终止 ffmpeg 转码进程
+  // ─── 清场：移除所有媒体内容并隐藏媒体层，防止下次打开瞬间露出上一次的图/视频帧 ───
   vVideo.pause();
   vVideo.autoplay = false;
   vVideo.removeAttribute('src');
+  try { vVideo.load(); } catch { /* 忽略 */ }
+  $('viewerVideo').classList.add('hidden');
+  viewerImg.removeAttribute('src');
+  viewerImg.classList.add('hidden');
+  if (savedBlobUrl) { URL.revokeObjectURL(savedBlobUrl); savedBlobUrl = ''; } // 写回新图的 blob 释放
+  const freezeC = $('videoFreeze')?.querySelector('canvas');
+  if (freezeC) { freezeC.width = 0; freezeC.height = 0; } // 冻结帧位图一并丢弃
+  const badge0 = $('viewerZoomBadge');
+  badge0.textContent = '';
+  badge0.classList.add('hidden', 'opacity-0');
   // 注意：不碰音频模块 —— 音频独立播放，关闭预览后继续后台播放
   flushProgress();            // 关闭前落盘，保证下次续播
   setViewerSuspension(false); // 退出单一播放 → 文件区列表恢复播放
@@ -2564,25 +3284,39 @@ function closeViewer() {
   //  · 一般模式：退出播放全屏并恢复记录几何
   //  · 最大化：退出真全屏，Rust 自动恢复最大化
   //  · 全局全屏：不动窗口
+  let geoChanging = false; // 窗口尺寸将异步变化：滚动恢复推迟到几何稳定后的 settle
   if (viewerFsPrev === 'normal') {
     if (viewerFsActive && viewerSavedGeo) {
       viewerFsActive = false;
-      restoreViewerGeo();
+      geoChanging = true;
+      beginViewerGeoSettle();
+      restoreViewerGeo(); // 内含退出全屏 + setPosition/setSize，多次 resize
     } else {
       viewerFsActive = false;
     }
   } else if (viewerFsPrev === 'maximized') {
     viewerFsActive = false;
+    geoChanging = true;
+    beginViewerGeoSettle();
     invoke('toggle_fullscreen', { onlyExit: true }).catch(() => {});
   } else {
     viewerFsActive = false;
   }
+  syncFsDragBlock();
   state.viewerIndex = -1;
-  // 恢复进入预览前的画廊视口滚动位置
-  if (viewerSavedScroll) {
-    scroller.scrollTop = viewerSavedScroll.top;
-    scroller.scrollLeft = viewerSavedScroll.left;
-    viewerSavedScroll = null;
+  if (geoChanging) {
+    // 几何过渡路径：纯黑场瞬现并保留到窗口尺寸稳定，挡住"清媒体+窗口还原 normal"
+    // 的所有中间帧，settle 完成后才真正隐藏预览层
+    $('viewer').classList.add('viewer-cover');
+  } else {
+    $('viewer').classList.add('hidden');
+    $('viewer').classList.remove('viewer-cover');
+    // 尺寸不变：立即恢复滚动
+    if (viewerSavedScroll) {
+      scroller.scrollTop = viewerSavedScroll.top;
+      scroller.scrollLeft = viewerSavedScroll.left;
+      viewerSavedScroll = null;
+    }
   }
 }
 
@@ -2618,12 +3352,10 @@ async function takeScreenshot() {
   let data = null;   // PNG 字节数组（save_screenshot 入参）
   let kind = '';
 
-  // 1) 视频预览：提取原始分辨率帧（mpv 解码 canvas / HTML5 video 内禀尺寸）
+  // 1) 视频预览：提取 HTML5 video 内禀尺寸的原始分辨率帧
   if (item?.kind === 'video') {
     let srcCanvas = null;
-    if (mpvPlaying && videoCanvas && videoCanvas.width > 0) {
-      srcCanvas = videoCanvas;
-    } else if (vVideo && vVideo.videoWidth > 0) {
+    if (vVideo && vVideo.videoWidth > 0) {
       const c = document.createElement('canvas');
       c.width = vVideo.videoWidth;
       c.height = vVideo.videoHeight;
@@ -2779,12 +3511,14 @@ $('viewerStage').addEventListener('dblclick', (e) => {
 
 // L110/L112：点击舞台空白处、上部 1/4 或视频画面 → 拖动窗口。
 // 移动超过阈值才发起（不干扰双击全屏）；视频模式下 viewerVideo 铺满舞台，
-// 画面上的按住拖动即窗口拖动（mpv 原生子窗口区域事件不经过 webview，无法覆盖）。
+// 画面上的按住拖动即窗口拖动。
 let viewerWinDrag = null;
 $('viewerStage').addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
+  // 全屏（播放全屏/全局全屏/沉浸）下禁止拖动窗口：整屏窗口被拖出位置会露出桌面/破坏全屏
+  if (viewerFsActive || appFsActive || document.body.classList.contains('immersive')) return;
   if (e.target.closest('button, input, select, a, #videoBar, #viewerPlaylist, #viewerTopFloat, #imgDock')) return;
-  const onVideo = e.target === $('viewerVideo') || e.target === $('videoCanvas');
+  const onVideo = e.target === $('viewerVideo');
   if (!(e.target === $('viewerStage') || onVideo || inViewerUpper(e))) return;
   viewerWinDrag = { x: e.clientX, y: e.clientY };
 });
@@ -2825,6 +3559,7 @@ function zoomImageAt(e, factor) {
   imgTransform.tx += (z - nz) * px;
   imgTransform.ty += (z - nz) * py;
   applyImageTransform();
+  flashZoomBadge();
 }
 
 // ─── L35：鼠标按住拖动平移图片 ───
@@ -2957,6 +3692,7 @@ function setImageZoom(nz) {
   imgTransform.ty *= nz / z;
   imgTransform.zoom = nz;
   applyImageTransform();
+  flashZoomBadge();
 }
 $('imgZoomIn').addEventListener('click', () => zoomImageCenter(1.2));
 $('imgZoomOut').addEventListener('click', () => zoomImageCenter(1 / 1.2));
@@ -2964,6 +3700,7 @@ $('imgZoomReset').addEventListener('click', () => {
   // 仅复位缩放/平移，保留旋转与翻转
   imgTransform.zoom = 1; imgTransform.tx = 0; imgTransform.ty = 0;
   applyImageTransform();
+  flashZoomBadge();
 });
 $('imgZoomRange').addEventListener('input', (e) => setImageZoom(rangeToZoom(Number(e.target.value))));
 
@@ -3019,8 +3756,8 @@ function hideVideoBarSoon(ms = 1000) {
   clearTimeout(videoBarTimer);
   videoBarTimer = setTimeout(() => {
     const bar = $('videoBar');
-    const videoMode = !$('viewerVideo').classList.contains('hidden') || mpvPlaying;
-    const paused = mpvPlaying ? $('videoPlay').innerHTML === ICO_PLAY : vVideo.paused;
+    const videoMode = !$('viewerVideo').classList.contains('hidden');
+    const paused = vVideo.paused;
     if (bar.matches(':hover')) return;   // 悬浮在控制条上保持显示
     if (videoMode && paused) return;     // 暂停时常显
     bar.classList.remove('viewer-show');
@@ -3114,7 +3851,7 @@ $('viewer').addEventListener('mousemove', (e) => {
   // 顶部 56px 热区：关闭按钮
   if (e.clientY <= 56) showViewerTop(); else hideViewerTopSoon();
   // 底部 160px 热区：播放控制条
-  const videoMode = !$('viewerVideo').classList.contains('hidden') || mpvPlaying;
+  const videoMode = !$('viewerVideo').classList.contains('hidden');
   if (videoMode) { if (e.clientY >= h - 160) showVideoBar(); else hideVideoBarSoon(); }
   // L99：右侧边缘 40px 热区 → 播放列表
   if (e.clientX >= w - 40) showViewerPlaylist(); else hideViewerPlaylistSoon();
@@ -3165,7 +3902,7 @@ async function updateVideoInfoPanel() {
     const p = await invoke('get_media_props', { path, kind: item.kind });
     if (viewerItemPath() !== myPath || !viewerShowInfo) return; // 已切换文件
     const rows = [];
-    rows.push(['引擎', mpvPlaying ? 'mpv（原生渲染）' : 'HTML5 video']);
+    rows.push(['引擎', isWebPlayerActive() ? 'web-demuxer + MSE' : vVideo.src && vVideo.src.includes('/stream/') ? 'ffmpeg 硬件转码' : 'HTML5 video']);
     if (p.videoCodec) rows.push(['视频编码', p.videoCodec]);
     if (p.audioCodec) rows.push(['音频编码', p.audioCodec]);
     if (p.width && p.height) rows.push(['分辨率', `${p.width} × ${p.height}`]);
@@ -3178,7 +3915,7 @@ async function updateVideoInfoPanel() {
       `<div class="vi-row"><span class="vi-k">${k}</span><span class="vi-v">${escapeHtml(String(v))}</span></div>`
     ).join('');
     // L199：实时数据（实测帧率/丢帧，HTML5 播放时每秒刷新）
-    if (!mpvPlaying && item.kind === 'video') startInfoLiveTicker();
+    if (item.kind === 'video') startInfoLiveTicker();
     else stopInfoLiveTicker();
   } catch (e) {
     panel.innerHTML = `<div class="opacity-60">${escapeHtml(String(e))}</div>`;
@@ -4123,9 +4860,13 @@ function applyImageTransform() {
   if (flipV) parts.push('scaleY(-1)');
   viewerImg.style.transform = parts.join(' ');
   const badge = $('viewerZoomBadge');
-  const label = transformLabel();
-  badge.textContent = label;
-  badge.classList.toggle('hidden', !label);
+  // 缩放角标仅图片模式显示，且只在缩放操作时短暂闪现（flashZoomBadge），
+  // 这里只刷新文本，不主动点亮——切图/旋转/翻转都不会让它常驻
+  if (viewerCurKind !== 'image') {
+    badge.classList.add('hidden');
+  } else {
+    badge.textContent = transformLabel();
+  }
   // L233：同步竖排缩放条位置与停靠区「已缩放」态（拖动滑块时不回写，避免打架）
   const dock = $('imgDock');
   if (dock) dock.dataset.zoom = zoom > 1.01 ? '1' : '';
@@ -4137,6 +4878,21 @@ function applyImageTransform() {
 function resetImageTransform() {
   imgTransform = { rotate: 0, flipH: false, flipV: false, zoom: 1, tx: 0, ty: 0 };
   applyImageTransform();
+}
+
+// 缩放 OSD：仅缩放操作时短暂闪现，停止 1.1s 后淡出；连续操作持续挂起
+let zoomBadgeTimer = 0;
+let zoomBadgeHideTimer = 0;
+function flashZoomBadge() {
+  if (viewerCurKind !== 'image') return;
+  const badge = $('viewerZoomBadge');
+  badge.classList.remove('opacity-0', 'hidden');
+  clearTimeout(zoomBadgeTimer);
+  clearTimeout(zoomBadgeHideTimer);
+  zoomBadgeTimer = setTimeout(() => {
+    badge.classList.add('opacity-0');
+    zoomBadgeHideTimer = setTimeout(() => badge.classList.add('hidden'), 200);
+  }, 1100);
 }
 
 function transformLabel() {
@@ -4158,17 +4914,66 @@ function transformLabel() {
   return parts.join(' · ');
 }
 
-/** 图片右键的二级菜单项 */
+/** 图片右键的二级菜单项：旋转/翻转直接写回原图（一次解码一次编码）；
+ *  「重置变换」仅复位当前视图的预览变换，不动文件 */
 function imageTransformItems() {
-  const mutate = (fn) => () => { fn(); applyImageTransform(); };
+  const apply = (ops, okTip) => () => applyImageTransformToFile(ops, okTip);
   return [
-    { label: '向左旋转 90°', fn: mutate(() => { imgTransform.rotate = (imgTransform.rotate + 270) % 360; }) },
-    { label: '向右旋转 90°', fn: mutate(() => { imgTransform.rotate = (imgTransform.rotate + 90) % 360; }) },
-    { label: '旋转 180°', fn: mutate(() => { imgTransform.rotate = (imgTransform.rotate + 180) % 360; }) },
-    { label: '水平翻转', fn: mutate(() => { imgTransform.flipH = !imgTransform.flipH; }) },
-    { label: '垂直翻转', fn: mutate(() => { imgTransform.flipV = !imgTransform.flipV; }) },
-    { label: '重置变换', fn: mutate(() => { imgTransform = { rotate: 0, flipH: false, flipV: false, zoom: 1, tx: 0, ty: 0 }; }) },
+    { label: '向左旋转 90°', fn: apply(['rotate_ccw'], '已向左旋转 90° 并保存') },
+    { label: '向右旋转 90°', fn: apply(['rotate_cw'], '已向右旋转 90° 并保存') },
+    { label: '旋转 180°', fn: apply(['rotate_180'], '已旋转 180° 并保存') },
+    { label: '水平翻转', fn: apply(['flip_h'], '已水平翻转并保存') },
+    { label: '垂直翻转', fn: apply(['flip_v'], '已垂直翻转并保存') },
+    { label: '重置变换', fn: () => resetImageTransform() },
   ];
+}
+
+/** 把旋转/翻转写回原图（预览器菜单与文件区卡片菜单共用）。
+ *  OSD 提示：开始驻留「正在处理…」，完成/失败后替换并自动淡出。 */
+async function applyImageTransformToFile(ops, okTip) {
+  const idx = state.viewerIndex;
+  const item = state.filtered[idx];
+  if (!item || item.kind !== 'image') return;
+  showTopToast('正在处理…', 0); // 驻留，完成或失败时替换
+  try {
+    const ret = await invoke('transform_image', { path: item.path, ops });
+    if (ret?.width && ret?.height && (item.width !== ret.width || item.height !== ret.height)) {
+      item.width = ret.width;
+      item.height = ret.height;
+      state.galleryVer++;
+      const t = state.thumbCache.get(thumbKey(item.path));
+      if (t) { t.w = ret.width; t.h = ret.height; }
+    }
+    // 前端缩略图缓存失效（Rust 端 hash 含 mtime 自动换新 key，旧缓存文件已由后端清理）
+    for (const k of [...state.thumbCache.keys()]) {
+      if (k === item.path || k.startsWith(item.path + '\u0000')) state.thumbCache.delete(k);
+    }
+    // 破 WebView 缓存：预载池当前项作废，新图强制绕缓存取回后换出（无白屏）
+    imgBust = `?t=${Date.now()}`;
+    const stale = viewerImgPool.get(idx);
+    if (stale) { stale.src = ''; viewerImgPool.delete(idx); }
+    await revealSavedImage(item, idx);
+    resetImageTransform();
+    showTopToast(okTip); // 约 1.2 秒自动淡出
+  } catch (err) {
+    showTopToast(`处理失败：${err}`, 3500);
+  }
+}
+
+/** 写回后无白屏换出新图：asset 协议对 ?t= 破缓存不可靠（WebView 可能仍命中旧图），
+ *  改用 fetch cache:'reload' 强制绕过缓存取回新字节 → blob URL 显示，绝对刷新。
+ *  同时把 blob 图放入预载池，切换邻居再切回也显示新图。失败时抛出由调用方统一提示。 */
+async function revealSavedImage(item, idx) {
+  if (savedBlobUrl) { URL.revokeObjectURL(savedBlobUrl); savedBlobUrl = ''; }
+  const resp = await fetch(convertFileSrc(item.path), { cache: 'reload' });
+  if (!resp.ok) throw new Error(`重新加载图片失败: HTTP ${resp.status}`);
+  const blob = await resp.blob();
+  savedBlobUrl = URL.createObjectURL(blob);
+  const im = new Image();
+  im.decoding = 'async';
+  im.onload = () => { if (state.viewerIndex === idx) viewerImg.src = savedBlobUrl; };
+  im.src = savedBlobUrl;
+  viewerImgPool.set(idx, im);
 }
 
 // ═══════════════ 自定义右键菜单（按实际区域） ═══════════════
@@ -4249,8 +5054,11 @@ function showSubmenu(anchor, items) {
 function hideCtxMenu() { ctxMenu.classList.add('hidden'); hideSubmenu(); }
 
 
-// 点击其它区域 / 滚动 / Esc 时关闭
-window.addEventListener('mousedown', (e) => { if (!ctxMenu.contains(e.target)) hideCtxMenu(); });
+// 点击其它区域 / 滚动 / Esc 时关闭（ctxSub 是 ctxMenu 的兄弟元素，必须一并豁免，
+// 否则 mousedown 会先隐藏子菜单，click 的 mousedown/mouseup 目标失去共同祖先，选项点击永远无效）
+window.addEventListener('mousedown', (e) => {
+  if (!ctxMenu.contains(e.target) && !ctxSub.contains(e.target)) hideCtxMenu();
+});
 window.addEventListener('blur', () => {
   hideCtxMenu();
   endMarquee();           // 鼠标移出窗口松开时不会收到 mouseup
@@ -4476,11 +5284,17 @@ async function deleteSelection(permanent = false) {
 /** 重新扫描当前目录（文件操作后刷新，筛选/排序保留） */
 async function refreshCurrentDir() {
   if (!state.currentDir) return;
+  const seq = ++dirChunkSeq;
+  dirChunkDone = false;
+  state.items = [];
   try {
-    state.items = await invoke('list_directory', { path: state.currentDir });
+    await invoke('list_directory_stream', { path: state.currentDir, deep: false, seq });
   } catch (e) {
+    if (seq !== dirChunkSeq) return;
     setStatus(String(e), true);
   }
+  if (seq !== dirChunkSeq) return; // 期间已切换/刷新目录：本次作废
+  dirChunkDone = true;
   applyFilter(); // 内部会重置选择并重绘
 }
 
@@ -4613,12 +5427,13 @@ function selectedPaths() {
     .filter(Boolean);
 }
 
-/** 卡片菜单里的翻转项：先打开预览，再施加变换 */
+/** 卡片菜单里的翻转项：先打开预览，再写回原图（写回完成前 openViewer 的
+ *  显示分支可能稍后执行，必须 await 它，否则会覆盖换图竞态） */
 function imageTransformItemsFor(idx) {
   return imageTransformItems().map((it) => ({
     label: it.label,
-    fn: () => {
-      if ($('viewer').classList.contains('hidden') || state.viewerIndex !== idx) openViewer(idx);
+    fn: async () => {
+      if ($('viewer').classList.contains('hidden') || state.viewerIndex !== idx) await openViewer(idx);
       it.fn();
     },
   }));
@@ -4780,6 +5595,9 @@ function applyViewMode() {
   document.querySelectorAll('.viewBtn').forEach((b) =>
     b.classList.toggle('active', b.dataset.view === (state.cfg?.viewMode ?? 'grid')));
   $('zoomSlider').value = activeThumbSize(); // L80：切视图后滑块同步到该视图的缩放状态
+  // 「算法」按钮仅画廊视图显示
+  $('btnLayout').classList.toggle('hidden', state.cfg?.viewMode !== 'gallery');
+  $('layoutPop').classList.add('hidden');
   renderVirtual();
   saveCfg();
 }
@@ -4810,7 +5628,7 @@ $('zoomSlider').addEventListener('input', (e) => {
   saveCfg();
 });
 
-// L70/L80：Ctrl+滚轮缩放——图标与画廊视图均生效（步进 20，范围 60–800），同步滑块
+// L70/L80：Ctrl+滚轮缩放——图标与画廊视图均生效（步进 20，范围见设置「缩放范围」），同步滑块
 let wheelColTransitionT = null;
 scroller.addEventListener('wheel', (e) => {
   if (!(e.ctrlKey || e.metaKey)) return;
@@ -4818,7 +5636,7 @@ scroller.addEventListener('wheel', (e) => {
   if (mode !== 'grid' && mode !== 'gallery') return;
   e.preventDefault();
   const cur = activeThumbSize();
-  const nz = Math.min(800, Math.max(60, cur + (e.deltaY < 0 ? 20 : -20)));
+  const nz = Math.min(zoomMax(), Math.max(zoomMin(), cur + (e.deltaY < 0 ? 20 : -20)));
   if (nz === cur) return;
   setActiveThumbSize(nz);
   $('zoomSlider').value = nz;
@@ -4963,6 +5781,7 @@ async function setImmersive(on) {
       invoke('toggle_fullscreen', { onlyExit: true }).catch(() => {});
     }
   }
+  syncFsDragBlock();
   renderVirtual(); // 文件区尺寸变化 → 重算列数/行高
 }
 
@@ -5227,7 +6046,7 @@ window.addEventListener('keydown', (e) => {
       }
       return;
     }
-    const isVideo = !$('viewerVideo').classList.contains('hidden') || mpvPlaying;
+    const isVideo = !$('viewerVideo').classList.contains('hidden');
     if (e.code === 'Space') { if (isVideo) toggleVideoPlay(); e.preventDefault(); return; }
     // L129/L136：F 在预览器内 = 播放全屏统一入口
     if (e.key.toLowerCase() === 'f') { viewerFullscreenAction(); e.preventDefault(); return; }
@@ -5253,10 +6072,14 @@ window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
     if ((k === 'q' || k === 'e') && isVideo) {
       const step = Number(state.cfg?.videoSeekStep ?? 10);
-      const curPos = mpvPlaying ? mpvPosition : (vVideo.currentTime || 0);
-      const target = k === 'q' ? Math.max(0, curPos - step) : curPos + step;
-      if (mpvPlaying) mpvCtl('seek', target);
-      else if (vVideo.duration) vVideo.currentTime = Math.min(target, vVideo.duration);
+      const dur = tcDur();
+      const curPos = tcTimeline ? tcCur() : (vVideo.currentTime || 0);
+      const target = Math.max(0, curPos + (k === 'q' ? -step : step));
+      if (tcTimeline) {
+        if (dur) seekTranscode(Math.min(target, dur - 0.5)); // 转码流：重启转码跳转
+      } else if (vVideo.duration) {
+        vVideo.currentTime = Math.min(target, vVideo.duration);
+      }
       e.preventDefault(); return;
     }
     return;
@@ -5343,6 +6166,7 @@ function moveSel(dx, dy) {
 
 // ═══════════════ 滚动监听 ═══════════════
 let rafPending = false;
+let galleryPrefetchLast = 0;
 scroller.addEventListener('scroll', () => {
   // L37：滚动中不暂停仍在视野内的预览；
   // rAF 内仅暂停已完全离开视野的视频，停止 250ms 后对齐可见性
@@ -5350,9 +6174,16 @@ scroller.addEventListener('scroll', () => {
     rafPending = true;
     requestAnimationFrame(() => {
       rafPending = false;
-      renderVirtual();
+      // 预览器退出的窗口几何过渡中：不按中间尺寸重排，等 settle 统一处理
+      if (!viewerGeoPending) renderVirtual();
       pauseOffscreenPreviews();
     });
+  }
+  // 连续快滑时也持续向前后建预载池（500ms 节流；函数内部自行去重/判断视图）
+  const now = performance.now();
+  if (now - galleryPrefetchLast > 500) {
+    galleryPrefetchLast = now;
+    prefetchGallerySizes();
   }
 });
 // resize 节流：拖动窗口边框/最大化切换会高频触发 resize，每次重建 DOM + IPC
@@ -5360,6 +6191,13 @@ scroller.addEventListener('scroll', () => {
 let resizeT = null;
 let resizeRafPending = false;
 window.addEventListener('resize', () => {
+  // 预览器退出导致的全屏→最大化/还原过渡：抑制所有中间尺寸重排，
+  // 只刷新"静默计时器"，尺寸稳定 130ms 后由 settle 做唯一一次布局+滚动恢复
+  if (viewerGeoPending) {
+    clearTimeout(viewerGeoQuietTimer);
+    viewerGeoQuietTimer = setTimeout(finishViewerGeoSettle, 130);
+    return;
+  }
   // rAF 内做 DOM 重建，避免阻塞 resize 事件本身
   if (!resizeRafPending) {
     resizeRafPending = true;
@@ -5430,6 +6268,11 @@ function syncSettingsUI() {
   $('setOverscan').value = c.overscan ?? 2;
   $('setGalleryGap').value = c.galleryGap ?? 14; // L156
   $('setGalleryGapVal').textContent = (c.galleryGap ?? 14) + 'px';
+  $('setGalleryLayout').value = ['justified','optimal','natural','masonry','balanced','hero'].includes(c.galleryLayout) ? c.galleryLayout : 'justified';
+  $('setZoomMin').value = c.zoomMin ?? 60;
+  $('setZoomMax').value = c.zoomMax ?? 240;
+  applyZoomRange();
+  $('setMediaOnly').classList.toggle('on', c.mediaOnly !== false); // 默认开：仅显示媒体文件
   $('setGalleryScrollStep').value = Math.round((c.galleryScrollStep ?? 0.05) * 100);
   $('setGalleryScrollStepVal').textContent = Math.round((c.galleryScrollStep ?? 0.05) * 100) + '%';
   $('setDblClick').value = c.doubleClickAction ?? 'viewer';
@@ -5694,6 +6537,13 @@ $('setListMeta').addEventListener('click', (e) => {
   renderVirtual();
   saveCfg();
 });
+// 仅显示媒体文件：关闭后重扫当前目录，非媒体文件按资源管理器方式列出（画廊视图不受影响）
+$('setMediaOnly').addEventListener('click', (e) => {
+  state.cfg.mediaOnly = !(state.cfg.mediaOnly !== false);
+  e.target.classList.toggle('on', state.cfg.mediaOnly);
+  saveCfg();
+  if (state.currentDir) openDirectory(state.currentDir);
+});
 $('setCacheDirPick').addEventListener('click', async () => {
   try {
     state.cfg.cacheDir = await invoke('pick_cache_dir');
@@ -5720,6 +6570,63 @@ $('setOverscan').addEventListener('input', (e) => {
   renderVirtual();
   saveCfg();
 });
+$('setGalleryLayout').addEventListener('change', (e) => {
+  state.cfg.galleryLayout = e.target.value;
+  if (state.cfg?.viewMode === 'gallery') layoutGalleryNow(); // 方案切换即时重排
+  saveCfg();
+});
+// 缩放范围：改动后收拢当前值并即时应用到滑块与滚轮
+for (const id of ['setZoomMin', 'setZoomMax']) {
+  $(id).addEventListener('change', () => {
+    let zmin = Math.max(40, Math.min(400, Number($('setZoomMin').value) || 60));
+    let zmax = Math.max(120, Math.min(1600, Number($('setZoomMax').value) || 240));
+    if (zmax <= zmin) zmax = zmin + 40;
+    state.cfg.zoomMin = zmin; state.cfg.zoomMax = zmax;
+    $('setZoomMin').value = zmin; $('setZoomMax').value = zmax;
+    applyZoomRange();
+    if (state.cfg?.viewMode === 'gallery') layoutGalleryNow(); else renderVirtual();
+    saveCfg();
+  });
+}
+// ═══ 排列算法弹出面板（画廊缩放滑块右侧「算法」按钮） ═══
+const LAYOUT_ALGOS = [
+  ['justified', '对齐行', '每行等高，按比例缩放正好填满整行'],
+  ['optimal', '视口最优化', '动态规划断行，各行缩放贴近原始尺寸，末行一并纳入优化'],
+  ['natural', '自然行', '不放大，按基准尺寸左对齐排满换行'],
+  ['masonry', '瀑布流', '列宽固定，按真实比例依次填入最矮列'],
+  ['balanced', '平衡瀑布流', '瀑布流基础上修正列高，各列底部更整齐'],
+  ['hero', '行首大图', '行首卡片放大，其余卡片缩放适配正好填满整行'],
+];
+function renderLayoutPop() {
+  const cur = state.cfg?.galleryLayout ?? 'justified';
+  $('layoutPop').innerHTML = LAYOUT_ALGOS.map(([v, n, d]) => `
+    <button data-layout="${v}" class="${v === cur ? 'cur' : ''}">
+      <div class="lp-name">${n}</div><div class="lp-desc">${d}</div>
+    </button>`).join('');
+}
+$('btnLayout').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const pop = $('layoutPop');
+  if (!pop.classList.contains('hidden')) { pop.classList.add('hidden'); return; }
+  renderLayoutPop();
+  pop.classList.remove('hidden');
+});
+$('layoutPop').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-layout]');
+  if (!btn) return;
+  state.cfg.galleryLayout = btn.dataset.layout;
+  $('setGalleryLayout').value = btn.dataset.layout; // 设置面板同步
+  layoutGalleryNow();
+  saveCfg();
+  $('layoutPop').classList.add('hidden');
+});
+document.addEventListener('click', (e) => {
+  const pop = $('layoutPop');
+  if (pop.classList.contains('hidden')) return;
+  if (e.target.closest('#layoutPop') || e.target.closest('#btnLayout')) return;
+  pop.classList.add('hidden');
+});
+
 // L156：画廊卡片间隔（默认 14px = 调整前的现状）
 $('setGalleryGap').addEventListener('input', (e) => {
   const v = Math.max(4, Math.min(32, Number(e.target.value) || 14));
@@ -5849,18 +6756,20 @@ function setStatus(msg, isErr = false) {
 
 /** 顶部短暂文字提示（截图等操作后显示，约 1.2 秒后淡出） */
 let topToastTimer = null;
-function showTopToast(msg) {
-  // 预览器打开时显示在预览器内部顶部，否则显示在主窗口顶部
+function showTopToast(msg, duration = 1200) {
+  // 预览器打开时显示在预览器内部顶部，否则显示在主窗口顶部；duration<=0 驻留不自动消失
   const el = !$('viewer').classList.contains('hidden') ? $('viewerToast') : $('topToast');
   if (!el) return;
   el.textContent = msg;
   el.classList.remove('hidden');
   el.style.opacity = '1';
   if (topToastTimer) clearTimeout(topToastTimer);
-  topToastTimer = setTimeout(() => {
-    el.style.opacity = '0';
-    setTimeout(() => el.classList.add('hidden'), 300);
-  }, 1200);
+  if (duration > 0) {
+    topToastTimer = setTimeout(() => {
+      el.style.opacity = '0';
+      setTimeout(() => el.classList.add('hidden'), 300);
+    }, duration);
+  }
 }
 
 function kindIcon(kind) {
@@ -5868,6 +6777,7 @@ function kindIcon(kind) {
   if (kind === 'folder') return svg('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>');
   if (kind === 'image') return svg('<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="M21 15l-5-5-9 9"/>');
   if (kind === 'video') return svg('<polygon points="6 3 20 12 6 21 6 3"/>');
+  if (kind === 'other') return svg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>');
   return svg('<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>');
 }
 
@@ -5881,7 +6791,7 @@ function kindOf(path) {
 }
 
 function kindLabel(kind) {
-  return kind === 'folder' ? '文件夹' : kind === 'image' ? '图片' : kind === 'video' ? '视频' : '音频';
+  return { folder: '文件夹', image: '图片', video: '视频', audio: '音频', other: '文件' }[kind] ?? '文件';
 }
 
 
@@ -6045,6 +6955,118 @@ async function perfEnsureVideo(path) {
   return e;
 }
 
+/** 为表演视频创建悬浮控制条（不绑定任何 v 级监听器；更新由 perfAttachCtrl 单例驱动）。
+ *  返回 { wrap, ctrl }：wrap 是透明热区，只有鼠标移到它（=控制条所在的底部区域）上才展开 ctrl。 */
+function makePerfCtrl(v) {
+  const wrap = document.createElement('div');
+  wrap.className = 'perf-ctrl-wrap';
+  wrap.innerHTML = `
+    <div class="card-ctrl perf-ctrl">
+      <div class="player-seek">
+        <div class="player-seek-fill"></div>
+        <div class="player-seek-knob"></div>
+      </div>
+      <div class="card-ctl-row">
+        <button class="card-ctl-btn" title="静音"></button>
+        <input type="range" min="0" max="100" value="0" class="player-vol card-vol" title="音量" />
+      </div>
+    </div>`;
+  const ctrl = wrap.querySelector('.card-ctrl');
+
+  const seek = ctrl.querySelector('.player-seek');
+  const fill = ctrl.querySelector('.player-seek-fill');
+  const knob = ctrl.querySelector('.player-seek-knob');
+  const muteBtn = ctrl.querySelector('.card-ctl-btn');
+  const vol = ctrl.querySelector('.card-vol');
+
+  const syncMuteIcon = () => { muteBtn.innerHTML = (v.muted || v.volume === 0) ? CARD_VOL_OFF : CARD_VOL_ON; };
+
+  const setFromPointer = (e) => {
+    const r = seek.getBoundingClientRect();
+    const p = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    if (v.duration) { try { v.currentTime = p * v.duration; } catch { /* 忽略 */ } }
+    fill.style.width = p * 100 + '%';
+    knob.style.left = p * 100 + '%';
+  };
+  let dragging = false;
+  seek.addEventListener('pointerdown', (e) => { dragging = true; seek.setPointerCapture(e.pointerId); setFromPointer(e); });
+  seek.addEventListener('pointermove', (e) => { if (dragging) setFromPointer(e); });
+  seek.addEventListener('pointerup', () => { dragging = false; });
+  seek.addEventListener('pointercancel', () => { dragging = false; });
+
+  vol.addEventListener('input', () => {
+    v.volume = Number(vol.value) / 100;
+    v.muted = vol.value === '0';
+    syncMuteIcon();
+  });
+  muteBtn.addEventListener('click', () => {
+    v.muted = !v.muted;
+    if (!v.muted && v.volume === 0) { v.volume = 0.5; vol.value = 50; }
+    vol.value = v.muted ? 0 : Math.round(v.volume * 100);
+    syncMuteIcon();
+  });
+  vol.value = v.muted ? 0 : Math.round(v.volume * 100);
+  syncMuteIcon();
+
+  // 控制条操作不穿透到表演卡片
+  for (const ev of ['pointerdown', 'click', 'dblclick']) ctrl.addEventListener(ev, (e) => e.stopPropagation());
+  return { wrap, ctrl };
+}
+
+/**
+ * 为表演视频挂载悬浮控制条（进度/音量），进度与画廊、全屏查看器共享同一份记录。
+ * 视频元素在池中复用，控制条跟随视频在不同模式的容器间移动。
+ */
+function perfAttachCtrl(v, path, host) {
+  // 摘掉挂在旧容器里的热区+控制条（卡片快切/视频换槽）
+  v._perfWrap?.remove();
+  v._perfWrap = null;
+  v._perfCtrl = null;
+  const { wrap, ctrl } = makePerfCtrl(v);
+  host.appendChild(wrap);
+  v._perfWrap = wrap;
+  v._perfCtrl = ctrl;
+
+  // 全局卡片音量（与画廊一致）；静音跟随表演设置，用户可用按钮临时解除
+  v.volume = Math.min(1, Math.max(0, (state.cfg?.cardVolume ?? 20) / 100));
+
+  // 每个池内视频只绑一次监听器（防止卡片快切上百帧后监听器堆积）：
+  // timeupdate 同时驱动外部进度记录与「当前控制条」UI；ctrl 每帧重建，通过 v._perfCtrl 现取现用
+  if (!v._perfBound) {
+    v._perfBound = true;
+    let lastTick = 0;
+    v.addEventListener('timeupdate', () => {
+      // 控制条进度（高频也要流畅，但只操作 DOM 样式）
+      const c = v._perfCtrl;
+      if (c && v.duration) {
+        const p = v.currentTime / v.duration;
+        c.querySelector('.player-seek-fill').style.width = p * 100 + '%';
+        c.querySelector('.player-seek-knob').style.left = p * 100 + '%';
+      }
+      // 外部进度记录 1s 节流（落盘/跨模式同步用）
+      const now = performance.now();
+      if (now - lastTick < 1000) return;
+      lastTick = now;
+      progressSet(v._perfPath || path, v.currentTime);
+    });
+  }
+  v._perfPath = path;
+
+  // 续播 seek 只在该视频本次表演会话的首次展示执行一次；
+  // 之后随卡片快切重新挂载/视频循环都不能再拉回旧位置
+  if (!v._perfSeeked) {
+    v._perfSeeked = true;
+    const seekToSaved = () => {
+      const saved = progressGet(path);
+      if (saved > 0 && v.duration > 0 && saved < v.duration - 0.5 && Math.abs(v.currentTime - saved) > 2) {
+        try { v.currentTime = saved; } catch { /* 忽略 */ }
+      }
+    };
+    if (v.readyState >= 1) seekToSaved();
+    else v.addEventListener('loadedmetadata', seekToSaved, { once: true });
+  }
+}
+
 /** 把视频挂进展示容器并起播（命中池则同步挂载，零加载延迟；未命中走异步兜底） */
 function perfShowVideo(path, host) {
   const attach = (e) => {
@@ -6055,6 +7077,8 @@ function perfShowVideo(path, host) {
     e.v.removeAttribute('style');
     e.v.muted = perfCfg().mute !== false;
     if (e.v.parentElement !== host) host.appendChild(e.v);
+    // 悬浮控制条（进度/音量），与外部进度记录同步
+    perfAttachCtrl(e.v, path, host);
     // 就绪检查：readyState>=2 有当前帧数据才能播；否则等 canplay 再起播，避免黑屏
     const markReady = () => e.v.classList.add('ready');
     if (e.v.readyState >= 2) {
@@ -6172,6 +7196,12 @@ function exitPerf() {
   // 恢复视野内画廊预览播放
   scheduleAutoPreviews();
 }
+
+// 托盘右键菜单「表演模式」：进行中则退出，未开始则按上次配置进入
+listen('tray-perf', () => {
+  if (perf.active) exitPerf();
+  else enterPerf();
+});
 
 function togglePerfPause() {
   perf.paused = !perf.paused;
@@ -7022,9 +8052,16 @@ async function swapSlide(slot, list, forcedItem) {
   }
   const old = slot.querySelector('.slide-img');
   if (old) {
-    if (old.tagName === 'VIDEO') old.remove();          // 池视频：立即脱离，随后统一暂停
+    if (old.tagName === 'VIDEO') {
+      old._perfWrap?.remove();
+      old._perfWrap = null;
+      old._perfCtrl = null;
+      old.remove();          // 池视频：立即脱离，随后统一暂停
+    }
     else { old.classList.add('leave'); setTimeout(() => old.remove(), dur + 100); }
   }
+  // 清掉槽位里可能残留的旧热区/控制条（视频→图片切换等情况）
+  slot.querySelector('.perf-ctrl-wrap')?.remove();
   media.removeAttribute('style');
   media.className = `slide-img fx-${fx}`;
   // Ken Burns 类动画时长 = 停留时长（缓慢运镜）；其余 = 过渡时长
@@ -7039,6 +8076,8 @@ async function swapSlide(slot, list, forcedItem) {
   slot.dataset.path = item.path;
   if (item.kind === 'video') {
     media.muted = c.mute !== false;
+    // 悬浮控制条（进度/音量），与画廊/全屏查看器进度同步
+    perfAttachCtrl(media, item.path, slot);
     media.play().catch(() => {});
   }
 }
@@ -7227,7 +8266,10 @@ function renderCover() {
         else pv.addEventListener('loadedmetadata', fit, { once: true });
       }
     } else if (card.isVideo && !atCenter && hasV) {
-      card.inner.querySelector('video').remove(); // 脱离即由 perfPauseDetached 暂停
+      const pv = card.inner.querySelector('video');
+      pv?._perfWrap?.remove();
+      if (pv) { pv._perfWrap = null; pv._perfCtrl = null; }
+      pv?.remove(); // 脱离即由 perfPauseDetached 暂停
       card.img.style.display = '';
     }
     coverApplySize(card, card.ar, atCenter);

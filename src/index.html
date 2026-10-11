@@ -6,12 +6,12 @@
   <title>Rainver 落雨影音</title>
 
   <!-- CSP 安全策略：仅允许自身脚本与样式
-       connect-src 里必须放行 rvframe.localhost：视频画面是走自定义协议 + fetch 取的，
-       少了这一条 fetch 会被浏览器当场拦掉。meta 里的 CSP 和 tauri.conf.json 里的 CSP
-       是「取交集」，两边都得放行，所以两处都要改。 -->
+       media-src 必须放行 http://127.0.0.1:*：转码流是 <video> 直连本地文件服务器的
+       /stream/<id>，少了这条视频会被浏览器当场拦掉（表现为预览器空白、无报错）。
+       meta 里的 CSP 和 tauri.conf.json 里的 CSP 是「取交集」，两边都得放行，所以两处都要改。 -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://rvframe.localhost; img-src 'self' asset: http://asset.localhost https://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
-  <link rel="stylesheet" href="style.css?v=43" />
+        content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https://asset.localhost http://127.0.0.1:* http://localhost:*; img-src 'self' asset: http://asset.localhost https://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob: http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob: data:" />
+  <link rel="stylesheet" href="style.css?v=53" />
 </head>
 <body class="h-screen w-screen overflow-hidden select-none bg-transparent text-slate-800 dark:text-slate-200">
 
@@ -153,13 +153,17 @@
 
     <!-- ─────── 中部：媒体区 ─────── -->
     <main class="flex-1 flex flex-col min-w-0">
-      <!-- 标签页：每个标签 = 一个目录 -->
-      <div id="tabBar" class="h-9 shrink-0 flex items-center gap-1 px-2 overflow-x-auto
+      <!-- 标签页：每个标签 = 一个目录；搜索框固定最右侧（不随标签滚动） -->
+      <div id="tabBar" class="h-9 shrink-0 flex items-center gap-2 px-2
                               border-b border-white/20 dark:border-white/5">
-        <div id="tabList" class="flex items-center gap-1 shrink-0"></div>
-        <button id="btnNewTab" title="新建标签页（选择文件夹）" class="tab-add shrink-0">
-          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
+        <div class="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto">
+          <div id="tabList" class="flex items-center gap-1 shrink-0"></div>
+          <button id="btnNewTab" title="新建标签页（选择文件夹）" class="tab-add shrink-0">
+            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+        <!-- 搜索（移至标签栏最右侧） -->
+        <input id="searchInput" type="text" placeholder="搜索… (Ctrl+F)" class="tool-search w-36 shrink-0" />
       </div>
 
       <!-- 工具栏 -->
@@ -176,9 +180,6 @@
         </button>
         <!-- 面包屑 -->
         <div id="breadcrumb" class="flex-1 flex items-center gap-0.5 text-xs overflow-x-auto whitespace-nowrap opacity-80"></div>
-
-        <!-- 搜索（L256：移至自动播放按钮左侧） -->
-        <input id="searchInput" type="text" placeholder="搜索… (Ctrl+F)" class="tool-search w-36" />
 
         <!-- L123：自动播放开关（线框+中间透明，点亮显关键色） -->
         <button id="btnAutoplay" title="自动播放" class="tool-ico">
@@ -209,9 +210,14 @@
           <button data-view="list"   class="viewBtn">列表</button>
           <button data-view="gallery" class="viewBtn">画廊</button>
         </div>
-        <!-- 画廊缩放滑块 --> 
-        <input id="zoomSlider" type="range" min="60" max="200" value="160" step="10"
-               class="w-24" title="缩略图大小" />
+        <!-- 画廊缩放滑块 + 排列算法（仅画廊视图显示） -->
+        <div class="relative flex items-center gap-1 shrink-0">
+          <input id="zoomSlider" type="range" min="60" max="240" value="160" step="10"
+                 class="w-24" title="缩略图大小" />
+          <button id="btnLayout" title="画廊排列算法" class="tool-ico tool-text hidden">算法</button>
+          <!-- 弹出式算法面板：显示全部算法描述（非下拉，避免空间不足） -->
+          <div id="layoutPop" class="hidden absolute right-0 top-full mt-1.5 z-50 w-64 layout-pop"></div>
+        </div>
         <!-- 信息面板开关 -->
         <button id="btnInfoPanel" title="元信息面板 (Ctrl+I)" class="tool-ico">
           <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M12 11v5"/></svg>
@@ -295,30 +301,16 @@
       </button>
       <img id="viewerImg" draggable="false" class="hidden max-w-full max-h-full object-contain rounded-lg" alt="" />
       <video id="viewerVideo" crossorigin="anonymous" class="hidden max-w-full max-h-full rounded-lg"></video>
-      <!-- 视频画面：ffmpeg 解码成裸 RGBA 字节，经 rvframe:// 协议送到这里 putImageData。
-           注意不能用 max-w-full/max-h-full：那只「不放大」，canvas 的固有尺寸就是解码
-           尺寸（默认 1280x720），全屏时它会死死卡在 1280x720 不跟着长，
-           表现就是「视频不全屏」。铺满舞台 + object-fit:contain 才对（见 input.css）。 -->
-      <canvas id="videoCanvas" class="hidden"></canvas>
-
-      <!-- 缓冲提示浮层：画面管线攒够预缓冲、音频还压着没起步时显示。
-           必须是浮层而不是状态栏文字——状态栏会被其它消息（hwaccel 告警、
-           拖动进度等）立刻覆盖掉，用户根本看不到「正在缓冲」。
-           data-state 供 CSS 做进度条与呼吸动画的钩子。 -->
-      <div id="videoBufOverlay" class="hidden absolute inset-0 z-30 flex-col items-center
-                  justify-center gap-3 backdrop-blur-[2px] pointer-events-none select-none">
-        <div class="flex flex-col items-center gap-3">
-          <div class="w-9 h-9 rounded-full border-[3px] border-white/25 border-t-white
-                      animate-spin"></div>
-          <div id="videoBufText" class="text-white/90 text-sm font-medium">缓冲中...</div>
-          <div class="w-40 h-1 rounded-full bg-white/20 overflow-hidden">
-            <div id="videoBufBar" class="h-full w-0 rounded-full bg-white/80 transition-[width] duration-150"></div>
-          </div>
-        </div>
+      <!-- 视频切换冻结帧：切换前把当前帧 drawImage 到这层 canvas 盖住舞台，
+           新视频 canplay 后再移除，视觉上旧帧完全保留，切换 0 黑屏 -->
+      <div id="videoFreeze" class="hidden absolute inset-0 z-[6] items-center justify-center pointer-events-none">
+        <canvas class="max-w-full max-h-full object-contain rounded-lg"></canvas>
       </div>
+      <!-- 辅助音轨：web-demuxer 不支持的音轨经 ffmpeg 转码为 AAC 后由此播放，与视频同步 -->
+      <audio id="viewerAudio" class="hidden"></audio>
 
-      <!-- 图片缩放信息 -->
-      <span id="viewerZoomBadge" class="hidden absolute top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full
+      <!-- 图片缩放信息（仅缩放操作时短暂闪现） -->
+      <span id="viewerZoomBadge" class="hidden opacity-0 transition-opacity duration-200 absolute top-3 left-1/2 -translate-x-1/2 z-20 px-3 py-1 rounded-full
                  bg-black/60 text-white/80 text-xs backdrop-blur pointer-events-none"></span>
 
       <!-- L233/L248：图片右下角停靠区：缩放总览图 + 竖排缩放控制条（最右侧，悬浮显示） -->
@@ -652,6 +644,25 @@
             <input id="setVideoAutoplayN" type="number" min="0" max="64" step="1" class="settingsInput w-20" />
           </div>
           <div class="settingsRow">
+            <label>卡片排列方案</label>
+            <select id="setGalleryLayout" class="settingsSelect">
+              <option value="justified">对齐行（等高填满整行）</option>
+              <option value="optimal">视口最优化（断行最匀，横竖图兼顾）</option>
+              <option value="natural">自然行（不放大，左对齐）</option>
+              <option value="masonry">瀑布流（定宽，顺序填最矮列）</option>
+              <option value="balanced">平衡瀑布流（列高均衡修正）</option>
+              <option value="hero">行首大图（首卡放大，其余匹配）</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>缩放范围（滑块最小 / 最大值）</label>
+            <div class="flex items-center gap-2">
+              <input id="setZoomMin" type="number" min="40" max="400" step="10" class="settingsInput w-20" title="最小值" />
+              <span class="text-xs opacity-60">~</span>
+              <input id="setZoomMax" type="number" min="120" max="1600" step="20" class="settingsInput w-20" title="最大值" />
+            </div>
+          </div>
+          <div class="settingsRow">
             <label>画廊卡片间隔</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
               <input id="setGalleryGap" type="range" min="4" max="32" step="2" class="w-48" />
@@ -741,6 +752,10 @@
           <div class="settingsRow">
             <label>列表视图显示 修改时间 / 分辨率 / 时长</label>
             <button id="setListMeta" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>仅显示媒体文件（关闭后列出其他文件，画廊视图不受影响）</label>
+            <button id="setMediaOnly" class="settingsToggle"></button>
           </div>
         </div>
 
@@ -1111,6 +1126,6 @@
   <!-- 画廊表演：模式2 卡片动画的全屏覆盖层（视口定格，卡片快切） -->
   <div id="perfOverlay" class="hidden fixed inset-0 z-[56] overflow-hidden"></div>
 
-  <script src="main.js?v=45" type="module"></script>
+  <script src="main.js?v=88" type="module"></script>
 </body>
 </html>

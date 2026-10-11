@@ -5,8 +5,12 @@
 //   缓存目录: 默认 %APPDATA，可在设置中更改；支持统计/清理/LRU 淘汰
 // ═══════════════════════════════════════════════════════
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::io::Read;
 use serde::Serialize;
+use tauri::Emitter;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -394,6 +398,619 @@ fn part_path(out: &Path) -> PathBuf {
     out.with_extension("part")
 }
 
+// ─── 本地文件 HTTP 服务器 ───
+/// web-demuxer 的 worker（data URL，origin=null）无法通过 Tauri asset 协议访问文件，
+/// 因此启动一个本地 HTTP 服务器提供文件访问（支持 Range）。
+static FILE_SERVER_PORT: OnceLock<u16> = OnceLock::new();
+
+#[tauri::command]
+pub fn get_file_server_port() -> u16 {
+    *FILE_SERVER_PORT.get_or_init(|| start_file_server())
+}
+
+fn start_file_server() -> u16 {
+    // 尝试绑定 14300~14399 端口
+    for port in 14300u16..14400 {
+        if let Ok(server) = tiny_http::Server::http(format!("127.0.0.1:{port}")) {
+            std::thread::spawn(move || run_file_server(server));
+            return port;
+        }
+    }
+    0
+}
+
+fn run_file_server(server: tiny_http::Server) {
+    for request in server.incoming_requests() {
+        // 每个请求独立线程：流式转码响应会长时间阻塞，不能卡住其他文件请求
+        std::thread::spawn(move || {
+            handle_file_request(request);
+        });
+    }
+}
+
+fn handle_file_request(request: tiny_http::Request) {
+        let url = request.url().to_string();
+
+        // 流式转码端点: /stream/<id>
+        if let Some(id_str) = url.strip_prefix("/stream/") {
+            let id: u64 = id_str.parse().unwrap_or(0);
+            let entry = transcode_streams()
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+                .and_then(|e| e.receiver.take());
+
+            match entry {
+                Some(rx) => {
+                    let reader = ChannelReader {
+                        receiver: rx,
+                        current: std::io::Cursor::new(Vec::new()),
+                    };
+                    let response = tiny_http::Response::new(
+                        tiny_http::StatusCode(200),
+                        vec![
+                            tiny_http::Header::from_bytes(&b"Content-Type"[..], b"video/mp4").unwrap(),
+                            tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], b"none").unwrap(),
+                            tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], b"*").unwrap(),
+                            tiny_http::Header::from_bytes(&b"Cache-Control"[..], b"no-store").unwrap(),
+                        ],
+                        reader,
+                        None,
+                        None,
+                    );
+                    let _ = request.respond(response);
+                }
+                None => {
+                    let _ = request.respond(tiny_http::Response::empty(404));
+                }
+            }
+            return;
+        }
+
+        // URL 格式: /<base64-encoded-path>
+        let path_b64 = url.trim_start_matches('/');
+        use base64::Engine;
+        let path_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(path_b64) {
+            Ok(b) => b,
+            Err(_) => {
+                let _ = request.respond(tiny_http::Response::empty(400));
+                return;
+            }
+        };
+        let path = match String::from_utf8(path_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = request.respond(tiny_http::Response::empty(400));
+                return;
+            }
+        };
+        let file_path = Path::new(&path);
+        if !file_path.is_file() {
+            let _ = request.respond(tiny_http::Response::empty(404));
+            return;
+        }
+        match std::fs::File::open(file_path) {
+            Ok(file) => {
+                let metadata = match file.metadata() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let _ = request.respond(tiny_http::Response::empty(500));
+                        return;
+                    }
+                };
+                let file_size = metadata.len();
+                let content_type = match file_path.extension().and_then(|e| e.to_str()) {
+                    Some("mp4") | Some("m4v") => "video/mp4",
+                    Some("webm") => "video/webm",
+                    Some("ts") | Some("m2ts") | Some("mts") => "video/mp2t",
+                    Some("mkv") => "video/x-matroska",
+                    Some("avi") => "video/x-msvideo",
+                    Some("flv") => "video/x-flv",
+                    Some("mov") => "video/quicktime",
+                    Some("m4a") | Some("aac") => "audio/mp4",
+                    Some("mp3") => "audio/mpeg",
+                    Some("ogg") | Some("opus") => "audio/ogg",
+                    Some("wav") => "audio/wav",
+                    Some("flac") => "audio/flac",
+                    _ => "application/octet-stream",
+                };
+
+                // 解析 Range 头
+                let range_header = request.headers().iter()
+                    .find(|h| h.field.equiv("Range"))
+                    .and_then(|h| h.value.as_str().strip_prefix("bytes="));
+
+                if let Some(range) = range_header {
+                    let (start, end) = if let Some((s, e)) = range.split_once('-') {
+                        let s: u64 = s.parse().unwrap_or(0);
+                        let e: u64 = if e.is_empty() { file_size - 1 } else { e.parse().unwrap_or(file_size - 1) };
+                        (s, e.min(file_size - 1))
+                    } else {
+                        (0, file_size - 1)
+                    };
+                    if start > end {
+                        let _ = request.respond(tiny_http::Response::empty(416));
+                        return;
+                    }
+                    let length = end - start + 1;
+                    let mut file = file;
+                    use std::io::Seek;
+                    let _ = file.seek(std::io::SeekFrom::Start(start));
+                    let limited = file.take(length);
+                    let response = tiny_http::Response::new(
+                        tiny_http::StatusCode(206),
+                        vec![
+                            tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap(),
+                            tiny_http::Header::from_bytes(&b"Content-Length"[..], length.to_string().as_bytes()).unwrap(),
+                            tiny_http::Header::from_bytes(&b"Content-Range"[..], format!("bytes {start}-{end}/{file_size}").as_bytes()).unwrap(),
+                            tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], b"bytes").unwrap(),
+                            tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], b"*").unwrap(),
+                        ],
+                        limited,
+                        Some(length as usize),
+                        None,
+                    );
+                    let _ = request.respond(response);
+                } else {
+                    let response = tiny_http::Response::new(
+                        tiny_http::StatusCode(200),
+                        vec![
+                            tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap(),
+                            tiny_http::Header::from_bytes(&b"Content-Length"[..], file_size.to_string().as_bytes()).unwrap(),
+                            tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], b"bytes").unwrap(),
+                            tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], b"*").unwrap(),
+                        ],
+                        file,
+                        Some(file_size as usize),
+                        None,
+                    );
+                    let _ = request.respond(response);
+                }
+            }
+            Err(_) => {
+                let _ = request.respond(tiny_http::Response::empty(500));
+            }
+        }
+}
+
+// ─── 流式转码（边转边播）───
+/// 转码流条目：ffmpeg stdout 通过 channel 推给 HTTP 响应
+struct StreamEntry {
+    receiver: Option<PeekableReceiver>,
+    child: Option<Arc<Mutex<std::process::Child>>>,
+}
+
+static TRANSCODE_STREAMS: OnceLock<Mutex<HashMap<u64, StreamEntry>>> = OnceLock::new();
+fn transcode_streams() -> &'static Mutex<HashMap<u64, StreamEntry>> {
+    TRANSCODE_STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 当前活跃的流式转码 ID（用于快速停止）
+static ACTIVE_STREAM_ID: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+fn active_stream_id() -> &'static Mutex<Option<u64>> {
+    ACTIVE_STREAM_ID.get_or_init(|| Mutex::new(None))
+}
+
+/// 带预读缓冲的 Receiver：第一个数据块可被 peek 后放回
+struct PeekableReceiver {
+    first: Option<Vec<u8>>,
+    inner: mpsc::Receiver<Vec<u8>>,
+}
+
+impl PeekableReceiver {
+    fn recv(&mut self) -> Result<Vec<u8>, mpsc::RecvError> {
+        if let Some(data) = self.first.take() {
+            return Ok(data);
+        }
+        self.inner.recv()
+    }
+}
+
+/// 从 PeekableReceiver 读取数据的 Reader，用于 tiny_http 流式响应
+struct ChannelReader {
+    receiver: PeekableReceiver,
+    current: std::io::Cursor<Vec<u8>>,
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if (self.current.position() as usize) < self.current.get_ref().len() {
+            return self.current.read(buf);
+        }
+        match self.receiver.recv() {
+            Ok(data) => {
+                self.current = std::io::Cursor::new(data);
+                self.current.read(buf)
+            }
+            Err(_) => Ok(0), // 流结束
+        }
+    }
+}
+
+/// 硬件加速方案（解码器 + 编码器配对）
+#[derive(Clone, Copy)]
+enum Accel {
+    /// NVIDIA：CUDA 解码显存帧直通 NVENC
+    Nvenc,
+    /// Intel：QSV 解码帧直通 QSV 编码器
+    Qsv,
+    /// AMD：D3D11VA 解码纹理直通 AMF 编码器
+    Amf,
+}
+
+impl Accel {
+    /// 零拷贝参数：(hwaccel, hwaccel_output_format, encoder, preset)
+    /// 解码帧留在显存/显卡内存，直接喂给同族硬件编码器，不经过系统内存
+    fn zero_copy_args(self) -> (&'static str, &'static str, &'static str, &'static [&'static str]) {
+        let (enc, preset) = self.encoder_args();
+        match self {
+            Accel::Nvenc => ("cuda", "cuda", enc, preset),
+            Accel::Qsv => ("qsv", "qsv", enc, preset),
+            Accel::Amf => ("d3d11va", "d3d11", enc, preset),
+        }
+    }
+    /// 编码器及参数（预设 + 质量控制），零拷贝与内存中转两档共用。
+    /// 不设质量控制时 NVENC 落到 SDK 默认码率（4K 源实测仅 ~1.5Mbps，画面严重模糊），
+    /// 统一用恒定质量 VBR：cq26 对 4K 实测 ~20Mbps、166fps（1.38x 实时，4K120 源可跟上）
+    fn encoder_args(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Accel::Nvenc => ("h264_nvenc", &["-preset", "p2", "-rc", "vbr", "-cq", "26", "-b:v", "0"]),
+            Accel::Qsv => ("h264_qsv", &["-preset", "veryfast", "-global_quality", "26"]),
+            Accel::Amf => ("h264_amf", &["-quality", "speed"]),
+        }
+    }
+    /// GPU 端位深转换滤镜：10bit 解码帧（p016 等）在显存内转成 nv12 再进编码器，
+    /// 保持零拷贝链路不断；8bit 源为直通，开销可忽略
+    fn gpu_filter(self) -> Option<&'static str> {
+        match self {
+            Accel::Nvenc => Some("scale_cuda=format=nv12"),
+            Accel::Qsv => Some("scale_qsv=format=nv12"),
+            // d3d11va 无对应位深转换滤镜，AMF 10bit 源由内存中转档兜底
+            Accel::Amf => None,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Accel::Nvenc => "h264_nvenc · GPU 零拷贝",
+            Accel::Qsv => "h264_qsv · GPU 零拷贝",
+            Accel::Amf => "h264_amf · GPU 零拷贝",
+        }
+    }
+    fn roundtrip_label(self) -> &'static str {
+        match self {
+            Accel::Nvenc => "h264_nvenc · GPU 转码",
+            Accel::Qsv => "h264_qsv · GPU 转码",
+            Accel::Amf => "h264_amf · GPU 转码",
+        }
+    }
+    fn hwaccel(self) -> &'static str {
+        match self {
+            Accel::Nvenc => "cuda",
+            Accel::Qsv => "qsv",
+            Accel::Amf => "d3d11va",
+        }
+    }
+}
+
+/// 转码编码模式（按此顺序回退尝试）
+#[derive(Clone, Copy)]
+enum EncodeMode {
+    /// 硬解显存帧直通硬件编码器（GPU 零拷贝，位深转换也在显存内完成）
+    ZeroCopy(Accel),
+    /// 硬解后帧下载到内存、CPU 仅做位深转换，再交由 GPU 编码（零拷贝失败时兜底）
+    HwRoundTrip(Accel),
+    /// 纯软解软编
+    Software,
+}
+
+impl EncodeMode {
+    fn label(self) -> &'static str {
+        match self {
+            EncodeMode::ZeroCopy(a) => a.label(),
+            EncodeMode::HwRoundTrip(a) => a.roundtrip_label(),
+            EncodeMode::Software => "libx264 · CPU 软编",
+        }
+    }
+}
+
+/// 探测 ffmpeg 编译产物中可用的硬件编码器。
+/// 注意：`-encoders` 列表只代表编译进了哪些编码器，与本机实际硬件无关，
+/// 因此仅作候选提示，真实可用性由运行时快速失败探测决定。
+fn detect_hw_encoder(ffmpeg: &Path) -> Option<Accel> {
+    let output = std::process::Command::new(ffmpeg)
+        .arg("-hide_banner")
+        .arg("-encoders")
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout);
+    if s.contains("h264_nvenc") {
+        Some(Accel::Nvenc)
+    } else if s.contains("h264_qsv") {
+        Some(Accel::Qsv)
+    } else if s.contains("h264_amf") {
+        Some(Accel::Amf)
+    } else {
+        None
+    }
+}
+
+/// 构建 ffmpeg 转码命令
+fn build_transcode_cmd(
+    ffmpeg: &Path,
+    src: &Path,
+    mode: EncodeMode,
+    seek: Option<f64>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.arg("-hide_banner").arg("-nostdin");
+    // 进度跳转：demuxer 级 -ss 置于 -i 之前（快速定位关键帧），
+    // 输出时间轴从 0 重新计起，浏览器侧由前端叠加偏移换算绝对时间
+    if let Some(t) = seek {
+        cmd.arg("-ss").arg(format!("{t:.3}"));
+    }
+    match mode {
+        EncodeMode::ZeroCopy(a) => {
+            let (hw, fmt, enc, preset) = a.zero_copy_args();
+            cmd.arg("-hwaccel").arg(hw)
+                .arg("-hwaccel_output_format").arg(fmt);
+            cmd.arg("-i").arg(src)
+                .arg("-map").arg("0:v:0")
+                .arg("-map").arg("0:a:0?");
+            // GPU 滤镜在显存内把 10bit 解码帧转成 nv12，编码器只吃 8bit；
+            // 不设 -pix_fmt，强制软件像素格式会引入显存↔内存往返，破坏零拷贝
+            if let Some(f) = a.gpu_filter() {
+                cmd.arg("-vf").arg(f);
+            }
+            cmd.arg("-c:v").arg(enc);
+            for p in preset {
+                cmd.arg(p);
+            }
+        }
+        EncodeMode::HwRoundTrip(a) => {
+            let (enc, preset) = a.encoder_args();
+            cmd.arg("-hwaccel").arg(a.hwaccel());
+            cmd.arg("-i").arg(src)
+                .arg("-map").arg("0:v:0")
+                .arg("-map").arg("0:a:0?")
+                // 硬解帧下载到内存后统一转 nv12（10bit→8bit 在 CPU 完成，仅此一步），
+                // 编码仍走 GPU：nvenc/qsv/amf 均接受系统内存 nv12 并自行上传
+                .arg("-vf").arg("format=nv12")
+                .arg("-c:v").arg(enc);
+            for p in preset {
+                cmd.arg(p);
+            }
+        }
+        EncodeMode::Software => {
+            cmd.arg("-i").arg(src)
+                .arg("-map").arg("0:v:0")
+                .arg("-map").arg("0:a:0?")
+                .arg("-c:v").arg("libx264")
+                .arg("-preset").arg("veryfast")
+                .arg("-pix_fmt").arg("yuv420p");
+        }
+    }
+    cmd.arg("-c:a").arg("aac")
+        .arg("-b:a").arg("128k")
+        .arg("-f").arg("mp4")
+        .arg("-movflags").arg("+frag_keyframe+empty_moov+default_base_moof")
+        .arg("pipe:1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW (0x08000000) | BELOW_NORMAL_PRIORITY_CLASS (0x00004000)
+        // 降优先级避免转码抢占 UI/浏览器渲染线程的 CPU 时间片
+        const FLAGS: u32 = 0x08000000 | 0x00004000;
+        cmd.creation_flags(FLAGS);
+    }
+    cmd
+}
+
+/// 启动 ffmpeg 转码，返回 (child, receiver)
+/// 使用有界 channel（32 块 ≈ 2MB），浏览器缓冲足够时 ffmpeg 自动背压等待
+fn spawn_transcode(
+    cmd: &mut std::process::Command,
+) -> Result<(Arc<Mutex<std::process::Child>>, mpsc::Receiver<Vec<u8>>), String> {
+    let (tx, rx) = mpsc::sync_channel(32);
+    let child = Arc::new(Mutex::new(cmd.spawn().map_err(|e| format!("启动 ffmpeg 失败: {e}"))?));
+    let mut stdout = child.lock().unwrap().stdout.take().ok_or("无法获取 stdout")?;
+
+    let child_clone = child.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut buf = [0u8; 65536];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break; // 接收端已关闭
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        drop(tx);
+        let _ = child_clone.lock().unwrap().wait();
+    });
+
+    Ok((child, rx))
+}
+
+/// fMP4 的 moov 头在首帧编码之前就会写出，不能作为转码成功的依据；
+/// 出现首个媒体分片标记 moof 才说明第一帧真正编码成功。
+/// 某些失败（如 10bit 源直通编码器）恰好死在「头已出、帧全无」，按头判定会交付死流。
+fn contains_moof(buf: &[u8]) -> bool {
+    buf.windows(4).any(|w| w == b"moof")
+}
+
+/// 等待转码管线的首个有效输出（累积到出现 moof 为止）。
+/// ffmpeg 提前退出（硬件不可用/格式组合不支持）时立即判定失败，
+/// 不干等整个超时；仅在"进程活着但迟迟无有效输出"时等满 timeout。
+/// 返回值是已累积的输出数据，调用方需将其送入 PeekableReceiver。
+fn wait_first_output(
+    child: &Arc<Mutex<std::process::Child>>,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let start = std::time::Instant::now();
+    let mut acc: Vec<u8> = Vec::new();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(data) => {
+                acc.extend_from_slice(&data);
+                if contains_moof(&acc) {
+                    return Some(acc); // 首帧编码成功，进程健康
+                }
+                // 仅为防累积失控：moov 头加空转错误输出不会超过几十 KB
+                if acc.len() > 4 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // 进程已退出：若已产出媒体分片（文件极短转完即退）仍算成功
+                return if contains_moof(&acc) { Some(acc) } else { None };
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let exited = child.lock().unwrap().try_wait().ok().flatten().is_some();
+                if exited || start.elapsed() >= timeout {
+                    return if contains_moof(&acc) { Some(acc) } else { None };
+                }
+            }
+        }
+    }
+}
+
+/// 转码流 IPC 返回
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscodeInfo {
+    pub id: u64,
+    pub engine: String,
+}
+
+/// 转码请求代际：每次新管线/停止请求自增，过期管线注册前自行作废，
+/// 避免「上一个转码尚未完成时用户又触发跳转/切换」导致旧流覆盖新流
+static TRANSCODE_GEN: AtomicU64 = AtomicU64::new(0);
+/// 流 ID 发号器：小整数即可（HTTP URL / IPC 往返），
+/// 不能用时间戳纳秒——超过 JS 安全整数范围，经 JSON 序列化会精度丢失导致 404
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 启动流式转码管线，输出 fMP4 到 HTTP 流。
+/// 前端用 <video src="http://127.0.0.1:port/stream/<id>"> 边转边播。
+/// 候选链：GPU 零拷贝（显存内转 8bit）→ GPU 解码 + GPU 编码（内存中转）→ 纯软编，
+/// 每级快速失败探测后自动降级。
+/// seek 为目标秒数（进度跳转/续播），重启转码从该位置起播。
+fn start_transcode_pipeline(path: &str, seek: Option<f64>) -> Result<TranscodeInfo, String> {
+    // 先停掉上一个流（切换视频/进度跳转时），再捕获本管线代际：
+    // 之后任何新的管线/停止请求都会让代际前移，使本管线注册前作废
+    stop_transcode_stream_inner();
+    let gen = TRANSCODE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg".to_string())?;
+    let src = crate::utils::canonicalize_checked(path)?;
+
+    let accel = detect_hw_encoder(&ffmpeg);
+
+    let mut modes: Vec<EncodeMode> = Vec::new();
+    if let Some(a) = accel {
+        modes.push(EncodeMode::ZeroCopy(a));
+        modes.push(EncodeMode::HwRoundTrip(a));
+    }
+    modes.push(EncodeMode::Software);
+
+    let mut started: Option<(Arc<Mutex<std::process::Child>>, PeekableReceiver, &'static str)> = None;
+    for (i, mode) in modes.iter().enumerate() {
+        // 非末级 6s：进程提前退出仍会秒级快速判失败（主导失败模式），
+        // 上限只兜底「活着却无输出」的病态情况。4s 会误杀即将成功的候选：
+        // 4K/高帧率 10bit 源首个媒体分片可达 4~5s（实测一个文件 moof 在 4.2s）
+        let timeout = if i + 1 == modes.len() { 15 } else { 6 };
+        let mut cmd = build_transcode_cmd(&ffmpeg, &src, *mode, seek);
+        let Ok((child, rx)) = spawn_transcode(&mut cmd) else { continue };
+        let mut rx = rx;
+        match wait_first_output(&child, &mut rx, std::time::Duration::from_secs(timeout)) {
+            Some(chunk) => {
+                let peekable = PeekableReceiver { first: Some(chunk), inner: rx };
+                started = Some((child, peekable, mode.label()));
+                break;
+            }
+            None => {
+                let _ = child.lock().unwrap().kill();
+                let _ = child.lock().unwrap().wait();
+            }
+        }
+    }
+
+    let (child, peekable, engine) =
+        started.ok_or_else(|| "转码启动失败：所有编码模式均无输出".to_string())?;
+
+    // 注册前校验代际：期间若有新管线/停止请求介入，本管线直接作废
+    if TRANSCODE_GEN.load(Ordering::SeqCst) != gen {
+        let _ = child.lock().unwrap().kill();
+        let _ = child.lock().unwrap().wait();
+        return Err("转码请求已被更新操作取代".to_string());
+    }
+
+    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
+
+    transcode_streams().lock().unwrap().insert(id, StreamEntry {
+        receiver: Some(peekable),
+        child: Some(child),
+    });
+    *active_stream_id().lock().unwrap() = Some(id);
+
+    Ok(TranscodeInfo { id, engine: engine.to_string() })
+}
+
+/// 启动 ffmpeg 硬件转码，输出 fMP4 到 HTTP 流。
+/// seekSecs：跳转目标秒数（进度条拖动/续播），重启转码从该位置起播。
+#[tauri::command]
+pub async fn transcode_stream(path: String, seek_secs: Option<f64>) -> Result<TranscodeInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || start_transcode_pipeline(&path, seek_secs))
+        .await
+        .map_err(|e| format!("转码任务异常退出: {e}"))?
+}
+
+/// 停止当前流式转码（关闭查看器/切换视频时调用）
+#[tauri::command]
+pub fn stop_transcode_stream() {
+    stop_transcode_stream_inner();
+}
+
+fn stop_transcode_stream_inner() {
+    // 代际自增：作废仍在启动中的转码管线
+    TRANSCODE_GEN.fetch_add(1, Ordering::SeqCst);
+    let id = active_stream_id().lock().unwrap().take();
+    if let Some(id) = id {
+        if let Some(entry) = transcode_streams().lock().unwrap().remove(&id) {
+            // kill ffmpeg 子进程
+            if let Some(child) = entry.child {
+                let _ = child.lock().unwrap().kill();
+            }
+            // receiver drop 后，读取线程的 tx.send 会失败，线程自动退出
+        }
+    }
+}
+
+/// 取消所有正在运行的预览重封装（全屏播放开始时调用，释放 CPU/IO）
+#[tauri::command]
+pub fn cancel_all_previews() {
+    // 标记所有 tag=="prev" 的任务为取消
+    let mut running_paths: Vec<PathBuf> = Vec::new();
+    {
+        let running = REMUX_RUNNING.lock().unwrap();
+        for job in running.iter() {
+            if job.tag == "prev" {
+                running_paths.push(job.src.clone());
+            }
+        }
+    }
+    let mut cancels = REMUX_CANCEL.lock().unwrap();
+    for p in &running_paths {
+        cancels.push((p.clone(), "prev"));
+    }
+}
+
 /// 启动时清掉上次异常退出留下的 `.part`。
 ///
 /// 它们是「重封装被杀到一半」的产物，纯垃圾：每个都是几 GB 的
@@ -666,6 +1283,427 @@ fn remux_to_mp4(
     std::fs::rename(&tmp, out).map_err(|e| format!("写入缓存失败: {e}"))?;
     Ok(())
 }
+
+/// 提取指定音轨并转码为 AAC（m4a），供 web-demuxer 不支持的音轨使用。
+/// `audio_index` 为音轨在源文件中的索引（从 0 开始）。
+#[tauri::command]
+pub async fn extract_audio_track(
+    app: tauri::AppHandle,
+    path: String,
+    audio_index: u32,
+) -> Result<String, String> {
+    let src = crate::utils::canonicalize_checked(&path)?;
+    if !src.is_file() {
+        return Err("文件不存在".into());
+    }
+    let dir = cache_dir(&app, "video")?;
+    let key = hash_key(&src);
+    let out = dir.join(format!("{key}.a{audio_index}.m4a"));
+    if out.exists() {
+        return Ok(out.to_string_lossy().into_owned());
+    }
+    let slots = slots_current();
+    let _permit = slots.acquire().await.map_err(|e| format!("队列异常: {e}"))?;
+    let (src2, out2) = (src.clone(), out.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        transcode_audio_to_aac(&src2, &out2, audio_index)
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))??;
+    Ok(out.to_string_lossy().into_owned())
+}
+
+/// 用 ffmpeg 把指定音轨转码为 AAC-LC m4a。
+fn transcode_audio_to_aac(src: &Path, out: &Path, audio_index: u32) -> Result<(), String> {
+    let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg（音轨转码需要）".to_string())?;
+    let tmp = part_path(out);
+    let _ = std::fs::remove_file(&tmp);
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.arg("-y")
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(src)
+        .arg("-map")
+        .arg(format!("0:a:{audio_index}"))
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-f")
+        .arg("mp4")
+        .arg(&tmp);
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("调用 ffmpeg 失败: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "音轨转码失败: ffmpeg 退出码 {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    std::fs::rename(&tmp, out).map_err(|e| format!("写入缓存失败: {e}"))?;
+    Ok(())
+}
+
+/// 提取纯视频流（丢弃所有音轨）为 mp4，供 web-demuxer 播放。
+/// 适用于源文件音轨参数损坏导致 web-demuxer 连带视频流也读不出的情况。
+/// 视频直接 copy，速度极快。
+#[tauri::command]
+pub async fn extract_video_only(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let src = crate::utils::canonicalize_checked(&path)?;
+    if !src.is_file() {
+        return Err("文件不存在".into());
+    }
+    let dir = cache_dir(&app, "video")?;
+    let key = hash_key(&src);
+    let out = dir.join(format!("{key}.vonly.mp4"));
+    if out.exists() {
+        return Ok(out.to_string_lossy().into_owned());
+    }
+    let slots = slots_current();
+    let _permit = slots.acquire().await.map_err(|e| format!("队列异常: {e}"))?;
+    let (src2, out2) = (src.clone(), out.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        extract_video_only_inner(&src2, &out2)
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))??;
+    Ok(out.to_string_lossy().into_owned())
+}
+
+fn extract_video_only_inner(src: &Path, out: &Path) -> Result<(), String> {
+    let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg".to_string())?;
+    let tmp = part_path(out);
+    let _ = std::fs::remove_file(&tmp);
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.arg("-y")
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(src)
+        .arg("-map").arg("0:v:0")
+        .arg("-c:v").arg("copy")
+        .arg("-an")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-f")
+        .arg("mp4")
+        .arg(&tmp);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("调用 ffmpeg 失败: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "提取视频失败: ffmpeg 退出码 {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    std::fs::rename(&tmp, out).map_err(|e| format!("写入缓存失败: {e}"))?;
+    Ok(())
+}
+
+// ─── 实时音频流 ───
+/// 全局音频流取消标志
+static AUDIO_STREAM_CANCEL: OnceLock<Mutex<Option<Arc<AtomicBool>>>> = OnceLock::new();
+fn audio_cancel_flag() -> &'static Mutex<Option<Arc<AtomicBool>>> {
+    AUDIO_STREAM_CANCEL.get_or_init(|| Mutex::new(None))
+}
+
+/// 实时转码音频为 fMP4 并通过 Tauri 事件推送给前端（MSE 播放）。
+/// ffmpeg 输出 fragmented mp4 到 stdout，Rust 分块 emit "audio-chunk"。
+#[tauri::command]
+pub async fn stream_audio(app: tauri::AppHandle, path: String, audio_index: u32) -> Result<(), String> {
+    let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg".to_string())?;
+    let src = crate::utils::canonicalize_checked(&path)?;
+
+    // 先停掉上一个流
+    stop_audio_stream_inner();
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    *audio_cancel_flag().lock().unwrap() = Some(cancel.clone());
+
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-i").arg(&src)
+        .arg("-map").arg(format!("0:a:{}", audio_index))
+        .arg("-c:a").arg("aac")
+        .arg("-b:a").arg("128k")
+        .arg("-f").arg("mp4")
+        .arg("-movflags").arg("+frag_keyframe+empty_moov+default_base_moof")
+        .arg("pipe:1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
+    let mut stdout = child.stdout.take().ok_or("无法获取 stdout")?;
+
+    let app2 = app.clone();
+    let cancel2 = cancel.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut buf = [0u8; 65536];
+        loop {
+            if cancel2.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                break;
+            }
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+                    let _ = app2.emit("audio-chunk", b64);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = app2.emit("audio-end", ());
+    });
+
+    Ok(())
+}
+
+/// 停止实时音频流。
+#[tauri::command]
+pub fn stop_audio_stream() {
+    stop_audio_stream_inner();
+}
+
+fn stop_audio_stream_inner() {
+    if let Some(cancel) = audio_cancel_flag().lock().unwrap().take() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 视频编码不被浏览器/MSE 支持时（如 hevc/vp9/av1），转码为 H.264 + AAC 的 mp4。
+/// 优先尝试硬件编码器（h264_qsv / h264_nvenc / h264_amf），失败回退 libx264。
+#[tauri::command]
+pub async fn transcode_to_playable(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let src = crate::utils::canonicalize_checked(&path)?;
+    if !src.is_file() {
+        return Err("文件不存在".into());
+    }
+    let dir = cache_dir(&app, "video")?;
+    let key = hash_key(&src);
+    let out = dir.join(format!("{key}.x264.mp4"));
+    if out.exists() {
+        return Ok(out.to_string_lossy().into_owned());
+    }
+    let slots = slots_current();
+    let _permit = slots.acquire().await.map_err(|e| format!("队列异常: {e}"))?;
+    let (src2, out2) = (src.clone(), out.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        transcode_to_h264(&src2, &out2)
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))??;
+    Ok(out.to_string_lossy().into_owned())
+}
+
+/// 转码为 H.264 + AAC mp4，优先硬件编码。
+fn transcode_to_h264(src: &Path, out: &Path) -> Result<(), String> {
+    let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg（视频转码需要）".to_string())?;
+    let tmp = part_path(out);
+    let _ = std::fs::remove_file(&tmp);
+
+    // 探测第一个 aac 音轨：有则直接 -c:a copy，跳过音频转码
+    let aac_idx = find_first_aac_audio(src);
+    // 探测视频是否已经是 h264：是则 -c:v copy，无需重编码
+    let video_is_h264 = probe_video_codec(src).map_or(false, |c| c == "h264");
+
+    if video_is_h264 {
+        // 视频已是 h264：直接 copy，只处理音频
+        if try_direct_copy(&ffmpeg, src, &tmp, aac_idx).is_ok() {
+            std::fs::rename(&tmp, out).map_err(|e| format!("写入缓存失败: {e}"))?;
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    // 需要重编码视频：尝试硬件编码器，失败则用 libx264
+    let hw_encoders = ["h264_qsv", "h264_nvenc", "h264_amf"];
+    for enc in hw_encoders {
+        if try_transcode(&ffmpeg, src, &tmp, enc, aac_idx).is_ok() {
+            std::fs::rename(&tmp, out).map_err(|e| format!("写入缓存失败: {e}"))?;
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    // 回退 libx264
+    try_transcode(&ffmpeg, src, &tmp, "libx264", aac_idx)?;
+    std::fs::rename(&tmp, out).map_err(|e| format!("写入缓存失败: {e}"))?;
+    Ok(())
+}
+
+/// 探测视频编码名称。
+fn probe_video_codec(src: &Path) -> Option<String> {
+    let ff = find_ffmpeg()?;
+    let probe = ff.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
+    if !probe.is_file() {
+        return None;
+    }
+    let mut cmd = std::process::Command::new(probe);
+    cmd.arg("-v").arg("error")
+        .arg("-select_streams").arg("v:0")
+        .arg("-show_entries").arg("stream=codec_name")
+        .arg("-of").arg("csv=p=0")
+        .arg(src);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let codec = s.lines().next()?.trim().to_string();
+    if codec.is_empty() { None } else { Some(codec) }
+}
+
+/// 视频直接 copy（源已是 h264），只处理音频。
+/// 带音频失败时自动回退到不带音频（-an）。
+fn try_direct_copy(ffmpeg: &Path, src: &Path, tmp: &Path, aac_idx: Option<usize>) -> Result<(), String> {
+    let args = build_ffmpeg_args(src, tmp, "copy", aac_idx, false);
+    if run_ffmpeg(ffmpeg, &args).is_ok() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(tmp);
+    // 回退：不带音频
+    let args_noaudio = build_ffmpeg_args(src, tmp, "copy", None, true);
+    run_ffmpeg(ffmpeg, &args_noaudio)
+}
+
+/// 用 ffprobe 找第一个 aac 音轨的索引；找不到返回 None。
+fn find_first_aac_audio(src: &Path) -> Option<usize> {
+    let ff = find_ffmpeg()?;
+    let probe = ff.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
+    if !probe.is_file() {
+        return None;
+    }
+    let mut cmd = std::process::Command::new(probe);
+    cmd.arg("-v").arg("error")
+        .arg("-select_streams").arg("a")
+        .arg("-show_entries").arg("stream=index,codec_name")
+        .arg("-of").arg("csv=p=0")
+        .arg(src);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 2 && parts[1].trim() == "aac" {
+            if let Ok(idx) = parts[0].trim().parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn try_transcode(ffmpeg: &Path, src: &Path, tmp: &Path, vcodec: &str, aac_idx: Option<usize>) -> Result<(), String> {
+    let args = build_ffmpeg_args(src, tmp, vcodec, aac_idx, false);
+    if run_ffmpeg(ffmpeg, &args).is_ok() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(tmp);
+    // 回退：不带音频
+    let args_noaudio = build_ffmpeg_args(src, tmp, vcodec, None, true);
+    run_ffmpeg(ffmpeg, &args_noaudio)
+}
+
+/// 构建 ffmpeg 参数。`no_audio` 为 true 时忽略所有音轨。
+fn build_ffmpeg_args(src: &Path, tmp: &Path, vcodec: &str, aac_idx: Option<usize>, no_audio: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-y".into(), "-hide_banner".into(), "-nostdin".into(),
+        "-i".into(), src.to_string_lossy().into_owned(),
+        "-map".into(), "0:v:0".into(),
+        "-c:v".into(), vcodec.into(),
+    ];
+    if vcodec != "copy" {
+        // 10bit 输入硬件编码器不支持，统一转 8bit
+        args.push("-pix_fmt".into());
+        args.push("yuv420p".into());
+        if vcodec == "libx264" {
+            args.push("-preset".into());
+            args.push("veryfast".into());
+            args.push("-crf".into());
+            args.push("23".into());
+        }
+    }
+    if no_audio {
+        args.push("-an".into());
+    } else if let Some(idx) = aac_idx {
+        args.push("-map".into());
+        args.push(format!("0:a:{}", idx));
+        args.push("-c:a".into());
+        args.push("copy".into());
+    } else {
+        args.push("-map".into());
+        args.push("0:a:0".into());
+        args.push("-c:a".into());
+        args.push("aac".into());
+        args.push("-b:a".into());
+        args.push("128k".into());
+    }
+    args.push("-movflags".into());
+    args.push("+faststart".into());
+    args.push("-f".into());
+    args.push("mp4".into());
+    args.push(tmp.to_string_lossy().into_owned());
+    args
+}
+
+/// 运行 ffmpeg，失败时打印 stderr 末尾便于诊断。
+fn run_ffmpeg(ffmpeg: &Path, args: &[String]) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("调用 ffmpeg 失败: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail: String = stderr.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        eprintln!("[ffmpeg] failed: {}", tail);
+        return Err(format!("ffmpeg 退出码 {}: {}", out.status.code().unwrap_or(-1), tail.lines().last().unwrap_or("")));
+    }
+    Ok(())
+}
+
 // ─── 缓存管理 IPC ───
 /// 缓存统计（文件数 + 总字节数）
 #[tauri::command]
@@ -853,6 +1891,159 @@ fn apply_orientation(img: image::DynamicImage, orient: u32) -> image::DynamicIma
         7 => img.rotate270().fliph(),
         8 => img.rotate270(),
         _ => img,
+    }
+}
+
+// ═══════════════ 图片变换写回原图（旋转/翻转实装） ═══════════════
+
+/// 变换写回 IPC 返回
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformedImage {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 旋转/翻转后写回原图。ops 按序应用（像素坐标系）：
+/// rotate_cw（顺时针 90°）/ rotate_180 / rotate_ccw（逆时针 90°）/ flip_h / flip_v。
+/// 支持 jpg/png/bmp/tiff：png/bmp/tiff 无损重编码，JPEG 质量 92 重编码并保留 EXIF
+/// （像素转正后剔除 Orientation 标签）。gif/webp/avif/heic 等不支持（动图/未启用编码器）。
+#[tauri::command]
+pub async fn transform_image(
+    app: tauri::AppHandle,
+    path: String,
+    ops: Vec<String>,
+) -> Result<TransformedImage, String> {
+    tauri::async_runtime::spawn_blocking(move || transform_image_inner(&app, &path, &ops))
+        .await
+        .map_err(|e| format!("变换任务异常退出: {e}"))?
+}
+
+fn transform_image_inner(app: &tauri::AppHandle, path: &str, ops: &[String]) -> Result<TransformedImage, String> {
+    if ops.is_empty() {
+        return Err("没有要应用的变换".into());
+    }
+    let src = crate::utils::canonicalize_checked(path)?;
+    if !src.is_file() {
+        return Err(format!("文件不存在: {}", src.display()));
+    }
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let fmt = match ext.as_str() {
+        "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+        "png" => image::ImageFormat::Png,
+        "bmp" => image::ImageFormat::Bmp,
+        "tif" | "tiff" => image::ImageFormat::Tiff,
+        _ => return Err(format!(".{ext} 暂不支持旋转/翻转保存（仅 jpg/png/bmp/tiff）")),
+    };
+
+    // 写回前的缓存 key（含旧 mtime）：mtime 变化后新缩略图走新 key，旧缓存文件需清理
+    let old_hash = hash_key(&src);
+    let bytes = std::fs::read(&src).map_err(|e| format!("读取失败: {e}"))?;
+
+    // 解码 + EXIF 方向转正（转正后 Orientation 标签失效，JPEG 写回时剔除）
+    let mut img = image::load_from_memory(&bytes).map_err(|e| format!("解码失败: {e}"))?;
+    let mut exif_out: Option<Vec<u8>> = None;
+    if fmt == image::ImageFormat::Jpeg {
+        if let Some(o) = exif_orientation(&bytes) {
+            img = apply_orientation(img, o);
+        }
+        exif_out = exif_without_orientation(&bytes);
+    }
+
+    for op in ops {
+        img = match op.as_str() {
+            "rotate_cw" => img.rotate90(),
+            "rotate_180" => img.rotate180(),
+            "rotate_ccw" => img.rotate270(),
+            "flip_h" => img.fliph(),
+            "flip_v" => img.flipv(),
+            other => return Err(format!("未知变换: {other}")),
+        };
+    }
+    let (w, h) = (img.width(), img.height());
+
+    // 编码：JPEG 带 EXIF 插入；其余格式直接按原格式重编码
+    let mut buf: Vec<u8> = Vec::with_capacity(bytes.len() + 64 * 1024);
+    if fmt == image::ImageFormat::Jpeg {
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
+        img.write_with_encoder(enc).map_err(|e| format!("JPEG 编码失败: {e}"))?;
+        if let Some(ex) = &exif_out {
+            jpeg_insert_exif(&mut buf, ex);
+        }
+    } else {
+        img.write_to(&mut std::io::Cursor::new(&mut buf), fmt)
+            .map_err(|e| format!("编码失败: {e}"))?;
+    }
+
+    // 原子写回：写同目录临时文件 → rename 覆盖（Windows 上 rename 不覆盖已存在目标，先删再试）
+    let name = src.file_name().ok_or("无效文件名")?.to_string_lossy().into_owned();
+    let tmp = src.with_file_name(format!("{name}.rvtmp"));
+    std::fs::write(&tmp, &buf).map_err(|e| format!("写入临时文件失败: {e}"))?;
+    if std::fs::rename(&tmp, &src).is_err() {
+        let removed = std::fs::remove_file(&src).is_ok();
+        let ok = removed && std::fs::rename(&tmp, &src).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("写回失败：文件可能被占用".into());
+        }
+    }
+
+    purge_orphan_thumbs(app, &old_hash);
+    Ok(TransformedImage { width: w, height: h })
+}
+
+/// 读取 EXIF 并剔除 Orientation（像素已转正），返回 TIFF 容器字节；无 EXIF/失败返回 None。
+/// 只保留 IFD0 字段：IFD1 内嵌缩略图像素未随旋转更新，保留会错位，直接丢弃。
+fn exif_without_orientation(bytes: &[u8]) -> Option<Vec<u8>> {
+    let exif = exif::Reader::new()
+        .read_from_container(&mut std::io::Cursor::new(bytes))
+        .ok()?;
+    let fields: Vec<exif::Field> = exif
+        .fields()
+        .filter(|f| f.ifd_num == exif::In::PRIMARY && f.tag != exif::Tag::Orientation)
+        .cloned()
+        .collect();
+    let mut writer = exif::experimental::Writer::new();
+    for f in &fields {
+        writer.push_field(f);
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    writer.write(&mut out, true).ok()?; // 小端 TIFF（主流）
+    let data = out.into_inner();
+    if data.len() > 8 { Some(data) } else { None }
+}
+
+/// 把 TIFF 容器字节作为 APP1(Exif) 段插入 JPEG（SOI 之后）
+fn jpeg_insert_exif(jpeg: &mut Vec<u8>, tiff: &[u8]) {
+    if jpeg.len() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return;
+    }
+    let seg_len = (tiff.len() + 2) as u16;
+    if seg_len > 0xFFFF {
+        return; // 单段超长（罕见），放弃保留
+    }
+    let mut app1 = vec![0xFF, 0xE1, (seg_len >> 8) as u8, (seg_len & 0xFF) as u8];
+    app1.extend_from_slice(b"Exif\0\0");
+    app1.extend_from_slice(tiff);
+    jpeg.splice(2..2, app1);
+}
+
+/// 删除 thumbnails 各子目录中以旧 hash 开头的缓存文件（写回原图后成为孤儿）
+fn purge_orphan_thumbs(app: &tauri::AppHandle, hash: &str) {
+    let Ok(root) = cache_root_dir(app) else { return };
+    for sub in std::fs::read_dir(root).into_iter().flatten() {
+        let Ok(sub) = sub else { continue };
+        if !sub.path().is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(sub.path()).into_iter().flatten().filter_map(|e| e.ok()) {
+            let fp = f.path();
+            if let Some(n) = fp.file_name().and_then(|n| n.to_str()) {
+                if n.starts_with(hash) {
+                    let _ = std::fs::remove_file(&fp);
+                }
+            }
+        }
     }
 }
 // ─── 视频缩略图（ffmpeg） ───

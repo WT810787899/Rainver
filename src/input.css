@@ -102,6 +102,11 @@ html.dark body.solid-bg { background: #0d1117; }
   object-fit: cover;
   z-index: 1;
   background: #000;
+  /* 首帧真正上屏前保持透明，露出下方缩略图，避免挂载/重挂瞬间黑块闪烁 */
+  opacity: 0;
+}
+.thumb-box .auto-preview.v-ready {
+  opacity: 1;
 }
 /* 悬浮控制条（玻璃拟态）：默认隐藏，鼠标悬浮卡片时淡入 */
 .card-ctrl {
@@ -125,6 +130,37 @@ html.dark body.solid-bg { background: #0d1117; }
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
+}
+/* 表演模式（弹卡阵列/幻灯片/封面流）：只有鼠标移到控制条本身所在的底部热区才显示。
+   wrap 是一块与控制条等高的透明热区，hover 热区或控制条时展开，移开即收起，
+   不会因为鼠标在视频画面上随意移动就弹出。 */
+.perf-ctrl-wrap {
+  position: absolute;
+  left: 6px; right: 6px; bottom: 6px;
+  height: 50px;
+  z-index: 5;
+}
+.perf-ctrl-wrap .card-ctrl {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
+}
+.perf-ctrl-wrap:hover .card-ctrl {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+/* 弹卡很小的时候热区与内边距收窄，避免占据过多画面 */
+.perf-card .perf-ctrl-wrap {
+  left: 4px; right: 4px; bottom: 4px;
+  height: 44px;
+}
+.perf-card .perf-ctrl-wrap .card-ctrl {
+  padding: 4px 6px;
+  gap: 3px;
 }
 .card-ctl-row {
   display: flex;
@@ -333,6 +369,34 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
 }
 .tool-ico:hover { color: var(--accent-text); border-color: var(--accent); }
 .tool-ico:active { transform: scale(.92); }
+
+/* ─── 工具栏文字按钮（tool-ico 同族，宽度随文字，如「算法」） ─── */
+.tool-text {
+  width: auto;
+  padding: 0 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ─── 排列算法弹出面板（缩放滑块右侧「算法」按钮） ─── */
+.layout-pop {
+  background: var(--modal-bg, var(--panel));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .35);
+}
+.layout-pop button {
+  display: block; width: 100%; text-align: left;
+  padding: 7px 10px; border-radius: 8px;
+  cursor: pointer; background: transparent; border: none;
+  transition: background .12s;
+}
+.layout-pop button:hover { background: rgba(var(--accent-rgb), .14); }
+.layout-pop button:active { transform: scale(.98); }
+.layout-pop .lp-name { font-size: 12px; font-weight: 600; color: var(--text); }
+.layout-pop button.cur .lp-name { color: var(--accent-text); }
+.layout-pop .lp-desc { font-size: 11px; color: var(--text-dim); margin-top: 1px; line-height: 1.5; }
 
 /* ─── 工具栏下拉（胶囊） ─── */
 .tool-select {
@@ -776,7 +840,8 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
               width .45s cubic-bezier(.25,.8,.3,1), height .45s cubic-bezier(.25,.8,.3,1);
   transform-style: preserve-3d;
   will-change: transform, opacity;
-  pointer-events: none;
+  /* 需要接收 hover 以显示视频悬浮控制条（封面流为全屏覆盖层，无需穿透到底层） */
+  pointer-events: auto;
 }
 .cover-inner {
   position: relative;
@@ -1426,27 +1491,6 @@ body.immersive #immersionBar { display: flex; }
 #immersionToast { opacity: 0; transition: opacity .6s ease; }
 #immersionToast.show { opacity: 1; }
 
-/* 视频画面 canvas。
-   位图尺寸（cvs.width/height）由 JS 按解码帧设置，CSS 负责把它铺满整个舞台。
-   这里**不能**只写 max-width/max-height:100%：那只约束「不超出」，不会放大。
-   canvas 是 replaced element，固有尺寸 = 解码尺寸（全屏时可能只有 1280x720），
-   于是它会死死卡在 1280x720 居中显示 —— 这正是「视频不全屏播放」的原因。
-   正确做法：盒模型铺满舞台（stage 是 relative，absolute+inset:0 最稳，
-   不受 flex 尺寸解析影响），再用 object-fit:contain 让像素内容按原比例
-   内缩，两侧留黑边，和 <video>/<img> 的观感一致。 */
-#videoCanvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  object-position: center;
-  background: #000;
-  z-index: 0;
-}
-
 /* ═══════════════════════════════════════════════════════
    标题栏竖线分隔（音乐按钮 / 窗口按钮）
    ═══════════════════════════════════════════════════════ */
@@ -1545,6 +1589,22 @@ body.immersive #immersionBar { display: flex; }
 /* ═══════════════════════════════════════════════════════
    L101：预览器视频——最长边自适应屏幕，最短边保持比例
    ═══════════════════════════════════════════════════════ */
+/* 进入预览器：内容（图片首帧/视频 canplay）就绪前保持透明，
+   加 .viewer-in 淡入，避免空舞台黑帧闪几帧 */
+#viewer {
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+#viewer.viewer-in {
+  opacity: 1;
+}
+/* 最大化→真全屏：Win32 会先还原 normal 几何一瞬，webview 跟着缩小会露出画廊。
+   toggle 之前先加 .viewer-cover 用纯黑场盖住（独立于内容淡入），几何过渡不可见 */
+#viewer.viewer-cover {
+  opacity: 1;
+  background-color: #000;
+  transition: none; /* 黑场必须瞬现：Win32 还原 normal 的第一帧前就要完全遮挡 */
+}
 #viewerVideo {
   width: 100%;
   height: 100%;
@@ -1631,38 +1691,6 @@ body.immersive #immersionBar { display: flex; }
   position: absolute;
   left: 0; right: 0; top: 0;
   will-change: transform;
-}
-
-/* 视频缓冲提示浮层
- *
- * pointer-events:none —— 浮层盖在画面正中，若吃掉点击，用户缓冲期间就点不了
- * 暂停/进度条，也就无法打断这 1~3 秒的等待。
- *
- * 进度条两种状态：
- *   · 已知进度（bufMs/PIPE_BUFFER_MS 有值）→ 用内联 width 走确定进度
- *   · 未知进度（管线刚起、还没上报 buffered_ms）→ rv-buf-indeterminate
- *     做来回滑动的条。**不能用空条**：一条空条配一个转圈，看起来像卡死；
- *     会动的条至少传达「还在动」。
- */
-#videoBufOverlay {
-  /* 缓冲期间画面本来就是静止的，用深色压一层让提示读得清 */
-  background: rgba(0, 0, 0, 0.55);
-}
-.rv-buf-indeterminate {
-  width: 38% !important;
-  animation: rv-buf-slide 1.1s ease-in-out infinite;
-}
-@keyframes rv-buf-slide {
-  0%   { transform: translateX(-100%); }
-  100% { transform: translateX(263%); }   /* 40%(160px容器) 的位移刚好到右端 */
-}
-/* 尊重系统的「减少动态效果」设置：关掉动画但保留静态提示 */
-@media (prefers-reduced-motion: reduce) {
-  #videoBufOverlay .animate-spin,
-  .rv-buf-indeterminate {
-    animation: none;
-  }
-  .rv-buf-indeterminate { width: 100% !important; opacity: 0.45; }
 }
 
 /* ═══════════════ L229/L245/L253：目录树标题旁磁盘「卷标+盘符」 ═══════════════ */

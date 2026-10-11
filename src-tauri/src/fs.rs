@@ -82,16 +82,17 @@ fn hidden_system_attrs(path: &std::path::Path) -> (bool, bool) {
     (hidden, false)
 }
 
-/// 扫描单个目录（非递归），过滤出媒体文件
+/// 扫描单个目录（非递归）；include_all=false 时过滤出媒体文件（默认），true 时非媒体归为 Other 一并列出
 /// 阻塞 IO 全部放到 spawn_blocking 任务，防止卡顿
 #[tauri::command]
-pub async fn list_directory(path: String) -> Result<Vec<MediaItem>, String> {
+pub async fn list_directory(path: String, include_all: Option<bool>) -> Result<Vec<MediaItem>, String> {
     let dir = canonicalize_checked(&path)?;
     if !dir.is_dir() {
         return Err(format!("不是有效目录: {}", dir.display()));
     }
 
-    tauri::async_runtime::spawn_blocking(move || scan_dir(&dir))
+    let all = include_all.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || scan_dir(&dir, all))
         .await
         .map_err(|e| format!("扫描任务失败: {e}"))?
 }
@@ -127,7 +128,7 @@ pub async fn pick_and_list(
         return Err("所选路径不是目录".into());
     }
     let display = dir.to_string_lossy().into_owned();
-    let items = tauri::async_runtime::spawn_blocking(move || scan_dir(&dir))
+    let items = tauri::async_runtime::spawn_blocking(move || scan_dir(&dir, false))
         .await
         .map_err(|e| format!("扫描任务失败: {e}"))??;
     Ok((display, items))
@@ -248,25 +249,60 @@ pub async fn list_subfolders(path: String) -> Result<Vec<FolderNode>, String> {
 }
 
 // ─── 内部：实际扫描逻辑（运行在阻塞线程池） ───
-fn scan_dir(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
-    let mut items = Vec::new();
-    // walkdir：非递归（max_depth 1），自动跳过无权限项
-    for entry in walkdir::WalkDir::new(dir).max_depth(1).into_iter().filter_map(|e| e.ok()) {
+const SCAN_CHUNK: usize = 500;
+
+fn scan_dir(dir: &std::path::Path, include_all: bool) -> Result<Vec<MediaItem>, String> {
+    scan_dir_batched(dir, false, include_all, &mut |_| Ok(()))
+}
+
+/// L230：递归扫描（穿透）——遍历全部层级，仅收集媒体文件
+fn scan_dir_deep(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
+    scan_dir_batched(dir, true, false, &mut |_| Ok(()))
+}
+
+/// 统一扫描：deep=false 非递归（含文件夹）；deep=true 递归仅媒体文件（上限 10 万条）。
+/// include_all=true 时非媒体文件归为 MediaKind::Other 一并列出（对应「仅显示媒体文件」关闭）。
+/// 每积累 SCAN_CHUNK 条通过 on_batch 推给调用方（流式场景增量 emit 到前端），
+/// 结束后整体排序并返回全量列表。
+fn scan_dir_batched(
+    dir: &std::path::Path,
+    deep: bool,
+    include_all: bool,
+    on_batch: &mut dyn FnMut(Vec<MediaItem>) -> Result<(), String>,
+) -> Result<Vec<MediaItem>, String> {
+    const MAX_ITEMS: usize = 100_000;
+    let mut items: Vec<MediaItem> = Vec::new();
+    let mut batch: Vec<MediaItem> = Vec::with_capacity(SCAN_CHUNK);
+    let mut walk = walkdir::WalkDir::new(dir);
+    if !deep {
+        walk = walk.max_depth(1); // 非递归；deep 走默认递归，follow_links(false) 避免环
+    }
+    for entry in walk.into_iter().filter_map(|e| e.ok()) {
+        if deep && items.len() >= MAX_ITEMS {
+            break;
+        }
         let p = entry.path();
         if p == dir {
             continue;
         }
-        // 目录同样列出（文件区不过滤文件夹），双击进入；不跟随符号链接
         let ft = entry.file_type();
         let (kind, ext, size) = if ft.is_dir() {
+            if deep {
+                continue; // 穿透结果里不放文件夹，文件区双击/操作都针对文件
+            }
+            // 目录同样列出（文件区不过滤文件夹），双击进入；不跟随符号链接
             (MediaKind::Folder, String::new(), 0u64)
         } else if ft.is_file() {
             let ext = p
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
-            // 非媒体后缀直接跳过
-            let Some(kind) = kind_by_ext(&ext) else { continue };
+            // 非媒体后缀：默认跳过；include_all 时归为 Other（资源管理器式列出）
+            let kind = match kind_by_ext(&ext) {
+                Some(k) => k,
+                None if include_all => MediaKind::Other,
+                None => continue,
+            };
             let size = match entry.metadata() {
                 Ok(m) => m.len(),
                 Err(_) => continue, // 无权限或已删除 → 跳过，避免崩溃
@@ -284,7 +320,7 @@ fn scan_dir(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        items.push(MediaItem {
+        let item = MediaItem {
             path: p.to_string_lossy().into_owned(),
             name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             ext,
@@ -298,9 +334,17 @@ fn scan_dir(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
             title: None,
             artist: None,
             album: None,
-        });
+        };
+        items.push(item.clone());
+        batch.push(item);
+        if batch.len() >= SCAN_CHUNK {
+            on_batch(std::mem::take(&mut batch))?;
+        }
     }
-    // 按类型（夹→图→影→音）+ 名称排序
+    if !batch.is_empty() {
+        on_batch(batch)?;
+    }
+    // 按类型（夹→图→影→音）+ 名称排序（流式场景前端 applyFilter 会再统一排序）
     items.sort_by(|a, b| {
         a.kind
             .partial_cmp(&b.kind)
@@ -310,60 +354,44 @@ fn scan_dir(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
     Ok(items)
 }
 
-/// L230：递归扫描（穿透）——遍历全部层级，仅收集媒体文件
-fn scan_dir_deep(dir: &std::path::Path) -> Result<Vec<MediaItem>, String> {
-    const MAX_ITEMS: usize = 100_000;
-    let mut items = Vec::new();
-    // walkdir 默认递归；follow_links(false) 避免环
-    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if items.len() >= MAX_ITEMS {
-            break;
-        }
-        let p = entry.path();
-        if p == dir {
-            continue;
-        }
-        // 穿透结果里不放文件夹，文件区双击/操作都针对文件
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let ext = p
-            .extension()
-            .map(|e| e.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        let Some(kind) = kind_by_ext(&ext) else { continue };
-        let Ok(meta) = entry.metadata() else { continue };
+/// 流式目录扫描的批次事件载荷
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirChunk {
+    /// 前端传入的代际号：换目录/刷新自增，过期批次由前端丢弃
+    seq: u32,
+    items: Vec<MediaItem>,
+}
 
-        let modified = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        items.push(MediaItem {
-            path: p.to_string_lossy().into_owned(),
-            name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            ext,
-            kind,
-            size: meta.len(),
-            modified,
-            duration: None,
-            width: None,
-            height: None,
-            title: None,
-            artist: None,
-            album: None,
-        });
+/// 流式目录扫描：每 500 条通过 `dir-chunk` 事件推送一批，
+/// 前端增量渲染，大目录不再等全量 JSON 一次序列化/解析完才显示。
+/// 完成后返回总数（最终排序由前端 applyFilter 统一处理）。
+#[tauri::command]
+pub async fn list_directory_stream(
+    app: tauri::AppHandle,
+    path: String,
+    deep: bool,
+    seq: u32,
+    include_all: Option<bool>,
+) -> Result<u32, String> {
+    use tauri::Emitter;
+    let dir = canonicalize_checked(&path)?;
+    if !dir.is_dir() {
+        return Err(format!("不是有效目录: {}", dir.display()));
     }
-    // 与单层扫描一致：按类型 + 名称排序
-    items.sort_by(|a, b| {
-        a.kind
-            .partial_cmp(&b.kind)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    Ok(items)
+    let all = include_all.unwrap_or(false) && !deep; // 穿透扫描保持仅媒体，避免 10 万上限被杂项占满
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut total: u32 = 0;
+        scan_dir_batched(&dir, deep, all, &mut |batch| {
+            total += batch.len() as u32;
+            app.emit("dir-chunk", DirChunk { seq, items: batch })
+                .map_err(|e| format!("批次事件发送失败: {e}"))?;
+            Ok(())
+        })?;
+        Ok(total)
+    })
+    .await
+    .map_err(|e| format!("扫描任务失败: {e}"))?
 }
 
 /// 按路径列表批量取文件元数据（集锦箱：跨目录文件，不做目录扫描）

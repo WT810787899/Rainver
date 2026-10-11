@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════
 use std::path::{Component, Path, PathBuf};
 
-/// 媒体大类（声明顺序即排序顺序：文件夹 → 图 → 影 → 音）
+/// 媒体大类（声明顺序即排序顺序：文件夹 → 图 → 影 → 音 → 其他）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
@@ -12,6 +12,8 @@ pub enum MediaKind {
     Image,
     Video,
     Audio,
+    /// 非媒体文件（「仅显示媒体文件」关闭时按资源管理器方式列出）
+    Other,
 }
 
 

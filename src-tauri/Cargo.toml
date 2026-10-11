@@ -29,9 +29,10 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
+tiny_http = "0.12"
 walkdir = "2"
 blake3 = "1"
-libloading = "0.8"          # 动态加载 libmpv（mpv-2.dll 缺失时优雅降级）
 image = { version = "0.25", features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 kamadak-exif = "0.6"        # EXIF 方向自动旋转
 id3 = "1"                    # mp3 元信息
