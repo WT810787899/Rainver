@@ -1070,6 +1070,54 @@ function progressSet(path, sec) {
   progressDirty = true;
 }
 
+// ─── 进度条双向同步：画廊卡片 ↔ 表演卡片（同文件的进度 UI 与 seek 实时互相对齐） ───
+/** 找同文件的其他播放实例：画廊 auto-preview 卡片（dataset.src）+ 表演池视频（_perfPath），排除自身 */
+function peerVideosOf(path, srcVideo) {
+  const out = [];
+  for (const v of content.querySelectorAll('video.auto-preview')) {
+    if (v.dataset.src === path && v !== srcVideo) out.push(v);
+  }
+  for (const v of document.querySelectorAll('#perfOverlay video')) {
+    if (v._perfPath === path && v !== srcVideo) out.push(v);
+  }
+  return out;
+}
+/** 取视频对应进度条 UI（表演走 _perfCtrl，画廊走 thumb-box 内 .card-ctrl） */
+function seekUiOf(v) {
+  const c = v._perfCtrl || v.closest('.thumb-box');
+  return c ? [c.querySelector('.player-seek-fill'), c.querySelector('.player-seek-knob')] : [];
+}
+function applySeekUi(v, p) {
+  const [fill, knob] = seekUiOf(v);
+  if (fill && knob) {
+    fill.style.width = p * 100 + '%';
+    knob.style.left = p * 100 + '%';
+  }
+}
+/** 播放进度广播（timeupdate 驱动）：对端进度条 UI 跟随；对端暂停时画面位置也一并对齐
+ *  （播放中的对端只动 UI 不动播放头，避免互相打断循环/起播节奏） */
+function peerSyncProgress(path, sec, dur, srcVideo) {
+  if (!path || !(dur > 0) || !(sec >= 0)) return;
+  const p = Math.max(0, Math.min(1, sec / dur));
+  for (const v of peerVideosOf(path, srcVideo)) {
+    applySeekUi(v, p);
+    if (v.paused && v.duration > 0 && Math.abs(v.currentTime - sec) > 1.5) {
+      try { v.currentTime = sec; } catch { /* 忽略 */ }
+    }
+  }
+}
+/** 用户在某处拖动进度结束：同文件其他实例（含表演中/画廊预览中）连播放头一起跳转 */
+function peerSeekApply(path, sec, srcVideo) {
+  if (!path || !(sec >= 0)) return;
+  for (const v of peerVideosOf(path, srcVideo)) {
+    if (v.duration > 0) {
+      try { v.currentTime = sec; } catch { /* 忽略 */ }
+      applySeekUi(v, Math.max(0, Math.min(1, sec / v.duration)));
+    }
+  }
+  progressSet(path, sec);
+}
+
 /** 立即落盘（隐藏/失焦/关闭预览/切目录等关键节点调用；平时由定时器节流） */
 function flushProgress() {
   if (!progressDirty) return;
@@ -1308,13 +1356,20 @@ function makeCardCtrl(v) {
   let dragging = false;
   seek.addEventListener('pointerdown', (e) => { dragging = true; seek.setPointerCapture(e.pointerId); setFromPointer(e); });
   seek.addEventListener('pointermove', (e) => { if (dragging) setFromPointer(e); });
-  seek.addEventListener('pointerup', () => { dragging = false; });
+  seek.addEventListener('pointerup', () => {
+    dragging = false;
+    // 双向同步：拖动结束后同文件的其他实例（表演卡片等）连播放头一起跳转
+    if (v.duration) peerSeekApply(v.dataset.src, v.currentTime, v);
+  });
   seek.addEventListener('pointercancel', () => { dragging = false; });
   v.addEventListener('timeupdate', () => {
     if (dragging || !v.duration) return;
     const p = v.currentTime / v.duration;
     fill.style.width = p * 100 + '%';
     knob.style.left = p * 100 + '%';
+    // 注意：画廊卡片是循环预览（loop），进度无权威语义——不向表演广播，
+    // 否则 loop 回绕到 0 会把暂停中的表演视频拉回开头（表现为「播着播着从头播」）。
+    // 反向只允许用户显式拖动（pointerup 的 peerSeekApply）影响表演。
   });
 
   // 音量：拖动即取消静音；静音按钮双向同步
@@ -2323,8 +2378,152 @@ let viewerMediaDur = 0; // 当前预览媒体总时长
 const seekPreviewEl = $('seekPreview');
 const seekPreviewImgEl = $('seekPreviewImg');
 const seekPreviewTEl = $('seekPreviewT');
-const frameCache = new Map(); // `${path}|${sec}` → URL/dataURL
+const frameCache = new Map(); // `${path}|${sec}` → objectURL/assetURL（LRU，越旧越先淘汰）
+const FRAME_CACHE_MAX = 360;
+
+function cachePut(path, sec, url) {
+  const key = `${path}|${sec}`;
+  if (frameCache.has(key)) frameCache.delete(key);
+  frameCache.set(key, url);
+  if (frameCache.size > FRAME_CACHE_MAX) {
+    const [oldKey, oldUrl] = frameCache.entries().next().value;
+    frameCache.delete(oldKey);
+    if (oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl); // asset 协议 URL 无需 revoke
+  }
+}
+function frameCacheClear() {
+  for (const url of frameCache.values()) {
+    if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+  }
+  frameCache.clear();
+}
 let frameJobToken = 0;
+
+// ── L131c：关键帧序列（后台 ffmpeg 实时落盘 {key}.dir/，前端轮询清单来一张显一张） ──
+let frameGenMeta = null;  // { path, interval, secs: [已缓存帧秒，升序], done, pollTimer }
+let frameGenBuilding = ''; // 防重复请求
+
+/** 雪碧图（后台关键帧序列）适用判定：仅 TS/MKV 等浏览器无法直连解码的格式——
+ *  它们只能靠 ffmpeg 抽帧。mp4/webm 等正常视频走实时客户端抽帧（extractVideo
+ *  pump），零 ffmpeg 开销且逐秒精确。 */
+function needsSeekSprite(path) {
+  if (isWebPlayerActive()) return true; // 播放中走 web-demuxer/转码 = 非直连格式
+  const ext = (path.match(/\.([^.\\/]+)$/) || [])[1]?.toLowerCase() || '';
+  return TRANSCODE_EXTS.has(ext);
+}
+
+function buildFrames(path) {
+  if (!needsSeekSprite(path)) return; // 正常视频走实时抽帧，不启动后台扫描
+  if (frameGenBuilding === path) return;
+  if (frameGenMeta && frameGenMeta.path === path) {
+    startFramePoll();
+    return;
+  }
+  if (!viewerMediaDur || viewerMediaDur <= 1) return;
+  frameGenBuilding = path;
+  invoke('build_seek_frames', { path, duration: viewerMediaDur })
+    .then(([interval]) => {
+      frameGenBuilding = '';
+      frameGenMeta = { path, interval, secs: [], done: false, genToken: ++frameJobToken };
+      startFramePoll();
+    })
+    .catch(() => { frameGenBuilding = ''; });
+}
+
+/** 轮询 list_seek_frames：每次拿到 (路径,秒) 全量清单，新帧进缓存、命中悬浮位立即上屏。
+ *  done 前每 300ms 一次；done 且全部入缓存后停。 */
+function startFramePoll() {
+  const m = frameGenMeta;
+  if (!m) return;
+  if (m.pollTimer) clearTimeout(m.pollTimer);
+  const path = m.path;
+  m.pollTimer = setTimeout(function poll() {
+    if (!frameGenMeta || frameGenMeta.path !== path) return; // 切文件了
+    invoke('list_seek_frames', { path }).then(([interval, done, items]) => {
+      if (!frameGenMeta || frameGenMeta.path !== path) return;
+      if (interval > 0) m.interval = interval;
+      m.done = done;
+      for (const [p, sec] of items) {
+        const key = `${path}|${sec}`;
+        if (!frameCache.has(key)) {
+          const url = convertFileSrc(p);
+          frameCache.set(key, url);
+          if (!m.done && !m.secs.includes(sec)) {
+            m.secs.push(sec);
+            // 悬浮位置命中（新帧恰好覆盖当前悬浮秒）：立即上屏
+            if (hoverPath === path && hoverSec >= sec &&
+                !seekPreviewEl.classList.contains('hidden')) {
+              const best = nearestGenSec(path, hoverSec);
+              if (best !== null) showGenFrame(path, best);
+            }
+          }
+        }
+      }
+      // done：近似秒（idx×interval）整体替换为 pts.txt 精确秒——近似 key
+      // 不清理会让混合列表里残留偏差帧，done 后显示必须全走精确映射
+      if (done) {
+        m.secs = items.map(([, s]) => s).sort((a, b) => a - b);
+      }
+      // 全部落缓存或已完成 → 停轮询；否则继续
+      if (!(m.done && items.every(([, sec]) => frameCache.has(`${path}|${sec}`)))) {
+        m.pollTimer = setTimeout(poll, 300);
+      }
+    }).catch(() => {
+      m.pollTimer = setTimeout(poll, 600); // 出错降频重试
+    });
+  }, 100);
+}
+
+function stopFramePoll() {
+  if (frameGenMeta?.pollTimer) {
+    clearTimeout(frameGenMeta.pollTimer);
+    frameGenMeta.pollTimer = 0;
+  }
+}
+
+/** 清除可能的内联样式（单帧模式不需要 object-position 等） */
+function clearSpriteMode() {
+  seekPreviewImgEl.style.objectFit = '';
+  seekPreviewImgEl.style.objectPosition = '';
+  seekPreviewImgEl.style.height = '';
+  seekPreviewImgEl.style.width = '';
+}
+
+/** 在已缓存的关键帧秒中找 ≤ sec 的最大项；没有则返回 null */
+function nearestGenSec(path, sec) {
+  const m = frameGenMeta;
+  if (!m || m.path !== path || !m.secs.length) return null;
+  let lo = 0, hi = m.secs.length - 1, best = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (m.secs[mid] <= sec) { best = m.secs[mid]; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  // 关键帧序列可能在结尾覆盖不到片尾——秒超过最后一帧时退用最后一帧
+  if (best === null && m.secs.length) return m.secs[0];
+  return best;
+}
+
+/** 显示指定秒的关键帧（URL 已在 frameCache） */
+function showGenFrame(path, sec) {
+  const url = frameCache.get(`${path}|${sec}`);
+  if (!url) return false;
+  seekPreviewEl.classList.remove('sp-pending');
+  clearSpriteMode();
+  if (seekPreviewImgEl.src !== url) seekPreviewImgEl.src = url;
+  return true;
+}
+
+/** 显示离 sec 最近（≤sec）的已生成关键帧；命中返回 true。
+ *  进行中（近似映射）帧内容可能落后 hover 很多（扫描未及）：偏差超过 2 个窗口
+ *  就放弃，让位给精确的单帧兜底；done 后是精确映射，无容差限制。 */
+function showNearestGenFrame(path, sec) {
+  const m = frameGenMeta;
+  const best = nearestGenSec(path, sec);
+  if (best === null) return false;
+  if (m && !m.done && best < sec - m.interval * 2) return false;
+  return showGenFrame(path, best);
+}
 
 // L145：客户端即时抽帧（独立隐藏 video + canvas，不走 IPC/ffmpeg，毫秒级出图）
 const extractVideo = document.createElement('video');
@@ -2352,13 +2551,49 @@ async function ensureExtractSrc(path) {
   await onceOn(extractVideo, 'loadedmetadata', 4000);
 }
 
-/** 客户端抽帧：seek → 画到 canvas → JPEG dataURL；失败/超时抛错 */
-async function clientExtractFrame(path, sec) {
+// ── 客户端抽帧：seeked 与 rvfc 竞速等帧，落点校验防脏帧 ──
+// 修复原实现竞态：seeked 不区分是哪次 seek，快速划动时旧请求画出的是新位置的帧
+// 却写进旧秒的缓存 key（脏缓存）。现在落点校验 + 代次作废双保险。
+let extractJobSeq = 0;
+const SEEK_TOL = 0.35; // seek 落点容差（秒），与旧实现一致
+
+/** 等 seek 完成且帧可用：seeked 与 rvfc 竞速，谁先到算谁（不会慢于只等 seeked） */
+function waitPresentedFrame(my) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      extractVideo.removeEventListener('error', onErr);
+      extractVideo.removeEventListener('seeked', onSeeked);
+      if (err) reject(err); else resolve();
+    };
+    const timer = setTimeout(() => finish(new Error('timeout')), 1500);
+    const onErr = () => finish(new Error('video-error'));
+    const onSeeked = () => finish(my !== extractJobSeq ? new Error('superseded') : null);
+    extractVideo.addEventListener('error', onErr);
+    extractVideo.addEventListener('seeked', onSeeked);
+    if (extractVideo.requestVideoFrameCallback) {
+      extractVideo.requestVideoFrameCallback(() => {
+        finish(my !== extractJobSeq ? new Error('superseded') : null);
+      });
+    }
+  });
+}
+
+/** 抽取一帧：seek → 等帧可用 → 画 canvas → JPEG blob（异步编码不占主线程）→ objectURL */
+async function extractFrame(path, sec) {
   await ensureExtractSrc(path);
-  if (Math.abs(extractVideo.currentTime - sec) > 0.35) {
+  const my = ++extractJobSeq;
+  if (Math.abs(extractVideo.currentTime - sec) > SEEK_TOL) {
     extractVideo.currentTime = sec;
-    await onceOn(extractVideo, 'seeked', 1500);
+    await waitPresentedFrame(my);
+  } else if (extractVideo.readyState < 2) {
+    await onceOn(extractVideo, 'loadeddata', 1500); // 位置已对但帧未就绪（首次加载）
   }
+  if (my !== extractJobSeq) throw new Error('superseded');
+  if (Math.abs(extractVideo.currentTime - sec) > SEEK_TOL) throw new Error('seek-drift');
   const vw = extractVideo.videoWidth;
   const vh = extractVideo.videoHeight;
   if (!vw || !vh) throw new Error('no-dim');
@@ -2367,60 +2602,166 @@ async function clientExtractFrame(path, sec) {
   extractCanvas.width = w;
   extractCanvas.height = h;
   extractCanvas.getContext('2d').drawImage(extractVideo, 0, 0, w, h);
-  return extractCanvas.toDataURL('image/jpeg', 0.82); // 跨域失败会在此抛 SecurityError
+  const blob = await new Promise((res, rej) => {
+    extractCanvas.toBlob((b) => (b ? res(b) : rej(new Error('blob-fail'))), 'image/jpeg', 0.82);
+  });
+  if (my !== extractJobSeq) throw new Error('superseded');
+  return URL.createObjectURL(blob);
 }
 
-/** IPC 抽帧（客户端抽帧失败的后备）；带 60ms 防抖 */
+/** IPC 抽帧（web-demuxer/转码主路径 + 客户端失败后备）；带 60ms 防抖 */
 let ipcDebounce = 0;
-function ipcExtractFrame(path, sec, key, myToken) {
+function ipcExtractFrame(path, sec, myToken) {
   const d = ++ipcDebounce;
   setTimeout(() => {
     if (d !== ipcDebounce) return; // 移动中：新请求取消旧的
     invoke('frame_at', { path, time: sec }).then((p) => {
       const url = convertFileSrc(p);
-      frameCache.set(key, url);
-      if (myToken === frameJobToken) seekPreviewImgEl.src = url;
+      cachePut(path, sec, url);
+      if (myToken === frameJobToken) revealFrame(path, sec, url);
     }).catch(() => { /* 失败保留旧帧 */ });
   }, 60);
+}
+
+let hoverPath = '', hoverSec = -1; // 当前悬浮位置
+
+// ── 抽帧执行器（pump）：同一时刻只跑一个 seek；主请求随时插队，预取绝不饿死主请求 ──
+// （上一版预取与主请求互相作废、且预取列表不含中心秒，导致主帧饿死反而更慢——已改单执行器）
+let pumpPath = '';
+let pumpIdle = true;
+let pumpWake = null;
+let wantSec = -1, wantToken = 0;           // 主请求：当前悬浮秒（最高优先级）
+let prefetchList = [], prefetchIdx = 0, prefetchOn = false;
+
+function wakePump() { pumpWake?.(); }
+function startPrefetch(sec) { // 以中心向 ±8 秒交替展开（中心秒由主请求处理，不重复入列）
+  prefetchList = [];
+  for (let d = 1; d <= 8; d++) prefetchList.push(sec + d, sec - d);
+  prefetchIdx = 0; prefetchOn = true;
+}
+function extractStop() { // 关预览/离开进度条：停 pump 并作废在途抽帧
+  pumpPath = ''; wantSec = -1; prefetchOn = false; prefetchList = [];
+  extractJobSeq++;
+  pumpWake?.();
+}
+/** 帧就绪后刷新气泡（hover 已移走则丢弃） */
+function revealFrame(path, sec, url) {
+  if (hoverPath !== path || hoverSec !== sec) return;
+  seekPreviewEl.classList.remove('sp-pending');
+  if (seekPreviewImgEl.src !== url) seekPreviewImgEl.src = url;
+}
+
+async function pumpLoop() {
+  pumpIdle = false;
+  try {
+    while (pumpPath) {
+      const path = pumpPath;
+      let sec = -1, isWant = false;
+      if (wantSec >= 0) { sec = wantSec; wantSec = -1; isWant = true; }
+      else if (prefetchOn) {
+        const dur = Math.ceil(viewerMediaDur || 0);
+        while (prefetchIdx < prefetchList.length) {
+          const s = prefetchList[prefetchIdx++];
+          if (s < 0 || (dur && s > dur) || frameCache.has(`${path}|${s}`)) continue;
+          sec = s; break;
+        }
+      }
+      if (sec < 0) { // 无活：休眠到新请求唤醒
+        await new Promise((r) => { pumpWake = r; });
+        pumpWake = null;
+        continue;
+      }
+      try {
+        const url = await extractFrame(path, sec);
+        if (pumpPath !== path) { URL.revokeObjectURL(url); return; }
+        cachePut(path, sec, url);
+        revealFrame(path, sec, url); // 主请求或预取命中当前悬浮秒都会刷新
+      } catch (err) {
+        if (String(err?.message || err) === 'superseded') continue; // 主请求插入，让位
+        if (isWant) ipcExtractFrame(path, sec, wantToken); // 客户端失败退 IPC
+        // 预取单帧失败：跳过继续
+      }
+    }
+  } finally { pumpIdle = true; }
+}
+function kickPump(path) {
+  if (!pumpIdle) return; // 循环在跑：新 wantSec 下一迭代处理
+  pumpPath = path;
+  pumpLoop();
 }
 
 /** 显示指定时间的帧（按整秒一档；HTML5 可播文件走客户端即时抽帧，其余走 IPC） */
 function showSeekFrame(path, t, leftPx, barW) {
   const sec = Math.max(0, Math.round(t));
+  hoverPath = path; hoverSec = sec;
   seekPreviewTEl.textContent = fmtDur(t) || '0:00';
   // 位置：夹在 [88, width-88]，防止超出进度条两端
   seekPreviewEl.style.left = Math.max(88, Math.min(barW - 88, leftPx)) + 'px';
   seekPreviewEl.classList.remove('hidden');
+  // 优先级：精确秒帧（客户端抽帧/单帧缓存）> 已生成关键帧序列的 ≤sec 最近帧
+  // > 兜底抽帧。关键帧命中即可毫秒级显示，不遮蔽后续更精确的缓存帧。
+  if (!frameCache.get(`${path}|${sec}`) && showNearestGenFrame(path, sec)) return;
+  // 未就绪：启动后台关键帧序列生成，同时走单帧路径兜底
+  buildFrames(path);
   const key = `${path}|${sec}`;
   const hit = frameCache.get(key);
-  if (hit) { if (seekPreviewImgEl.src !== hit) seekPreviewImgEl.src = hit; return; }
-  const myToken = ++frameJobToken;
-  // web-demuxer 路径（浏览器不支持的容器）走 IPC 抽帧
-  const needIpc = isWebPlayerActive();
-  if (!needIpc) {
-    // HTML5 可播文件：客户端即时抽帧（L145）；失败再退回 IPC
-    clientExtractFrame(path, sec).then((url) => {
-      frameCache.set(key, url);
-      if (myToken === frameJobToken) seekPreviewImgEl.src = url;
-    }).catch(() => ipcExtractFrame(path, sec, key, myToken));
-  } else {
-    ipcExtractFrame(path, sec, key, myToken);
+  if (isWebPlayerActive()) {
+    if (hit) {
+      seekPreviewEl.classList.remove('sp-pending');
+      clearSpriteMode();
+      if (seekPreviewImgEl.src !== hit) seekPreviewImgEl.src = hit;
+    } else {
+      seekPreviewEl.classList.add('sp-pending');
+      ipcExtractFrame(path, sec, ++frameJobToken);
+    }
+    return;
   }
+  if (hit) {
+    seekPreviewEl.classList.remove('sp-pending');
+    clearSpriteMode();
+    if (seekPreviewImgEl.src !== hit) seekPreviewImgEl.src = hit;
+  } else {
+    seekPreviewEl.classList.add('sp-pending');
+    if (!pumpIdle && pumpPath !== path) {
+      pumpPath = path;
+      extractJobSeq++;
+    }
+    wantSec = sec;
+    wantToken = ++frameJobToken;
+    extractJobSeq++;
+    wakePump();
+  }
+  startPrefetch(sec);
+  kickPump(path);
 }
 $('videoSeek').addEventListener('pointerenter', () => {
-  // L145：提前加载抽帧 video，首次悬浮即出图（web-demuxer 路径不预加载）
   const path = viewerItemPath();
-  if (path && !isWebPlayerActive()) ensureExtractSrc(path).catch(() => {});
+  if (path) {
+    // 雪碧图构建在 pointerenter 触发，hover 前预跑，到 hover 时大概率已就绪
+    buildFrames(path);
+    if (!isWebPlayerActive()) ensureExtractSrc(path).catch(() => {});
+  }
 });
+let seekMoveRaf = 0, seekMoveEvt = null;
 $('videoSeek').addEventListener('pointermove', (e) => {
-  const path = viewerItemPath();
-  if (!path || !viewerMediaDur) return;
-  const r = $('videoSeek').getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-  showSeekFrame(path, ratio * viewerMediaDur, ratio * r.width, r.width);
+  seekMoveEvt = e;
+  if (seekMoveRaf) return; // rAF 合并：一帧最多处理一次，高频划动不再连续打断
+  seekMoveRaf = requestAnimationFrame(() => {
+    seekMoveRaf = 0;
+    const ev = seekMoveEvt;
+    seekMoveEvt = null;
+    if (!ev) return;
+    const path = viewerItemPath();
+    if (!path || !viewerMediaDur) return;
+    const r = $('videoSeek').getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+    showSeekFrame(path, ratio * viewerMediaDur, ratio * r.width, r.width);
+  });
 });
 $('videoSeek').addEventListener('pointerleave', () => {
   seekPreviewEl.classList.add('hidden');
+  extractStop();
+  stopFramePoll(); // 停逐帧轮询（进入播放才继续）
 });
 
 
@@ -3262,6 +3603,7 @@ function closeViewer() {
   cleanupExternalAudio();
   clearTranscodeState(); // 复位转码流时间轴并作废在途跳转
   invoke('stop_transcode_stream').catch(() => {}); // 终止 ffmpeg 转码进程
+  invoke('cancel_all_previews').catch(() => {});   // 终止全部预览 remux（预览器建立的 ffmpeg 全回收）
   // ─── 清场：移除所有媒体内容并隐藏媒体层，防止下次打开瞬间露出上一次的图/视频帧 ───
   vVideo.pause();
   vVideo.autoplay = false;
@@ -3271,6 +3613,12 @@ function closeViewer() {
   viewerImg.removeAttribute('src');
   viewerImg.classList.add('hidden');
   if (savedBlobUrl) { URL.revokeObjectURL(savedBlobUrl); savedBlobUrl = ''; } // 写回新图的 blob 释放
+  frameCacheClear();  // 进度缩略图帧缓存（blob URL 一并释放）
+  extractStop();      // 停抽帧执行器、作废在途客户端抽帧
+  frameGenMeta = null; frameGenBuilding = ''; // 清逐帧生成（下次 openViewer 重建）
+  stopFramePoll();
+  clearSpriteMode();
+  hoverPath = ''; hoverSec = -1;
   const freezeC = $('videoFreeze')?.querySelector('canvas');
   if (freezeC) { freezeC.width = 0; freezeC.height = 0; } // 冻结帧位图一并丢弃
   const badge0 = $('viewerZoomBadge');
@@ -3752,7 +4100,9 @@ function showVideoBar() {
   bar.classList.add('viewer-show');
   clearTimeout(videoBarTimer);
 }
-function hideVideoBarSoon(ms = 1000) {
+
+//  隐藏 播放 控制条
+function hideVideoBarSoon(ms = 200) {
   clearTimeout(videoBarTimer);
   videoBarTimer = setTimeout(() => {
     const bar = $('videoBar');
@@ -3814,7 +4164,9 @@ function showViewerPlaylist() {
   $('viewerPlaylist').classList.add('viewer-show');
   clearTimeout(vpTimer);
 }
-function hideViewerPlaylistSoon(ms = 300) { // L109：离开后 300ms 内消失
+
+//   隐藏播放列表
+function hideViewerPlaylistSoon(ms = 200) { // L109：离开后 200ms 内消失
   clearTimeout(vpTimer);
   vpTimer = setTimeout(() => {
     if (!$('viewerPlaylist').matches(':hover')) $('viewerPlaylist').classList.remove('viewer-show');
@@ -5987,12 +6339,12 @@ window.addEventListener('keydown', (e) => {
     else closePerfSettings();
     e.preventDefault(); return;
   }
-  // 表演中：空格暂停/继续；Tab 切换模式；数字键 1-5 直跳指定模式；Esc 由下方通用分支退出表演
+  // 表演中：空格暂停/继续；Tab 切换模式；数字键 1-9 直跳指定模式；Esc 由下方通用分支退出表演
   if (perf.active) {
     if (e.code === 'Space') { togglePerfPause(); e.preventDefault(); return; }
     if (e.key === 'Tab') { perfCycleMode(e.shiftKey ? -1 : 1); e.preventDefault(); return; }
-    // 数字键 1-5：直跳对应模式
-    const numModes = { '1': 'waterfall', '2': 'cards', '3': 'array', '4': 'slideshow', '5': 'cover' };
+    // 数字键 1-9：直跳对应模式
+    const numModes = { '1': 'waterfall', '2': 'cards', '3': 'array', '4': 'slideshow', '5': 'cover', '6': 'carousel', '7': 'mosaic', '8': 'float', '9': 'tunnel' };
     if (numModes[e.key]) {
       const next = numModes[e.key];
       if (next !== perf.mode) {
@@ -6000,7 +6352,7 @@ window.addEventListener('keydown', (e) => {
         saveCfg();
         syncPerfUI();
         startPerfMode(next);
-        showTopToast('模式：' + ({ waterfall: '瀑布流', cards: '卡片动画', array: '阵列图案', slideshow: '幻灯片', cover: '封面流' })[next]);
+        showTopToast('模式：' + PERF_MODE_NAMES[next]);
       }
       e.preventDefault(); return;
     }
@@ -6204,6 +6556,9 @@ window.addEventListener('resize', () => {
     requestAnimationFrame(() => {
       resizeRafPending = false;
       renderVirtual();
+      // 表演模式自适应：float 更新边界（卡位置不重置）；carousel 重算半径/卡框；
+      // mosaic/split 为 CSS grid 分数布局，自动适应无需处理
+      if (perf.active) perfResize();
     });
   }
   resizeT = setTimeout(() => {
@@ -6855,6 +7210,36 @@ function perfCfg() {
     slideRandom: false,
     coverInterval: 2.5, coverEffect: 'zoom', coverRandomFx: false, coverSideCount: 3,
     coverRandom: false,
+    // 模式6 3D 圆筒
+    carouselSpin: 'step', carouselInterval: 6, carouselSpeed: 8,
+    carouselVisible: 2, carouselWidth: 46, carouselRandomStart: false,
+    carouselShape: 'cylinder', carouselSolid: 'cube', // 多面体形态的立体形状
+    carouselPolySize: 27, // 多面体大小：最大面距 R 占视口短边的百分比（12-45）
+    carouselPolyInterval: 6, // 多面体步进：每面切换间隔（秒，0.5-60）
+    // 模式7 活拼贴墙
+    mosaicCols: 4, mosaicRows: 3, mosaicInterval: 8, mosaicJitter: true,
+    mosaicAnim: 'fade', mosaicVideoCount: 6, mosaicWave: false,
+    mosaicWaveInterval: 60, mosaicGap: 8,
+    mosaicFocus: 'off', mosaicFocusInterval: 10, // 景深聚焦：off|random|timer
+    // 模式8 漂浮粒子流
+    floatCount: 12, floatSpeed: 1, floatSpin: 8, floatDepth: true,
+    floatVideos: 6, floatSwap: 'wrap', floatInterval: 10,
+    // 模式9 时空隧道（默认值 = 用户当前调校参数固化，2026-10-13）
+    tunnelShape: 'hex', tunnelSpeed: 0.6, tunnelCount: 30,
+    tunnelVideos: 6, tunnelStart: 30, // 起播点：进入距近端深度百分比才播
+    tunnelCoreN: 6, tunnelCoreSize: 18, tunnelCoreGap: 1.1, tunnelCoreDrift: 6,
+    tunnelVpx: 4, tunnelVpy: -1, tunnelStars: true,
+    tunnelNearZ: 860, tunnelFarZ: 4550, // 近端穿出/远端进入平面（Z 消失点两翼）
+    tunnelDof: 6, tunnelGlow: 600, // 景深量 / 消失点辉光范围
+    tunnelNeon: true, tunnelNeonEnter: 73, // 霓虹总开关 / 进入时机%（主轴卡生命线位置）
+    tunnelNeonWidth: 1, tunnelNeonGlowAmt: 84, // 霓虹线条粗细px（0=无描边）/ 辉光强度%（0=无辉光）
+    tunnelWallBright: 100, // 氛围卡片亮度%（30-150，发光卡不受影响恒为正常亮度）
+    tunnelWallOpacity: 20, tunnelRandOpacity: 100, tunnelRandOpaque: 34, // 透明度%(0-100)/随机透明概率%/随机不透明概率%
+    tunnelNeonRate: 100, // 氛围卡霓虹概率%（独立随机抽奖）
+    tunnelSpin: 8, tunnelGlowRate: 59, tunnelGlitchRate: 0, // 宇宙自转漂移 / 发光与失真概率
+    tunnelSub: { hex: { speed: 0.6 }, spaced: { count: 30 } }, // 子模式独立参数 {spaced/round/quad/hex/dodec/space: {speed,count,videos,start}}
+    // 模式6 3D 圆筒：同时播放视频数上限（默认 6，最大 30）
+    perfVidLimit: 6,
     mute: true,
   };
 }
@@ -6935,24 +7320,40 @@ function perfRandomQueue(queueRef, list, n) {
 const perfVidPool = new Map();
 const PERF_VID_MAX = 20;  // 同时缓冲的视频上限（当前展示 + 预判队列）
 const PERF_PREFETCH = 6; // 预判未来多少个媒体位
+// 进行中的 perfEnsureVideo 调用（去重）：perfPrefetch 与 perfShowVideo 可能并发
+// 请求同一文件，若无去重会新建两个 video 元素、池中 set 覆盖——被 attach 播放的是
+// 游离元素 A，流转回中央后池命中元素 B（currentTime=0），表现为「播着播着从头播」。
+const perfEnsuring = new Map();
 
 /** 确保池中已有某视频（离屏即可开始缓冲，不播放） */
 async function perfEnsureVideo(path) {
   let e = perfVidPool.get(path);
   if (e) return e;
-  const playPath = await playableVideoSrc(path);
-  // await 期间可能已被退出表演清空
-  if (!perf.active) return null;
-  const v = document.createElement('video');
-  v.muted = true;
-  v.loop = true;
-  v.playsInline = true;
-  v.preload = 'auto';
-  v.src = convertFileSrc(playPath);
-  e = { v, last: 0 };
-  perfVidPool.set(path, e);
-  perfTrimPool();
-  return e;
+  let pr = perfEnsuring.get(path);
+  if (pr) return pr;
+  pr = (async () => {
+    const playPath = await playableVideoSrc(path);
+    // await 期间可能已被退出表演清空或已有并发完成的副本
+    if (!perf.active) return null;
+    e = perfVidPool.get(path);
+    if (e) return e;
+    const v = document.createElement('video');
+    v.muted = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    v.src = convertFileSrc(playPath);
+    e = { v, last: 0 };
+    perfVidPool.set(path, e);
+    perfTrimPool();
+    return e;
+  })();
+  perfEnsuring.set(path, pr);
+  try {
+    return await pr;
+  } finally {
+    perfEnsuring.delete(path);
+  }
 }
 
 /** 为表演视频创建悬浮控制条（不绑定任何 v 级监听器；更新由 perfAttachCtrl 单例驱动）。
@@ -6991,7 +7392,11 @@ function makePerfCtrl(v) {
   let dragging = false;
   seek.addEventListener('pointerdown', (e) => { dragging = true; seek.setPointerCapture(e.pointerId); setFromPointer(e); });
   seek.addEventListener('pointermove', (e) => { if (dragging) setFromPointer(e); });
-  seek.addEventListener('pointerup', () => { dragging = false; });
+  seek.addEventListener('pointerup', () => {
+    dragging = false;
+    // 双向同步：拖动结束后画廊里的同文件卡片连播放头一起跳转
+    if (v.duration && v._perfPath) peerSeekApply(v._perfPath, v.currentTime, v);
+  });
   seek.addEventListener('pointercancel', () => { dragging = false; });
 
   vol.addEventListener('input', () => {
@@ -7043,6 +7448,8 @@ function perfAttachCtrl(v, path, host) {
         c.querySelector('.player-seek-fill').style.width = p * 100 + '%';
         c.querySelector('.player-seek-knob').style.left = p * 100 + '%';
       }
+      // 双向同步：广播给画廊里同文件卡片的进度条（对端暂停时连画面一起对齐）
+      if (v.duration) peerSyncProgress(v._perfPath || path, v.currentTime, v.duration, v);
       // 外部进度记录 1s 节流（落盘/跨模式同步用）
       const now = performance.now();
       if (now - lastTick < 1000) return;
@@ -7085,7 +7492,14 @@ function perfShowVideo(path, host) {
       markReady();
       e.v.play().catch(() => {});
     } else {
+      // readyState 已降级（封面流侧位视频脱离 DOM 后 Chromium 释放解码缓冲）：
+      // load() 会把 currentTime 清零（media element reset），先记录中断位置，
+      // canplay 后恢复——否则卡片流转回中央表现为「从头播起」
+      const keepAt = e.v.currentTime;
       e.v.addEventListener('canplay', () => {
+        if (keepAt > 1 && e.v.duration > 0 && Math.abs(e.v.currentTime - keepAt) > 1) {
+          try { e.v.currentTime = keepAt; } catch { /* 忽略 */ }
+        }
         markReady();
         if (e.v.isConnected && perf.active) e.v.play().catch(() => {});
       }, { once: true });
@@ -7174,7 +7588,7 @@ function enterPerf() {
   if (perf.activatedImmersive) setImmersive(true);
   if (perfCfg().mute) muteAllCardPreviews();
   startPerfMode(perfCfg().mode || 'waterfall');
-  showTopToast('画廊表演中 · F2 设置 · 1-5/Tab 切模式 · 空格 暂停 · F1/Esc 退出');
+  showTopToast('画廊表演中 · F2 设置 · 1-9/Tab 切模式 · 空格 暂停 · F1/Esc 退出');
 }
 
 function exitPerf() {
@@ -7182,6 +7596,7 @@ function exitPerf() {
   perf.active = false;
   perf.paused = false;
   stopPerfTimers();
+  perfModeCleanup(); // 各模式专属定时器/状态（mosaic 每格定时器等）
   previewSuspend.perf = false;
   perfClearVideos(); // 释放表演视频队列
   const overlay = $('perfOverlay');
@@ -7201,6 +7616,13 @@ function exitPerf() {
 listen('tray-perf', () => {
   if (perf.active) exitPerf();
   else enterPerf();
+});
+
+// 窗口隐藏到托盘 / 最小化时，后端已回收全部 ffmpeg 视频类工作（转码流被杀）。
+// 暂停预览器视频避免僵等死流；进度已由 timeupdate 落账，窗口恢复后续播。
+listen('ffmpeg-released', () => {
+  if (viewerCurKind !== 'video') return;
+  try { vVideo.pause(); } catch { /* 忽略 */ }
 });
 
 function togglePerfPause() {
@@ -7256,7 +7678,8 @@ function stopPerfTimers() {
 }
 
 /** 循环切换表演模式：Tab 键 / 模式 TAB 点击均走这里 */
-const PERF_MODES = ['waterfall', 'cards', 'array', 'slideshow', 'cover'];
+const PERF_MODES = ['waterfall', 'cards', 'array', 'slideshow', 'cover', 'carousel', 'mosaic', 'float', 'tunnel'];
+const PERF_MODE_NAMES = { waterfall: '瀑布流', cards: '卡片动画', array: '阵列图案', slideshow: '幻灯片', cover: '封面流', carousel: '3D 圆筒', mosaic: '活拼贴墙', float: '漂浮粒子流', tunnel: '时空隧道' };
 function perfCycleMode(step = 1) {
   const cur = PERF_MODES.indexOf(perf.mode);
   const next = PERF_MODES[(cur + step + PERF_MODES.length) % PERF_MODES.length];
@@ -7265,16 +7688,17 @@ function perfCycleMode(step = 1) {
   saveCfg();
   syncPerfUI();
   startPerfMode(next);
-  showTopToast('模式：' + ({ waterfall: '瀑布流', cards: '卡片动画', array: '阵列图案', slideshow: '幻灯片', cover: '封面流' })[next]);
+  showTopToast('模式：' + PERF_MODE_NAMES[next]);
 }
 
 /** 切换/启动表演模式（设置面板 TAB 选中即调用） */
 function startPerfMode(mode) {
   stopPerfTimers();
+  perfModeCleanup(); // 各模式专属定时器/状态（perf.rafId / perf.timer 已由上面统一清）
   perf.mode = mode;
   const overlay = $('perfOverlay');
-  // 定格类模式（卡片动画 / 阵列图案 / 幻灯片 / 封面流）用覆盖层；瀑布流看真实画廊
-  const overlayModes = ['cards', 'array', 'slideshow', 'cover'];
+  // 定格类模式（卡片动画 / 阵列图案 / 幻灯片 / 封面流 / 走马灯 / 拼贴墙 / 粒子流 / 分屏）用覆盖层；瀑布流看真实画廊
+  const overlayModes = ['cards', 'array', 'slideshow', 'cover', 'carousel', 'mosaic', 'float', 'tunnel'];
   const isOverlay = overlayModes.includes(mode);
   overlay.classList.toggle('hidden', !isOverlay);
   // 必须显式挂 perf-overlay：背景模糊/压暗样式全靠它（初始 HTML 上没有）
@@ -7298,7 +7722,34 @@ function startPerfMode(mode) {
   else if (mode === 'cards') startCardsAnim();
   else if (mode === 'array') startRandomArray();
   else if (mode === 'slideshow') startSlideshow();
-  else startCoverFlow();
+  else if (mode === 'cover') startCoverFlow();
+  else if (mode === 'carousel') startCarousel();
+  else if (mode === 'mosaic') startMosaic();
+  else if (mode === 'float') startFloat();
+  else if (mode === 'split') startTunnel(); // 旧配置残留 split 时同样进隧道
+  else if (mode === 'tunnel') startTunnel();
+  // 旧模式遗留的池内视频此刻均已脱离展示容器，统一起 pause，避免继续占用解码器
+  perfPauseDetached();
+}
+
+/** 模式专属清理：切换模式 / 退出表演时调用（perf.rafId / perf.timer 由 stopPerfTimers 统一清） */
+function perfModeCleanup() {
+  // mosaic：自重排定时器 id 在各格 st.timer 上滚动、无法枚举，用换代号让存活链在下次触发时立即作废
+  perf._mosGen = (perf._mosGen || 0) + 1;
+  if (perf._mosFocusTimer) { clearTimeout(perf._mosFocusTimer); perf._mosFocusTimer = 0; }
+  mosCells = [];
+  tunCards = [];
+  tunStage = null; tunWall = null; tunCoreBox = null; tunStarsEl = null;
+  tunGeo.tunRings = [];
+  tunGeo.coreFrontCard = null;
+  perf._tunFlags = null;
+  // 清理霓虹闪烁定时器
+  for (const card of tunCards) { if (card._neonFlicker) { clearTimeout(card._neonFlicker); card._neonFlicker = null; } }
+  fltCards = [];
+  carCards = [];
+  carRing = null;
+  carPoly = null;
+  carPolyGeo.faces = [];
 }
 
 // ─── 模式1 瀑布流：视口自动滚动（rAF 平滑 / setInterval 随机跳动） ───
@@ -7589,7 +8040,7 @@ function startCardsAnim() {
 /** 本帧停留时长：错峰开启时 +0~100% 随机；保底 ≥ 入场动画(淡入+错峰上限)+300ms 凝视 */
 function cardsFrameDelay() {
   const c = perfCfg();
-  const base = Math.max(300, (c.cardsInterval ?? 2) * 1000);
+  const base = Math.max(500, (c.cardsInterval ?? 2) * 1000);
   const ms = c.cardsSync ? base + Math.random() * base : base;
   const floor = (c.cardsFade ?? 450)
     + (c.cardsSync ? Math.max(0, c.cardsSyncMax ?? 2000) : 0) + 300;
@@ -7747,10 +8198,10 @@ function scheduleArrayTimer() {
       if (!perf.active || perf.mode !== 'array') return;
       if (perf.paused) { arm(250); return; }
       dealArrayFrame();
-      arm(Math.max(300, (perfCfg().arrayInterval ?? 2) * 1000));
+      arm(Math.max(500, (perfCfg().arrayInterval ?? 2) * 1000));
     }, ms);
   };
-  arm(Math.max(300, (perfCfg().arrayInterval ?? 2) * 1000));
+  arm(Math.max(500, (perfCfg().arrayInterval ?? 2) * 1000));
 }
 
 /**
@@ -8313,6 +8764,1566 @@ function renderCover() {
   coverPreload(preloadIdx);
 }
 
+// ─── 模式6-9 公共辅助 ───
+/** 洗牌牌堆逐张取号（mosaic / split / float / carousel 共用）：一轮取完自动重洗 */
+function dealNextMedia(list) {
+  if (!list.length) return null;
+  if (perf.deckPos >= perf.deck.length) perfShuffle(list);
+  return list[perf.deck[perf.deckPos++]];
+}
+
+/** 从牌堆取下一张「图片」（跳过视频项，最多试一整轮） */
+function dealNextImage(list) {
+  for (let i = 0; i < list.length; i++) {
+    const it = dealNextMedia(list);
+    if (it && it.kind === 'image') return it;
+  }
+  return null;
+}
+
+/** 视频摘除三件套（封面流同款）：控制条随元素摘除，元素脱离 DOM 回池由 perfPauseDetached 暂停 */
+function perfDetachVideo(v) {
+  v?._perfWrap?.remove();
+  if (v) { v._perfWrap = null; v._perfCtrl = null; }
+  v?.remove();
+}
+
+/** 视频格/视频槽的封面垫底：先显示缩略图，避免起播前黑块 */
+function perfThumbCover(path, img) {
+  const t = thumbAny(path);
+  if (t?.url) { img.src = t.url; return; }
+  loadThumb(path, 'video', 640).then((tt) => { if (tt?.url) img.src = tt.url; });
+}
+
+// ─── 模式6 3D 圆筒：卡片围成 3D 圆筒/多面体，步进 / 连续两种推进，可见卡视频自动起播 ───
+let carCards = [];
+let carRing = null;
+let carGeo = { R: 0, cardW: 0, cardH: 0, step: 0, N: 0 };
+let carIdx = 0;        // step 模式游标（持续递增，ring 角度 = -idx·step）
+let carAngle = 0;      // 当前 ring 角度（度）；连续模式逐帧累加
+
+function startCarousel() {
+  const list = perfMedia();
+  if (!list.length) { startPerfMode('waterfall'); return; }
+  const c = perfCfg();
+  // 牌堆：全部媒体（视频不再截池，参与量由「同时播放上限」约束）
+  const deck = [...list];
+  perfShuffle(deck);
+  // 多面体形态：卡片按面法线组合成封闭立体整体翻滚，与圆筒运动完全分离
+  if ((c.carouselShape || 'cylinder') === 'polyhedron') {
+    startCarouselPoly(deck, c);
+    return;
+  }
+  const overlay = $('perfOverlay');
+  overlay.innerHTML = '';
+  const stage = document.createElement('div');
+  stage.className = 'car-stage';
+  carRing = document.createElement('div');
+  carRing.className = 'car-ring';
+  stage.appendChild(carRing);
+  overlay.appendChild(stage);
+  // 圆筒：可见卡数推导环大小
+  const V = Math.max(1, Math.min(3, c.carouselVisible ?? 2));
+  carGeo.N = Math.min(2 * V + 3, 9); // 卡数封顶 9，避免小圆筒上卡过密
+  carGeo.step = 360 / carGeo.N;
+  carCards = [];
+  for (let s = 0; s < carGeo.N; s++) {
+    const el = document.createElement('div');
+    el.className = 'car-card';
+    el.innerHTML = '<div class="car-inner"><img alt="" draggable="false" decoding="async"></div>';
+    carRing.appendChild(el);
+    carCards.push({ el, inner: el.querySelector('.car-inner'), img: el.querySelector('img'), path: '', isVideo: false, slot: s, _hidden: false, _vid: false });
+  }
+  carIdx = c.carouselRandomStart ? Math.floor(Math.random() * carGeo.N) : 0;
+  carAngle = -carIdx * carGeo.step;
+  carLayout();
+  carApplyRing(false); // 无过渡落位
+  for (const card of carCards) carAssignContent(card, deck);
+  if ((c.carouselSpin || 'step') === 'step') {
+    carVisibleVideos(deck); // 立即起播可见视频
+    scheduleCarouselTimer(deck);
+  } else {
+    perf.lastTs = performance.now();
+    const tick = (ts) => {
+      if (!perf.active || perf.mode !== 'carousel') return;
+      const dt = Math.min(0.05, (ts - perf.lastTs) / 1000);
+      perf.lastTs = ts;
+      if (!perf.paused) {
+        carAngle -= Math.max(0.5, perfCfg().carouselSpeed ?? 8) * dt;
+        carApplyRing(false);
+        carVisibleVideos(deck);
+        carRecycle(deck);
+      }
+      perf.rafId = requestAnimationFrame(tick);
+    };
+    perf.rafId = requestAnimationFrame(tick);
+  }
+  perfPrefetch(carWanted(deck));
+}
+
+/** 步进定时器：推进一格游标（ring CSS transition 补间），刷新可见视频 */
+function scheduleCarouselTimer(deck) {
+  if (perf.timer) { clearInterval(perf.timer); perf.timer = 0; }
+  perf.timer = setInterval(() => {
+    if (!perf.active || perf.mode !== 'carousel') return;
+    if (perf.paused) return;
+    if ((perfCfg().carouselShape || 'cylinder') === 'polyhedron') {
+      polyStepAnim(deck); // 多面体：整体复合翻转一步（转场明确）
+      return;
+    }
+    carIdx++;
+    carAngle = -carIdx * carGeo.step; // 必须重算：carApplyRing 读 carAngle，只递增游标不更新角度会导致步进不动
+    carApplyRing(true);
+    carVisibleVideos(deck);
+    carRecycle(deck);
+    perfPrefetch(carWanted(deck));
+  }, Math.max(0.5, (perfCfg().carouselShape || 'cylinder') === 'polyhedron'
+    ? (perfCfg().carouselPolyInterval ?? 6) // 多面体：每面切换间隔（独立滑块）
+    : (perfCfg().carouselInterval ?? 6)) * 1000);
+}
+
+/** 计算卡框尺寸与圆筒半径（R 由卡宽推出，保证相邻卡不重叠）并定型各卡 */
+function carLayout() {
+  const vw = Math.max(30, Math.min(60, perfCfg().carouselWidth ?? 46));
+  carGeo.cardW = window.innerWidth * vw / 100;
+  carGeo.cardH = Math.min(window.innerHeight * 0.66, carGeo.cardW * 0.72);
+  carGeo.R = (carGeo.cardW / 2) / Math.tan(Math.PI / carGeo.N);
+  for (const card of carCards) {
+    card.el.style.width = `${carGeo.cardW.toFixed(1)}px`;
+    card.el.style.height = `${carGeo.cardH.toFixed(1)}px`;
+    card.el.style.transform =
+      `translate(-50%,-50%) rotateY(${card.slot * carGeo.step}deg) translateZ(${carGeo.R.toFixed(1)}px)`;
+  }
+}
+
+function carApplyRing(animate) {
+  if (!carRing) return;
+  carRing.style.transition = animate ? 'transform 1s ease' : 'none';
+  // ring 后推 R：正面卡落在 z≈0 平面，构图居中
+  carRing.style.transform = `translateZ(${(-carGeo.R).toFixed(1)}px) rotateY(${carAngle.toFixed(2)}deg)`;
+}
+
+/** 归一化角度到 [-180, 180) */
+function carNorm(a) { return ((a % 360) + 540) % 360 - 180; }
+
+function carFrontSlotNow() {
+  let best = 0, bd = 1e9;
+  for (const card of carCards) {
+    const d = Math.abs(carNorm(card.slot * carGeo.step + carAngle));
+    if (d < bd) { bd = d; best = card.slot; }
+  }
+  return best;
+}
+
+/** 可见视频管理：面向观众（|角度|<90°）的视频卡按面向度升序起播（近者优先），
+    受「同时播放视频数」上限约束；转背/隐藏后摘除恢复封面。card._vid 状态门控。 */
+function carVisibleVideos(deck) {
+  const limit = Math.max(1, Math.min(30, perfCfg().perfVidLimit ?? 6));
+  const vis = carCards
+    .filter((cd) => cd.isVideo)
+    .map((cd) => ({ cd, facing: Math.abs(carNorm(cd.slot * carGeo.step + carAngle)) }))
+    .sort((a, b) => a.facing - b.facing);
+  let used = 0;
+  for (const { cd, facing } of vis) {
+    const want = facing < 90 && used < limit;
+    if (want) used++;
+    if (want && !cd._vid) {
+      cd._vid = true;
+      cd.img.style.display = 'none';
+      perfShowVideo(cd.path, cd.inner);
+    } else if (!want && cd._vid) {
+      cd._vid = false;
+      const pv = cd.inner.querySelector('video');
+      if (pv) perfDetachVideo(pv);
+      cd.img.style.display = '';
+    }
+  }
+}
+
+/** 转到背面（backface 不可见）的卡在穿越瞬间从牌堆换下一份内容 */
+function carRecycle(list) {
+  // 隐藏线 = backface 90° 再外推 0.35 步长，确保换装时卡已完全不可见
+  const limit = 90 + carGeo.step * 0.35;
+  for (const card of carCards) {
+    const facing = Math.abs(carNorm(card.slot * carGeo.step + carAngle));
+    const hidden = facing > limit;
+    if (hidden && !card._hidden) {
+      card._hidden = true;
+      carAssignContent(card, list); // 只在「可见→隐藏」穿越时换一次，不逐帧刷新
+    } else if (!hidden) {
+      card._hidden = false;
+    }
+  }
+}
+
+/** 给环上卡分配牌堆下一份内容：图片=原图；视频=封面帧，转可见才由 carVisibleVideos 起播 */
+function carAssignContent(card, deck) {
+  if (card._vid) { // 换装前摘掉残留视频（防快速连续换装漏摘）
+    card._vid = false;
+    const pv = card.inner.querySelector('video');
+    if (pv) perfDetachVideo(pv);
+    card.img.style.display = '';
+  }
+  for (let i = 0; i < deck.length; i++) {
+    const item = dealNextMedia(deck);
+    if (!item) return;
+    card.path = item.path;
+    if (item.kind === 'video') {
+      card.isVideo = true;
+      perfThumbCover(item.path, card.img);
+      // 隐藏态直接挂高清帧（loadThumb 队列并发受控），转正面前已就绪
+      loadThumb(item.path, 'video', PERF_VIDEO_THUMB).then((t) => {
+        if (t && card.path === item.path) card.img.src = t.url;
+      });
+    } else {
+      card.isVideo = false;
+      card.img.src = convertFileSrc(item.path);
+    }
+    return;
+  }
+}
+
+/** 预判：中央 ±(V+1) 槽位的 path 序列 */
+function carWanted(list) {
+  const V = Math.max(1, Math.min(3, perfCfg().carouselVisible ?? 2));
+  const front = carFrontSlotNow();
+  const out = [];
+  for (let k = -V - 1; k <= V + 1; k++) {
+    const s = ((front + k) % carGeo.N + carGeo.N) % carGeo.N;
+    const card = carCards.find((cd) => cd.slot === s);
+    if (card?.path) out.push(card.path);
+  }
+  return out;
+}
+
+/** resize / 卡宽变化：重算半径与卡框并热应用（保持当前角度） */
+function carResize() {
+  if (!carRing) return;
+  carLayout();
+  carApplyRing(false);
+}
+
+// ─── 多面体形态：N 张卡按均匀面法线组合成封闭立体，整体复合翻滚（与圆筒运动分离） ───
+let carPoly = null;
+let carPolyGeo = { faces: [] }; // 每面 { n:法线, R:面心距, w, h, roll, clip }
+let carPolyRot = { x: -18, y: 24 }; // 当前翻滚角（度）
+
+function startCarouselPoly(deck, c) {
+  const overlay = $('perfOverlay');
+  overlay.innerHTML = '';
+  const stage = document.createElement('div');
+  stage.className = 'car-stage';
+  carPoly = document.createElement('div');
+  carPoly.className = 'car-poly';
+  stage.appendChild(carPoly);
+  overlay.appendChild(stage);
+  const spec = polySolidSpec(c.carouselSolid || 'cube');
+  carPolyGeo.faces = spec;
+  carGeo.N = spec.length;
+  carCards = [];
+  for (let s = 0; s < carGeo.N; s++) {
+    const el = document.createElement('div');
+    el.className = 'car-card';
+    el.innerHTML = '<div class="car-inner"><img alt="" draggable="false" decoding="async"></div>';
+    carPoly.appendChild(el);
+    carCards.push({ el, inner: el.querySelector('.car-inner'), img: el.querySelector('img'), path: '', isVideo: false, slot: s, _hidden: false, _vid: false });
+  }
+  polyLayout();
+  for (const card of carCards) carAssignContent(card, deck);
+  carPolyRot = { x: -18, y: 24 };
+  polyApplyRot(false);
+  polyRecycle(deck);
+  polyVideosTick();
+  if ((c.carouselSpin || 'step') === 'step') {
+    scheduleCarouselTimer(deck); // 内部按形态分支：步进 = 整体复合翻转一步
+  } else {
+    perf.lastTs = performance.now();
+    const tick = (ts) => {
+      if (!perf.active || perf.mode !== 'carousel') return;
+      const dt = Math.min(0.05, (ts - perf.lastTs) / 1000);
+      perf.lastTs = ts;
+      if (!perf.paused) {
+        const sp = Math.max(0.5, perfCfg().carouselSpeed ?? 8) / 8; // 速度基准 8 → 1x
+        carPolyRot.x += 5.3 * sp * dt;
+        carPolyRot.y += 8.5 * sp * dt; // 双轴异速 → 复合翻滚
+        polyApplyRot(false);
+        polyRecycle(deck);
+        polyVideosTick();
+      }
+      perf.rafId = requestAnimationFrame(tick);
+    };
+    perf.rafId = requestAnimationFrame(tick);
+  }
+  perfPrefetch(carCards.map((cd) => cd.path).filter(Boolean));
+}
+
+/** 立体规格引擎：按所选体式返回每面的 { n:法线, R:面心距, w, h, roll, clip }。
+    支持五种柏拉图立体 + 长方体；卡片为「圆心盒」：盒尺寸 = 面外接圆直径 2ρ，
+    clip polygon 按真实顶点在面内正视基下的方位精确编码（顶点落位误差 < 1e-5），
+    roll=180 使内容视觉正立（180° 旋转非镜像，不破坏顶点落位）。 */
+function polySolidSpec(solid) {
+  const PHI = (1 + Math.sqrt(5)) / 2;
+  const IPHI = 1 / PHI;
+  const norm = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+
+  // 渲染映射：卡局部点 (a,b) → 世界 a·e1 + b·e2 + R·n（roll=0 时，e1/e2 与 polyLayout 的
+  // rotateY(az) rotateX(-elv) 局部基一致）。故 clip 顶点编码 a=dot(p,e1)、b=dot(p,e2) 即精确落位；
+  // 整体取反 (−a,−b) + roll=180 等价于卡面旋转半圈 → 内容正立且顶点集合不变。
+  const face = (nRaw, vs) => {
+    const n = norm(nRaw);
+    const c = [0, 1, 2].map((k) => vs.reduce((s, v) => s + v[k], 0) / vs.length);
+    const R = Math.hypot(c[0], c[1], c[2]);
+    const az = Math.atan2(n[0], n[2]);
+    const e1 = [Math.cos(az), 0, -Math.sin(az)];
+    const e2 = cross(n, e1);
+    const pts = vs.map((v) => { const p = sub(v, c); return [dot(p, e1), dot(p, e2)]; });
+    const rho = Math.max(...pts.map((p) => Math.hypot(p[0], p[1])));
+    const GROW = 1.003; // 微扩 0.3% 补偿 GPU 光栅化的共享棱半像素缝（相似放大，非重叠拼接）
+    // 盒尺寸同步放大 GROW，顶点百分比按原始比例编码 → 实际多边形外扩 GROW 且不超出盒边界
+    const clipPts = pts.map((p) => [(-p[0] / rho + 1) / 2 * 100, (-p[1] / rho + 1) / 2 * 100]);
+    const clip = 'polygon(' + clipPts.map((p) => `${p[0].toFixed(3)}% ${p[1].toFixed(3)}%`).join(', ') + ')';
+    return { n, R, w: 2 * rho * GROW, h: 2 * rho * GROW, roll: 180, clip };
+  };
+  // 通用面集：对每个法线取 dot 最大的顶点组（同分容差），按 (e1,e2) 面内极角排环序
+  const buildFaces = (normalList, verts) => {
+    return normalList.map((nRaw) => {
+      const n = norm(nRaw);
+      const scored = verts.map((v) => ({ v, d: dot(n, v) }));
+      const maxd = Math.max(...scored.map((s) => s.d));
+      let vs = scored.filter((s) => s.d > maxd - 1e-6).map((s) => s.v);
+      const c = [0, 1, 2].map((k) => vs.reduce((s, v) => s + v[k], 0) / vs.length);
+      const az = Math.atan2(n[0], n[2]);
+      const e1 = [Math.cos(az), 0, -Math.sin(az)];
+      const e2 = cross(n, e1);
+      vs = vs.map((v) => { const p = sub(v, c); return { v, a: Math.atan2(dot(p, e2), dot(p, e1)) }; })
+        .sort((x, y) => x.a - y.a).map((o) => o.v);
+      return face(n, vs);
+    });
+  };
+  const cubeSigns = [];
+  for (const x of [1, -1]) for (const y of [1, -1]) for (const z of [1, -1]) cubeSigns.push([x, y, z]);
+  const axisPairs = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  // 十二面体面法线 = 二十面体顶点方向；二十面体面法线 = 十二面体顶点方向（对偶）
+  const dodecaVerts = [
+    ...cubeSigns,
+    ...[[0, PHI, IPHI], [0, PHI, -IPHI], [0, -PHI, IPHI], [0, -PHI, -IPHI],
+      [IPHI, 0, PHI], [IPHI, 0, -PHI], [-IPHI, 0, PHI], [-IPHI, 0, -PHI],
+      [PHI, IPHI, 0], [PHI, -IPHI, 0], [-PHI, IPHI, 0], [-PHI, -IPHI, 0]],
+  ];
+  const icosaVerts = [
+    ...[[0, 1, PHI], [0, 1, -PHI], [0, -1, PHI], [0, -1, -PHI],
+      [1, PHI, 0], [1, -PHI, 0], [-1, PHI, 0], [-1, -PHI, 0],
+      [PHI, 0, 1], [PHI, 0, -1], [-PHI, 0, 1], [-PHI, 0, -1]],
+  ];
+
+  if (solid === 'tetra') {
+    const verts = [[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]];
+    return buildFaces(verts.map((v) => [-v[0], -v[1], -v[2]]), verts); // 面法线 = 对顶点反向
+  }
+  if (solid === 'octa') return buildFaces(cubeSigns, axisPairs); // 面法线=卦限方向，顶点=轴
+  if (solid === 'dodeca') return buildFaces(icosaVerts, dodecaVerts); // 12 五边形面
+  if (solid === 'icosa') return buildFaces(dodecaVerts, icosaVerts); // 20 三角形面
+  if (solid === 'cuboid') {
+    const h = 0.75, v = 0.5, d = 0.575; // A×B×C = 1.5×1.0×1.15
+    const verts = [];
+    for (const x of [h, -h]) for (const y of [v, -v]) for (const z of [d, -d]) verts.push([x, y, z]);
+    return buildFaces(axisPairs, verts); // 6 矩形面
+  }
+  return buildFaces(axisPairs, cubeSigns); // cube：6 正方形面
+}
+
+/** 多面体定型：整体缩放使最大面距 = 短边×大小比例；卡尺寸/裁剪/朝向来自 polySolidSpec */
+function polyLayout() {
+  const minDim = Math.min(window.innerWidth, window.innerHeight);
+  const faces = carPolyGeo.faces;
+  if (!faces.length) return;
+  const baseR = Math.max(...faces.map((f) => f.R));
+  const scale = minDim * (Math.max(12, Math.min(45, perfCfg().carouselPolySize ?? 27)) / 100) / baseR;
+  for (let s = 0; s < carCards.length; s++) {
+    const card = carCards[s];
+    const f = faces[s];
+    if (!f) continue;
+    const n = f.n;
+    const az = Math.atan2(n[0], n[2]) * 180 / Math.PI;
+    const elv = Math.asin(Math.max(-1, Math.min(1, n[1]))) * 180 / Math.PI;
+    card.el.style.width = `${(f.w * scale).toFixed(1)}px`;
+    card.el.style.height = `${(f.h * scale).toFixed(1)}px`;
+    if (f.clip) {
+      card.el.style.clipPath = f.clip;
+      card.el.style.webkitClipPath = f.clip;
+    } else {
+      card.el.style.clipPath = '';
+      card.el.style.webkitClipPath = '';
+    }
+    // rotateY(方位角) rotateX(-仰角) rotateZ(形状方位) translateZ(R)：面法线转到 n，卡面朝外
+    card.el.style.transform =
+      `translate(-50%,-50%) rotateY(${az.toFixed(2)}deg) rotateX(${(-elv).toFixed(2)}deg) rotateZ(${f.roll.toFixed(2)}deg) translateZ(${(f.R * scale).toFixed(1)}px)`;
+  }
+}
+
+/** 整体翻滚姿态 */
+function polyApplyRot(animate) {
+  if (!carPoly) return;
+  carPoly.style.transition = animate ? 'transform 1s cubic-bezier(.45,.05,.2,1)' : 'none';
+  carPoly.style.transform = `rotateX(${carPolyRot.x.toFixed(2)}deg) rotateY(${carPolyRot.y.toFixed(2)}deg)`;
+}
+
+/** 面法线经整体翻滚后的 z 分量：>0 朝观众（n' = Rx(x)·Ry(y)·n） */
+function polyFaceZ(slot) {
+  const f = carPolyGeo.faces[slot];
+  if (!f) return 1;
+  const n = f.n;
+  const cy = Math.cos(carPolyRot.y * Math.PI / 180), sy = Math.sin(carPolyRot.y * Math.PI / 180);
+  const vy = n[1], vz = -n[0] * sy + n[2] * cy;
+  const cx = Math.cos(carPolyRot.x * Math.PI / 180), sx = Math.sin(carPolyRot.x * Math.PI / 180);
+  return vy * sx + vz * cx;
+}
+
+/** 步进翻滚：随机复合翻转动作（转场明确），缓动结束后换装/刷新可见视频 */
+function polyStepAnim(deck) {
+  const moves = [[90, 0], [-90, 0], [0, 120], [0, -120], [72, 108], [-72, -108]];
+  const mv = moves[Math.floor(Math.random() * moves.length)];
+  carPolyRot.x += mv[0];
+  carPolyRot.y += mv[1];
+  polyApplyRot(true);
+  setTimeout(() => {
+    if (!perf.active || perf.mode !== 'carousel') return;
+    if ((perfCfg().carouselShape || 'cylinder') !== 'polyhedron') return;
+    polyRecycle(deck);
+    polyVideosTick();
+    perfPrefetch(carCards.map((cd) => cd.path).filter(Boolean));
+  }, 1050);
+}
+
+/** 背面卡换装：世界 z < -0.5 视为不可见（面朝外，背向即完全看不见） */
+function polyRecycle(deck) {
+  for (const card of carCards) {
+    const hidden = polyFaceZ(card.slot) < -0.5;
+    if (hidden && !card._hidden) {
+      card._hidden = true;
+      carAssignContent(card, deck); // 只在「可见→隐藏」穿越时换一次
+    } else if (!hidden) {
+      card._hidden = false;
+    }
+  }
+}
+
+/** 可见视频管理（多面体）：朝前（z>0.25）按面向度降序起播，受同时播放上限约束 */
+function polyVideosTick() {
+  const limit = Math.max(1, Math.min(30, perfCfg().perfVidLimit ?? 6));
+  const vids = carCards
+    .filter((cd) => cd.isVideo)
+    .map((cd) => ({ cd, z: polyFaceZ(cd.slot) }))
+    .sort((a, b) => b.z - a.z);
+  let used = 0;
+  for (const { cd, z } of vids) {
+    const want = z > 0.25 && used < limit;
+    if (want) used++;
+    if (want && !cd._vid) {
+      cd._vid = true;
+      cd.img.style.display = 'none';
+      perfShowVideo(cd.path, cd.inner);
+    } else if (!want && cd._vid) {
+      cd._vid = false;
+      const pv = cd.inner.querySelector('video');
+      if (pv) perfDetachVideo(pv);
+      cd.img.style.display = '';
+    }
+  }
+}
+
+/** 多面体 resize：重算几何定型（翻滚角保持） */
+function polyResize() {
+  if (!carPoly) return;
+  polyLayout();
+}
+
+/** 窗口 resize 分发（表演中）：仅 float / carousel 需要手动适应 */
+function perfResize() {
+  if (perf.mode === 'float') {
+    fltW = window.innerWidth;
+    fltH = window.innerHeight;
+  } else if (perf.mode === 'carousel') {
+    if (carRing) carResize();
+    else polyResize();
+  } else if (perf.mode === 'tunnel') {
+    tunResize();
+  }
+}
+
+// ─── 模式7 活拼贴墙：CSS grid 铺满全屏，每格独立定时轮换，双层 crossfade ───
+let mosCells = [];
+
+function startMosaic() {
+  const list = perfMedia();
+  if (!list.length) { startPerfMode('waterfall'); return; }
+  const c = perfCfg();
+  perfShuffle(list);
+  const overlay = $('perfOverlay');
+  overlay.innerHTML = '';
+  const grid = document.createElement('div');
+  grid.className = 'mosaic-grid';
+  const cols = Math.max(2, Math.min(8, c.mosaicCols ?? 4));
+  const rows = Math.max(2, Math.min(6, c.mosaicRows ?? 3));
+  grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+  grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
+  grid.style.gap = `${Math.max(0, c.mosaicGap ?? 8)}px`;
+  overlay.appendChild(grid);
+  const total = cols * rows;
+  // 视频格：随机分配（上限 30，默认 6）
+  const vidN = Math.max(0, Math.min(30, c.mosaicVideoCount ?? 6));
+  const slots = Array.from({ length: total }, (_, i) => i);
+  const vidSlots = new Set();
+  for (let i = 0; i < vidN && slots.length; i++) {
+    vidSlots.add(slots.splice(Math.floor(Math.random() * slots.length), 1)[0]);
+  }
+  const vidList = list.filter((it) => it.kind === 'video');
+  perf._mosVidPos = 0;
+  mosCells = [];
+  for (let i = 0; i < total; i++) {
+    const el = document.createElement('div');
+    el.className = 'mosaic-cell';
+    el.innerHTML = '<img class="mosaic-img" alt="" draggable="false" decoding="async">' +
+      '<img class="mosaic-img top" alt="" draggable="false" decoding="async">';
+    grid.appendChild(el);
+    mosCells.push({
+      el, imgs: [...el.querySelectorAll('img')], cur: 0, timer: 0,
+      isVideo: vidSlots.has(i), video: null, busy: false, path: '',
+    });
+  }
+  // 首轮铺满：图片格直接落位（无过渡），视频格垫封面后起播
+  for (const st of mosCells) mosFillCell(st, list, vidList);
+  // 每格独立定时器 + 随机相位（首个间隔 30%~100% 随机，避免全屏整齐划一地换片）
+  perf._mosGen = (perf._mosGen || 0) + 1; // 换代号：本次启动的定时链与旧实例隔离
+  const base = Math.max(0.5, c.mosaicInterval ?? 8);
+  for (const st of mosCells) mosArmTimer(st, list, vidList, base * 1000 * (0.3 + Math.random() * 0.7));
+  scheduleMosaicWave();
+  // 景深聚焦：非 off 时立即挑一格，定时模式挂重挑链
+  if ((perfCfg().mosaicFocus || 'off') !== 'off') mosFocusPick();
+  scheduleMosaicFocus();
+  perfPreloadMedia(perfUpcoming(list, 8));
+}
+
+/** 首轮铺满：图片格 base 层直接显示；视频格垫封面帧 + perfShowVideo 起播 */
+function mosFillCell(st, list, vidList) {
+  if (st.isVideo && vidList.length) {
+    const item = vidList[perf._mosVidPos++ % vidList.length];
+    st.path = item.path;
+    perfThumbCover(item.path, st.imgs[0]);
+    st.imgs[0].style.opacity = '1';
+    perfShowVideo(item.path, st.el);
+    st.video = st.el.querySelector('video');
+    return;
+  }
+  const item = dealNextImage(list);
+  if (!item) return;
+  st.path = item.path;
+  const img = st.imgs[0];
+  img.style.transition = 'none';
+  img.onload = () => { img.style.transition = ''; };
+  img.src = convertFileSrc(item.path);
+  img.style.opacity = '1';
+  st.cur = 0;
+}
+
+/** 每格独立轮换定时器：间隔 ±30% 抖动（可关） */
+function mosArmTimer(st, list, vidList, ms) {
+  const gen = perf._mosGen || 0;
+  st.timer = setTimeout(() => {
+    if (gen !== (perf._mosGen || 0)) return; // 模式已切换/重启，整条链作废（防旧链复活误操作新格视频）
+    if (!perf.active || perf.mode !== 'mosaic') return;
+    if (perf.paused) { mosArmTimer(st, list, vidList, 250); return; }
+    mosSwapCell(st, list, vidList);
+    const base = Math.max(0.5, perfCfg().mosaicInterval ?? 8);
+    const jitter = perfCfg().mosaicJitter ? 0.3 : 0;
+    mosArmTimer(st, list, vidList, Math.max(500, base * 1000 * (1 + (Math.random() * 2 - 1) * jitter)));
+  }, Math.max(250, ms));
+}
+
+/** 单格换片：视频格先摘旧视频再挂新（三件套）；图片格双层 crossfade（fade / zoom / none） */
+function mosSwapCell(st, list, vidList) {
+  if (st.isVideo && vidList.length) {
+    if (st.video) { perfDetachVideo(st.video); st.video = null; }
+    const item = vidList[perf._mosVidPos++ % vidList.length];
+    st.path = item.path;
+    perfShowVideo(item.path, st.el);
+    st.video = st.el.querySelector('video');
+    return;
+  }
+  if (st.busy) return; // 上一轮 crossfade 未完成，跳过本次
+  const item = dealNextImage(list);
+  if (!item || item.path === st.path) return;
+  st.busy = true;
+  const anim = perfCfg().mosaicAnim || 'fade';
+  const instant = anim === 'none';
+  const next = st.imgs[1 - st.cur];
+  const cur = st.imgs[st.cur];
+  // 换入层置顶：crossfade 期间上层不透明度爬升，底层不会透出背景
+  next.style.zIndex = '2';
+  cur.style.zIndex = '1';
+  next.classList.remove('mos-zoom');
+  if (instant) next.style.transition = 'none';
+  next.onload = () => {
+    st.busy = false;
+    if (!perf.active || perf.mode !== 'mosaic') return;
+    if (anim === 'zoom') next.classList.add('mos-zoom');
+    next.style.opacity = '1';
+    cur.style.opacity = '0';
+    st.cur = 1 - st.cur;
+    // 随机景深聚焦：每次换片完成后重挑聚焦格
+    if ((perfCfg().mosaicFocus || 'off') === 'random') mosFocusPick();
+    if (instant) requestAnimationFrame(() => { next.style.transition = ''; });
+  };
+  next.src = convertFileSrc(item.path);
+  st.path = item.path;
+}
+
+/** 波浪刷新：按「格子中心距屏幕中心」排序，从中心向外每格错峰 80ms 换一轮 */
+function scheduleMosaicWave() {
+  const c = perfCfg();
+  if (!c.mosaicWave) return;
+  perf.timer = setTimeout(() => {
+    if (!perf.active || perf.mode !== 'mosaic') return;
+    if (perf.paused) { scheduleMosaicWave(); return; }
+    const list = perfMedia();
+    const vidList = list.filter((it) => it.kind === 'video');
+    const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+    const order = mosCells
+      .map((st) => {
+        const r = st.el.getBoundingClientRect();
+        return { st, d: Math.hypot(r.left + r.width / 2 - cx, r.top + r.height / 2 - cy) };
+      })
+      .sort((a, b) => a.d - b.d);
+    order.forEach((o, i) => {
+      setTimeout(() => {
+        if (perf.active && perf.mode === 'mosaic' && !perf.paused) mosSwapCell(o.st, list, vidList);
+      }, i * 80);
+    });
+    scheduleMosaicWave();
+  }, Math.max(30, c.mosaicWaveInterval ?? 60) * 1000);
+}
+
+/** 景深聚焦：随机挑一格保持清晰，其余格模糊降亮（主次感）。off 清除，random/timer 都随机挑格 */
+function mosFocusPick() {
+  if (!mosCells.length) return;
+  const pick = mosCells[Math.floor(Math.random() * mosCells.length)];
+  for (const st of mosCells) {
+    st.el.classList.toggle('mos-focus', st === pick);
+    st.el.classList.toggle('mos-blur', st !== pick);
+  }
+}
+function mosFocusOff() {
+  for (const st of mosCells) st.el.classList.remove('mos-focus', 'mos-blur');
+}
+
+/** 定时聚焦：固定间隔重挑聚焦格（随机聚焦由每格换片触发，见 mosSwapCell） */
+function scheduleMosaicFocus() {
+  const c = perfCfg();
+  if ((c.mosaicFocus || 'off') !== 'timer') return;
+  const tick = () => {
+    perf._mosFocusTimer = setTimeout(() => {
+      if (!perf.active || perf.mode !== 'mosaic') return;
+      if (!perf.paused) mosFocusPick();
+      tick();
+    }, Math.max(1, c.mosaicFocusInterval ?? 10) * 1000);
+  };
+  tick();
+}
+
+// ─── 模式8 漂浮粒子流：单 rAF 积分驱动全部卡片，边界 wrap 换内容，深度分层 ───
+let fltCards = [];
+let fltW = 0, fltH = 0;
+
+function startFloat() {
+  const list = perfMedia();
+  if (!list.length) { startPerfMode('waterfall'); return; }
+  const c = perfCfg();
+  perfShuffle(list);
+  const overlay = $('perfOverlay');
+  overlay.innerHTML = '';
+  const stage = document.createElement('div');
+  stage.className = 'float-stage';
+  overlay.appendChild(stage);
+  fltW = window.innerWidth;
+  fltH = window.innerHeight;
+  const n = Math.max(6, Math.min(24, c.floatCount ?? 12));
+  const vidN = Math.max(0, Math.min(30, c.floatVideos ?? 6));
+  const vidList = list.filter((it) => it.kind === 'video');
+  const depthOn = c.floatDepth !== false;
+  const blurOK = n <= 16; // 卡多时禁用 blur，保合成器帧率
+  fltCards = [];
+  for (let i = 0; i < n; i++) {
+    const isVideo = i < vidN && vidList.length > 0;
+    const item = isVideo ? vidList[i % vidList.length] : dealNextImage(list);
+    if (!item) break;
+    const el = document.createElement('div');
+    el.className = 'float-card';
+    el.innerHTML = '<img alt="" draggable="false" decoding="async">';
+    stage.appendChild(el);
+    // 深度：z∈[0,1] 越大越近 → 更快 / 更大 / 更实 / 更清晰（关深度时全部 z=1）
+    const z = depthOn ? Math.random() : 1;
+    const a = perfAspect(item);
+    const w = fltW * (0.16 + Math.random() * 0.14) * (isVideo ? 1.15 : 1);
+    const h = w / Math.max(0.2, a.w / a.h);
+    const card = {
+      el, path: item.path, isVideo, z,
+      w, h,
+      x: Math.random() * Math.max(1, fltW - w),
+      y: Math.random() * Math.max(1, fltH - h),
+      vx: (Math.random() < 0.5 ? -1 : 1) * (0.4 + Math.random() * 0.8),
+      vy: (Math.random() < 0.5 ? -1 : 1) * (0.4 + Math.random() * 0.8),
+      phase: Math.random() * Math.PI * 2,
+      rotFreq: 0.3 + Math.random() * 0.5,
+      spin: Math.max(0, Math.min(20, c.floatSpin ?? 8)),
+      s: 0.55 + z * 0.45,
+    };
+    el.style.width = `${w.toFixed(1)}px`;
+    el.style.height = `${h.toFixed(1)}px`;
+    el.style.opacity = String(0.35 + z * 0.65);
+    el.style.zIndex = String(Math.round(z * 100));
+    if (blurOK && depthOn && z < 0.5) el.style.filter = `blur(${((0.5 - z) * 6).toFixed(1)}px)`;
+    if (isVideo) {
+      perfThumbCover(item.path, el.querySelector('img'));
+      perfShowVideo(item.path, el);
+    } else {
+      el.querySelector('img').src = convertFileSrc(item.path);
+    }
+    fltCards.push(card);
+  }
+  // timer 轮换模式：定期给图片卡错峰换内容（视频卡循环播放，不参与轮换）
+  if ((c.floatSwap || 'wrap') === 'timer') {
+    if (perf.timer) clearInterval(perf.timer);
+    perf.timer = setInterval(() => {
+      if (!perf.active || perf.mode !== 'float' || perf.paused) return;
+      fltCards.forEach((card, i) => {
+        if (card.isVideo) return;
+        setTimeout(() => {
+          if (perf.active && perf.mode === 'float' && !perf.paused) fltSwapCard(card, list);
+        }, i * 120);
+      });
+    }, Math.max(0.5, c.floatInterval ?? 10) * 1000);
+  }
+  perf.lastTs = performance.now();
+  const tick = (ts) => {
+    if (!perf.active || perf.mode !== 'float') return;
+    const dt = Math.min(0.05, (ts - perf.lastTs) / 1000);
+    perf.lastTs = ts;
+    if (!perf.paused) floatIntegrate(dt, list);
+    perf.rafId = requestAnimationFrame(tick);
+  };
+  perf.rafId = requestAnimationFrame(tick);
+}
+
+/** 单 rAF 积分：漂速 = 基础速度 × 深度系数（近快远慢），视频卡减半；wrap 换牌堆内容 */
+function floatIntegrate(dt, list) {
+  const c = perfCfg();
+  const speed = Math.max(0.2, Math.min(3, c.floatSpeed ?? 1));
+  const swapOnWrap = (c.floatSwap || 'wrap') === 'wrap';
+  for (const card of fltCards) {
+    const k = speed * (0.4 + card.z * 1.1) * (card.isVideo ? 0.5 : 1);
+    card.x += card.vx * k * 60 * dt;
+    card.y += card.vy * k * 60 * dt;
+    card.phase += card.rotFreq * dt;
+    const rot = Math.sin(card.phase) * card.spin; // 正弦摆动，不持续单向旋转
+    let wrapped = false;
+    if (card.x + card.w < -40) { card.x = fltW + 20; wrapped = true; }
+    else if (card.x > fltW + 40) { card.x = -card.w - 20; wrapped = true; }
+    if (card.y + card.h < -40) { card.y = fltH + 20; wrapped = true; }
+    else if (card.y > fltH + 40) { card.y = -card.h - 20; wrapped = true; }
+    if (wrapped && swapOnWrap && !card.isVideo) fltSwapCard(card, list);
+    card.el.style.transform =
+      `translate3d(${card.x.toFixed(1)}px,${card.y.toFixed(1)}px,0) rotate(${rot.toFixed(2)}deg) scale(${card.s.toFixed(3)})`;
+  }
+}
+
+/** 给漂浮卡换牌堆下一张图（仅图片卡） */
+function fltSwapCard(card, list) {
+  const item = dealNextImage(list);
+  if (!item || item.path === card.path) return;
+  card.path = item.path;
+  card.el.querySelector('img').src = convertFileSrc(item.path);
+}
+
+// ─── 模式9 时空隧道：三种结构（间隔排列/闭合管道/零碎宇宙空间）+ 中央飘移卡 ───
+// 卡片向观众推进，媒体不足时按复用段位叠加镜像+颜色滤镜补满结构；视频仅进入起播点深度才播放
+let tunCards = [];
+let tunStage = null;
+let tunWall = null;
+let tunCoreBox = null;
+let tunStarsEl = null;
+let tunGeo = {
+  shape: 'spaced', near: 800, far: 3300, span: 2500, R: 0, slotW: 0, slotH: 0, layerH: 0,
+  edge: 0, ring: 0, rows: 0, ringK: 0, layers: 0, N: 0, tunRings: [], safeR: 0,
+  coreN: 0, coreW: 0, coreGap: 0, coreSpan: 1, minDim: 0, coreFrontCard: null,
+};
+
+const TUN_SHAPE_LEGACY = { ring: 'round', pipe: 'round', spiral: 'spaced', elevator: 'space' }; // 旧配置值迁移
+const TUN_PIPES = { round: 16, dodec: 12, hex: 6, quad: 4 }; // 闭合管道子形状 → 环向面数（round 用 16 面密排近似圆）
+const TUN_GLITCH = [ // 科技失真池：偶尔少量随机出现
+  'saturate(0) contrast(1.45) brightness(1.1)',
+  'invert(.92) hue-rotate(160deg) saturate(1.4)',
+  'contrast(1.8) saturate(1.8) hue-rotate(-30deg)',
+  'saturate(0) invert(1) contrast(1.2)',
+  'hue-rotate(90deg) saturate(2.2) contrast(1.3)',
+];
+const tunRand = (a, b) => a + Math.random() * (b - a);
+
+/** 当前隧道类型（兼容旧配置值；pipe 拆分为 round/quad/hex/dodec 四种子形状） */
+function tunShape() {
+  const s = perfCfg().tunnelShape || 'spaced';
+  return TUN_SHAPE_LEGACY[s] || s;
+}
+const tunIsPipe = (s) => s === 'round' || s === 'quad' || s === 'hex' || s === 'dodec';
+
+/** 子模式独立参数（speed/count/videos/start 按形状各自记忆，缺失回落扁平字段兼容旧配置） */
+function tunSubCfg(shape) {
+  const c = perfCfg();
+  const s = shape || tunShape();
+  const sub = (c.tunnelSub && c.tunnelSub[s]) || {};
+  return {
+    speed: sub.speed ?? c.tunnelSpeed ?? 1,
+    count: sub.count ?? c.tunnelCount ?? 14,
+    videos: sub.videos ?? c.tunnelVideos ?? 6,
+    start: sub.start ?? c.tunnelStart ?? 30,
+  };
+}
+function tunSetSub(key, val) {
+  const c = ensurePerfCfg();
+  const s = tunShape();
+  if (!c.tunnelSub) c.tunnelSub = {};
+  if (!c.tunnelSub[s]) c.tunnelSub[s] = {};
+  c.tunnelSub[s][key] = val;
+  if (key === 'speed') c.tunnelSpeed = val; // 双写扁平字段兜底
+  else if (key === 'count') c.tunnelCount = val;
+  else if (key === 'videos') c.tunnelVideos = val;
+  else if (key === 'start') c.tunnelStart = val;
+  saveCfg(); // 持久化到配置文件
+}
+
+/** 素材分配旗标：结构总槽位 > 素材数时，随机撒 ghost 占位（零散空缺），槽位内容此后固定
+ *  存储 deck 索引（0..n-1）而非布尔值，-1 = ghost，避免 idx > deck.length 时 deck[idx] 越界 */
+function tunDealFlags(total) {
+  const deck = perf._tunDeck || [];
+  const n = Math.min(deck.length, total);
+  const arr = new Array(total).fill(-1);
+  for (let i = 0; i < n; i++) arr[i] = i;
+  for (let i = total - 1; i > 0; i--) {
+    const j = (Math.random() * (i + 1)) | 0;
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  perf._tunFlags = arr;
+}
+
+function startTunnel() {
+  const list = perfMedia();
+  if (!list.length) { startPerfMode('waterfall'); return; }
+  const c = perfCfg();
+  perfShuffle(list);
+  perf._tunDeck = list; // 牌堆：全部媒体轮转发牌，超出牌堆的卡按段位镜像/滤镜复用
+  perf._tunDeal = 0;
+  perf._tunT = 0; // 中央卡飘移相位时钟
+  const overlay = $('perfOverlay');
+  overlay.innerHTML = '';
+  tunStage = document.createElement('div');
+  tunStage.className = 'tun-stage';
+  tunApplyVanish();
+  tunStarsEl = null;
+  if (c.tunnelStars !== false) { tunStarsEl = tunBuildStars(); tunStage.appendChild(tunStarsEl); }
+  tunWall = document.createElement('div');
+  tunWall.className = 'tun-world';
+  tunGeo.coreN = Math.max(0, Math.min(14, c.tunnelCoreN ?? 6));
+  tunGeo.coreFrontCard = null;
+  tunCoreBox = null;
+  if (tunGeo.coreN > 0) {
+    tunCoreBox = document.createElement('div');
+    tunCoreBox.className = 'tun-world core-world'; // 独立层序高于壁卡：主轴卡绝不被氛围卡遮挡
+  }
+  const fog = document.createElement('div');
+  fog.className = 'tun-fog';
+  const vig = document.createElement('div');
+  vig.className = 'tun-vignette';
+  tunStage.appendChild(tunWall);
+  if (tunCoreBox) tunStage.appendChild(tunCoreBox);
+  tunStage.appendChild(fog);
+  tunStage.appendChild(vig);
+  overlay.appendChild(tunStage);
+  tunCards = [];
+  tunPlanGroups(); // 依数量与形态做结构分组
+  tunLayout();     // 几何定型
+  tunDealFlags(tunIsPipe(tunGeo.shape) ? tunGeo.rows * tunGeo.ring : tunGeo.N); // 素材旗标：不足处零散 ghost
+  tunBuildWall();
+  tunBuildCore();
+  for (const card of tunCards) tunApply(card, c);
+  tunNeonFront(); // 开场即按进入时机点亮（暂停状态下也不等下一帧）
+  perf.lastTs = performance.now();
+  const tick = (ts) => {
+    if (!perf.active || perf.mode !== 'tunnel') return;
+    const dt = Math.min(0.05, (ts - perf.lastTs) / 1000);
+    perf.lastTs = ts;
+    if (!perf.paused) tunIntegrate(dt, perfCfg());
+    perf.rafId = requestAnimationFrame(tick);
+  };
+  perf.rafId = requestAnimationFrame(tick);
+}
+
+/** 结构分组：闭合管道面数由子形状固定（排列形状不受数量影响）；间隔排列每层 ringK 张、末层余数；宇宙逐卡随机 */
+function tunPlanGroups() {
+  const g = tunGeo;
+  const sub = tunSubCfg();
+  g.shape = tunShape();
+  g.N = Math.max(6, Math.min(36, sub.count ?? 14));
+  if (tunIsPipe(g.shape)) {
+    g.edge = TUN_PIPES[g.shape] || 16;
+    g.ring = g.edge;
+  } else if (g.shape === 'spaced') {
+    g.ringK = Math.max(3, Math.min(8, Math.round(Math.sqrt(g.N / 2.2))));
+    g.layers = Math.ceil(g.N / g.ringK);
+  }
+}
+
+/** 几何定型：卡槽尺寸、筒半径、纵深（近端穿出/远端进入可设）、近端穿出点、中央卡尺寸与间隔 */
+function tunLayout() {
+  const g = tunGeo;
+  const c = perfCfg();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  g.minDim = Math.min(vw, vh);
+  g.near = Math.max(300, Math.min(950, c.tunnelNearZ ?? 800)); // 近端穿出平面：z 越大离相机越近（屏幕贴脸才消失）
+  const spanT = Math.max(1500, Math.min(6000, c.tunnelFarZ ?? 3300)) - g.near; // 远端进入距离 → 结构纵深
+  if (tunIsPipe(g.shape)) {
+    // 闭合管：宽 = 2R·tan(π/edge) 相邻卡四边精确相接，圈距 = 卡高上下严丝合缝；形状由面数决定与数量无关
+    g.R = Math.max(250, Math.min(430, vw * 0.32));
+    g.slotW = 2 * g.R * Math.tan(Math.PI / g.edge);
+    g.slotH = g.slotW;
+    g.rows = Math.max(3, Math.min(Math.floor(120 / g.edge), Math.round(spanT / g.slotH))); // 总卡数 ≤120 防面数多时卡顿
+    g.span = g.rows * g.slotH;
+  } else if (g.shape === 'spaced') {
+    g.slotW = Math.max(170, Math.min(430, vw * 0.2));
+    g.slotH = g.slotW * 0.95;
+    g.layerH = Math.max(420, spanT / g.layers); // 层距由纵深/层数摊分（保留最小间隔）
+    // 防纵深堆叠：卡高不超过层距 85%，超出则整体缩卡
+    if (g.slotH > g.layerH * 0.85) { g.slotH = g.layerH * 0.85; g.slotW = g.slotH / 0.95; }
+    // 防切向堆叠：弦长约束 R ≥ slotW/(2·sin(π/ringK))，相邻卡之间留 8% 缝
+    g.R = Math.max(g.slotW / (2 * Math.sin(Math.PI / g.ringK)) * 1.08, g.minDim * 0.34);
+    g.span = g.layers * g.layerH;
+  } else { // space 宇宙空间
+    // DEMO 碎片是小尺寸零碎残骸（30~180px）：卡体小才不会盖住中心
+    g.slotW = Math.max(70, Math.min(210, vw * 0.09));
+    g.R = g.minDim * 0.5; // 散布半径基准
+    g.span = Math.max(1500, spanT);
+    g.safeR = Math.max(g.minDim * 0.12, 130); // 屏幕投影安全区：氛围卡绝不进入主轴周围
+  }
+  g.far = g.near + g.span;
+  // 中央卡：大小 / 间隔 / 数量
+  g.coreW = g.minDim * (Math.max(8, Math.min(40, perfCfg().tunnelCoreSize ?? 16)) / 100);
+  g.coreGap = Math.max(420, g.span / 7) * Math.max(0.4, Math.min(3, perfCfg().tunnelCoreGap ?? 1));
+  g.coreSpan = Math.max(1, g.coreN * g.coreGap);
+}
+
+/** 建卡：统一结构（卡 > 媒体层 > 封面图），视频起播时 perfShowVideo 挂进媒体层；host 可指定挂载容器（管道环） */
+function tunMakeCard(core, host) {
+  const el = document.createElement('div');
+  el.className = 'tun-card' + (core ? ' core' : '');
+  el.innerHTML = '<div class="tun-media"><img alt="" draggable="false" decoding="async"></div>';
+  (host || (core ? tunCoreBox : tunWall)).appendChild(el);
+  const card = {
+    el, media: el.querySelector('.tun-media'), img: el.querySelector('img'),
+    core: !!core, kind: 'image', path: '', aspect: 1, z: 0, dealIdx: 0,
+    _vid: false, lastOp: -1, lastBlur: -1,
+    pre: 'translate(-50%,-50%)', tail: '',
+  };
+  tunCards.push(card);
+  return card;
+}
+
+/** 发牌：主轴卡循环素材；氛围卡按旗标取真实素材，不足即 ghost 半透明占位（槽位内容固定不再轮换） */
+/** 氛围卡滤镜（亮度+失真）：发光卡中签恒正常亮度 → 覆盖亮度滑块 */
+function tunFxFilter(card, c) {
+  let f = '';
+  if (card._glow) f = 'brightness(1)';
+  else {
+    const br = Math.max(30, Math.min(150, c.tunnelWallBright ?? 100)) / 100;
+    if (br !== 1) f = `brightness(${br.toFixed(2)})`;
+  }
+  if (card._glitch) f = (f ? f + ' ' : '') + card._glitch;
+  return f;
+}
+/** 氛围卡发光/霓虹/失真抽奖：what = all|glow|neon|glitch。
+ *  概率滑块改动时用单项 what 对已发牌的氛围卡即时重掷（氛围卡槽位内容固定、不回绕换装，只在发牌时抽一次等于滑块永远无效） */
+function tunRollFx(card, what) {
+  what = what || 'all';
+  const c = perfCfg();
+  if (what === 'all' || what === 'glow') {
+    card._glow = Math.random() * 100 < Math.max(0, Math.min(100, c.tunnelGlowRate ?? 15));
+    if (card._glow) {
+      card.el.style.setProperty('--gh', String((Math.random() * 360) | 0));
+      card.el.classList.add('glow-on'); // ::after 淡发光画在图片之上；外辉光走类
+    } else {
+      card.el.classList.remove('glow-on');
+    }
+  }
+  if (what === 'all' || what === 'neon') {
+    card._neon = Math.random() * 100 < Math.max(0, Math.min(100, c.tunnelNeonRate ?? 10)); // 独立抽奖，与发光互不影响
+    if (card._neon) {
+      card.el.style.setProperty('--nh', String((Math.random() * 360) | 0));
+      card.el.classList.add('neon-on'); // ::before 覆盖层：霓虹描边画在图片之上
+    } else {
+      card.el.classList.remove('neon-on');
+    }
+  }
+  if (what === 'all' || what === 'glitch') {
+    const glR = Math.max(0, Math.min(100, c.tunnelGlitchRate ?? 3));
+    card._glitch = Math.random() * 100 < glR ? TUN_GLITCH[(Math.random() * TUN_GLITCH.length) | 0] : null;
+  }
+  card.el.style.boxShadow = ''; // 外辉光改由 .glow-on 类驱动（随透明度衰减），清内联残留
+  card.media.style.filter = tunFxFilter(card, c); // 亮度+失真即时上屏
+}
+/** 氛围卡透明度抽奖：随机不透明(中签恒1) > 随机透明(中签 35-75%) > 全局基础 → 中签覆盖透明度滑块。
+ *  what = all|force|trans：单项重掷时保留另一项的既有结果（避免调透明度把不透明抽奖也洗掉） */
+function tunRollOpacity(card, what) {
+  what = what || 'all';
+  const c = perfCfg();
+  card.el.style.opacity = ''; // 透明度写 --op（图片/视频级），清 ghost 期 el 残留
+  const wOp = Math.max(0, Math.min(100, c.tunnelWallOpacity ?? 100)) / 100;
+  if (what === 'all' || what === 'force') {
+    card._opForce = Math.random() * 100 < Math.max(0, Math.min(100, c.tunnelRandOpaque ?? 10)) ? 1 : null;
+  }
+  if (what === 'all' || what === 'trans') {
+    card._transF = Math.random() * 100 < Math.max(0, Math.min(100, c.tunnelRandOpacity ?? 15)) ? (0.35 + Math.random() * 0.4) : 1;
+  }
+  card._opBase = card._opForce ?? wOp * (card._transF ?? 1);
+  card.lastOp = -1; // 强制重写透明度
+}
+/** 概率滑块即时生效：对已发出的氛围卡重掷指定抽奖并立刻上屏（ghost 无媒体只随全局透明度，跳过） */
+function tunRerollWall(what) {
+  if (!tunCards.length) return;
+  for (const card of tunCards) {
+    if (card.core || card.kind === 'ghost') continue;
+    if (what === 'force' || what === 'trans') tunRollOpacity(card, what);
+    else tunRollFx(card, what);
+  }
+  tunRetint(); // 同步上屏（按已存旗标重组，不重掷；暂停时也即时可见）
+}
+
+function tunAssign(card, idx) {
+  const deck = perf._tunDeck || [];
+  if (!deck.length) return;
+  if (idx === undefined) idx = card.dealIdx = perf._tunDeal++;
+  card.dealIdx = idx;
+  if (!card.core) { // 氛围卡：旗标存储 deck 索引（-1 = ghost）
+    const flags = perf._tunFlags;
+    const fi = (!flags || idx >= flags.length) ? -1 : flags[idx];
+    if (fi < 0) { tunGhost(card); return; }
+    card._deckIdx = fi; // 记录对应的 deck 索引
+  }
+  const item = deck[card.core ? idx % deck.length : card._deckIdx]; // 主轴循环素材，氛围卡按旗标索引
+  card.kind = item.kind;
+  card.path = item.path;
+  const a = perfAspect(item);
+  card.aspect = Math.max(0.2, a.w / a.h);
+  card.el.classList.remove('ghost');
+  card.media.style.display = '';
+  card.el.style.background = '';
+  card.media.style.transform = '';
+  if (card.core) {
+    tunNeonOff(card); // 回绕换装 = 旧生命周期结束：霓虹随卡消失（越过进入时机后由 tunNeonFront 重新点亮）
+    card.media.style.filter = '';
+    card.el.style.boxShadow = ''; // 主轴辉光交由霓虹描边机制接管
+  } else {
+    // 氛围卡：发光/霓虹/失真独立抽奖（中签覆盖亮度），随机不透明/透明抽奖（中签覆盖透明度）
+    tunRollFx(card, 'all');
+    tunRollOpacity(card, 'all');
+  }
+  if (item.kind === 'video') perfThumbCover(item.path, card.img);
+  else card.img.src = convertFileSrc(item.path);
+  if (card.core) { // 主轴卡异步校准真实宽高比后重定型，保证内容完整不裁切
+    perfEnsureAspect(item).then(() => {
+      if (card.path !== item.path) return;
+      const ra = perfAspect(item);
+      if (ra.forced) return;
+      const na = Math.max(0.2, ra.w / ra.h);
+      if (Math.abs(na - card.aspect) > 0.01) {
+        card.aspect = na;
+        tunPose(card);
+        tunApply(card, perfCfg());
+      }
+    }).catch(() => {});
+  }
+}
+
+/** ghost 占位卡：半透明随机色渐变，无媒体不参与播放 */
+function tunGhost(card) {
+  card.kind = 'ghost';
+  card.path = '';
+  card.aspect = 1;
+  card.el.classList.add('ghost');
+  card.media.style.display = 'none';
+  card.media.style.filter = '';
+  card.media.style.transform = '';
+  card.el.style.boxShadow = '';
+  const h = (Math.random() * 360) | 0;
+  card.el.style.background = `linear-gradient(160deg, hsla(${h},80%,62%,.30), hsla(${(h + 50) % 360},80%,34%,.10))`;
+  card.el.style.opacity = ''; // 清 ambient 期残留（ambient 透明度写 --op，不再走 el）
+  // ghost 也吃全局氛围透明度（发牌即按当前配置定基，重启后滑块值依然生效）
+  card._opForce = null;
+  card._transF = 1;
+  card._opBase = Math.max(0, Math.min(100, perfCfg().tunnelWallOpacity ?? 100)) / 100;
+  card.lastOp = -1; // 强制下帧重写透明度
+}
+
+/** 姿态静态部分：尺寸 + 预拼 transform 头尾（每帧只插 z，降低字符串开销） */
+function tunPose(card) {
+  const g = tunGeo;
+  if (card.core) {
+    card.el.style.width = g.coreW.toFixed(1) + 'px';
+    card.el.style.height = (g.coreW / card.aspect).toFixed(1) + 'px';
+    return;
+  }
+  if (tunIsPipe(g.shape)) {
+    // 切向贴壁卡（DEMO 同款）：rotateZ 转到角度 → translateY 推到半径 → rotateX 让卡面法线指向管轴。
+    // 管道卡全静态：transform 必须在这里直接写上（tunApply 对管道卡 return，不写样式），
+    // 卡高沿管轴方向（rotateX(90°) 后局部 Y → 世界 Z），推进由整圈容器的 translateZ 负责
+    card.el.style.width = g.slotW.toFixed(1) + 'px';
+    card.el.style.height = g.slotH.toFixed(1) + 'px';
+    card.el.style.transform =
+      `translate(-50%,-50%) rotateZ(${card.phi.toFixed(4)}rad) translateY(${g.R.toFixed(1)}px) rotateX(90deg)`;
+  } else if (g.shape === 'spaced') {
+    card.el.style.width = g.slotW.toFixed(1) + 'px';
+    card.el.style.height = g.slotH.toFixed(1) + 'px';
+    const x = Math.cos(card.phi) * g.R, y = Math.sin(card.phi) * g.R;
+    card.pre = `translate(-50%,-50%) translate3d(${x.toFixed(1)}px,${y.toFixed(1)}px,0)`;
+    card.tail = ` rotateZ(${(card.phi - Math.PI / 2).toFixed(4)}rad) rotateX(90deg)`;
+  } else { // space：零碎碎片（随机小尺寸 + 外围散布），按媒体真实比例定型
+    const w = g.slotW * (card.sz || 1);
+    card.el.style.width = w.toFixed(1) + 'px';
+    card.el.style.height = (w / card.aspect).toFixed(1) + 'px';
+    card.pre = `translate(-50%,-50%) translate3d(${card.sx.toFixed(1)}px,${card.sy.toFixed(1)}px,0)`;
+    card.tail = ` rotateZ(${card.rz.toFixed(1)}deg) rotateX(${card.rx.toFixed(1)}deg) rotateY(${card.ry.toFixed(1)}deg)`;
+  }
+}
+
+function tunBuildWall() {
+  const g = tunGeo;
+  if (tunIsPipe(g.shape)) {
+    // 闭合管：每环一个容器，卡完全静态（四边相接由 2R·tan(π/edge) 保证），推进只写整圈容器 translateZ
+    g.tunRings = [];
+    for (let l = 0; l < g.rows; l++) {
+      const ringEl = document.createElement('div');
+      ringEl.className = 'tun-ring';
+      tunWall.appendChild(ringEl);
+      const ring = { el: ringEl, cards: [], z: g.near - l * g.slotH, lastOp: -1 };
+      ringEl.style.transform = `translateZ(${ring.z.toFixed(1)}px)`; // 初始姿态立即落位，避免首帧堆叠
+      for (let r = 0; r < g.ring; r++) {
+        const card = tunMakeCard(false, ringEl);
+        tunAssign(card);
+        card.ring = ring;
+        card.phi = (r / g.ring) * Math.PI * 2; // 多边形/圆管四边精确相接，无随机偏移
+        tunPose(card);
+        card.z = ring.z;
+        ring.cards.push(card);
+      }
+      g.tunRings.push(ring);
+    }
+  } else if (g.shape === 'spaced') {
+    let idx = 0;
+    for (let l = 0; l < g.layers; l++) {
+      const cnt = Math.min(g.ringK, g.N - idx); // 末层余数
+      for (let r = 0; r < cnt; r++, idx++) {
+        const card = tunMakeCard(false);
+        card.el.classList.add('fit-contain'); // 间隔排列：媒体完整显示不裁剪
+        tunAssign(card);
+        card.phi = (r / cnt) * Math.PI * 2 + tunRand(-0.05, 0.05);
+        tunPose(card);
+        card.z = g.near - (l + 0.5 + tunRand(-0.07, 0.07)) * g.layerH; // 轻微深度抖动防死板，±7% 不会与相邻层堆叠
+      }
+    }
+  } else { // space 宇宙空间：外围散布，少量卡自转 + 自漂移
+    for (let i = 0; i < g.N; i++) {
+      const card = tunMakeCard(false);
+      tunAssign(card);
+      // 氛围卡只散布在外围（半径带外移），配合投影安全区绝不进入中心与主轴卡抢位置
+      const phi = tunRand(0, Math.PI * 2), rF = tunRand(0.7, 1.4);
+      card.sz = tunRand(0.55, 1.25); // 每卡随机尺寸系数：零碎残骸感
+      card.sx = Math.cos(phi) * g.R * rF;
+      card.sy = Math.sin(phi) * g.R * rF;
+      card.rz = tunRand(-38, 38);
+      card.rx = tunRand(-30, 30);
+      card.ry = tunRand(-30, 30);
+      if (Math.random() < 0.3) { // 少量卡带自转/自漂移（速率由「宇宙自转漂移」设置缩放）
+        card.spinRz = tunRand(-1, 1); card.spinRx = tunRand(-1, 1); card.spinRy = tunRand(-1, 1);
+        card.dx = tunRand(-1, 1); card.dy = tunRand(-1, 1);
+      }
+      tunPose(card);
+      card.z = g.near - (i + tunRand(0.15, 0.85)) * (g.span / g.N);
+    }
+  }
+}
+
+/** 中央卡：始终面向相机，从消失点飘移飞出（双频利萨如 + 第三频慢扰动，轨迹不重复不定向）；每卡随机霓虹色相 */
+function tunBuildCore() {
+  const g = tunGeo;
+  for (let i = 0; i < g.coreN; i++) {
+    const card = tunMakeCard(true);
+    tunAssign(card);
+    tunPose(card);
+    card.w1 = tunRand(0.22, 0.42);
+    card.w2 = tunRand(0.16, 0.36);
+    card.p1 = tunRand(0, Math.PI * 2);
+    card.p2 = tunRand(0, Math.PI * 2);
+    card.w3 = tunRand(0.05, 0.13); // 慢扰动频：飘移加随机，不会一直朝一个地方
+    card.p3 = tunRand(0, Math.PI * 2);
+    card.neon = (Math.random() * 360) | 0; // 科技霓虹描边色相（随机）
+    card.el.style.setProperty('--neon', String(card.neon));
+    card.z = g.near - (i + 0.5) * g.coreGap;
+  }
+}
+
+/** 单卡姿态：预拼头尾+逐帧 z；远端 12% 区间短过渡渐入、近端贴屏才收口；景深模糊量可设；播放视频跳过模糊 */
+function tunApply(card, cfg) {
+  const g = tunGeo;
+  if (!card.core && tunIsPipe(g.shape)) return; // 管道壁卡全静态：推进/透明度由整圈容器循环统一处理
+  if (card.core) {
+    const amp = (Math.max(0, Math.min(30, cfg.tunnelCoreDrift ?? 8)) / 100) * g.minDim;
+    const T = perf._tunT;
+    const x = Math.cos(T * card.w1 + card.p1) * amp + Math.cos(T * card.w3 + card.p3) * amp * 0.45;
+    const y = Math.sin(T * card.w2 + card.p2) * amp * 0.72 + Math.sin(T * card.w3 * 1.37 + card.p3 * 2.1) * amp * 0.32;
+    card.el.style.transform =
+      `translate(-50%,-50%) translate3d(${x.toFixed(1)}px,${y.toFixed(1)}px,${card.z.toFixed(1)}px)`;
+  } else {
+    card.el.style.transform = `${card.pre} translateZ(${card.z.toFixed(1)}px)${card.tail}`;
+  }
+  const span = card.core ? g.coreSpan : g.span;
+  const t = Math.max(0, Math.min(1, (card.z - (g.near - span)) / span)); // 0=远端 1=近端
+  let op = Math.min(1, t / 0.12); // 透明进入只在远处，12% 区间短过渡
+  const nf = (g.near - card.z) / (card.core ? 130 : 60); // 近端贴屏前一小段才收口（不再提前消失）
+  if (nf < 1) op *= Math.max(0, nf);
+  if (g.shape === 'space' && !card.core) {
+    // 投影安全区（DEMO 机制）：把卡体半径也算进去，氛围卡整体绝不进入主轴周围
+    const d = Math.max(1, 1000 - card.z);
+    const sr = Math.hypot(card.sx, card.sy) * 1000 / d;
+    const hideR = g.safeR + g.slotW * 0.55 * (card.sz || 1); // 安全区 + 卡半宽
+    const fadeR = hideR + g.slotW * 1.1 * (card.sz || 1);
+    if (sr < hideR) op = 0;
+    else if (sr < fadeR) {
+      const st = (sr - hideR) / (fadeR - hideR);
+      op *= st * st * (3 - 2 * st);
+    }
+  }
+  const q = Math.round(op * (card._opBase ?? 1) * 50) / 50; // 全局/随机透明基数参与逐帧透明度
+  if (q !== card.lastOp) {
+    if (card.core || card.kind === 'ghost') card.el.style.opacity = q.toFixed(2);
+    else card.el.style.setProperty('--op', q.toFixed(2)); // 氛围卡淡图片/视频+卡底/投影，霓虹/发光覆盖层不受影响
+    card.lastOp = q;
+  }
+  const dof = Math.max(0, Math.min(30, cfg.tunnelDof ?? 6)); // 景深量可设（范围加大，仅作用于氛围卡）
+  const b = (card.core || card._vid) ? 0 : Math.round((1 - t) * (1 - t) * dof); // 主轴卡不应用景深
+  if (b !== card.lastBlur) {
+    card.el.style.filter = b > 0 ? `blur(${b}px)` : '';
+    card.lastBlur = b;
+  }
+}
+
+/** 摘除卡内播放中的视频（回池暂停），恢复封面层 */
+function tunDetachVid(card) {
+  if (!card._vid) return;
+  card._vid = false;
+  const pv = card.media.querySelector('video');
+  if (pv) perfDetachVideo(pv);
+  card.img.style.display = '';
+  card.lastBlur = -1; // 强制下帧重估深度模糊
+}
+
+/** 单 rAF 积分：整体推进（速度按子模式独立）、近端回绕（氛围卡内容固定、主轴循环换装）、宇宙自转漂移、主轴霓虹最前卡 */
+function tunIntegrate(dt, cfg) {
+  const g = tunGeo;
+  const speed = Math.max(0.2, Math.min(3, tunSubCfg().speed ?? 1));
+  perf._tunT += dt;
+  // 速度锚定 DEMO 观感（11~14 秒穿全程）：1× ≈ 12 秒穿完整条隧道，范围 0.2-3 → 60s~4s
+  const dz = speed * g.span * 0.0833 * dt;
+  if (tunIsPipe(g.shape)) {
+    // 管道：只写整圈容器的 translateZ + 环级量化透明度（壁卡全静态），回绕后内容固定
+    for (const ring of g.tunRings) {
+      ring.z += dz;
+      if (ring.z > g.near) {
+        ring.z -= g.span;
+        for (const card of ring.cards) tunDetachVid(card);
+        ring.lastOp = -1;
+      }
+      ring.el.style.transform = `translateZ(${ring.z.toFixed(1)}px)`;
+      const depth = (g.near - ring.z) / g.span; // 0 近 → 1 远
+      let op = Math.min(1, (1 - depth) / 0.12); // 远端 12% 区间短过渡渐入
+      const nf = (g.near - ring.z) / 60; // 近端贴屏才收口（近处卡片不提前消失）
+      if (nf < 1) op *= nf < 0 ? 0 : nf;
+      const q = Math.round(op * 25) / 25;
+      // 景深模糊（仅氛围壁卡，主轴卡由 tunApply 单独处理且不应用景深）；2px 量化降低重栅格化频率
+      const dof = Math.max(0, Math.min(30, cfg.tunnelDof ?? 6));
+      const blurB = Math.round(depth * depth * dof / 2) * 2;
+      for (const card of ring.cards) {
+        card.z = ring.z; // 同步卡深度供视频管理
+        const cq = Math.round(q * (card._opBase ?? 1) * 25) / 25; // 卡级透明基数（全局/随机透明）
+        if (cq !== card.lastOp) {
+          if (card.kind === 'ghost') card.el.style.opacity = cq.toFixed(2);
+          else card.el.style.setProperty('--op', cq.toFixed(2)); // 壁卡同 tunApply：只淡内容与卡底，霓虹不受影响
+          card.lastOp = cq;
+        }
+        if (card._vid) { if (card.lastBlur !== 0) { card.el.style.filter = ''; card.lastBlur = 0; } }
+        else if (blurB !== card.lastBlur) { card.el.style.filter = blurB > 0 ? `blur(${blurB}px)` : ''; card.lastBlur = blurB; }
+      }
+      ring.lastOp = q;
+    }
+    for (const card of tunCards) { // 主轴卡照旧自推进 + 循环换装
+      if (!card.core) continue;
+      card.z += dz;
+      if (card.z > g.near) {
+        card.z -= g.coreSpan;
+        tunDetachVid(card);
+        tunAssign(card); // 主轴循环素材
+        tunPose(card); // 换媒体后比例可能变化
+      }
+      tunApply(card, cfg);
+    }
+  } else {
+    const spinR = Math.max(0, Math.min(30, cfg.tunnelSpin ?? 8)); // 宇宙自转/漂移速率
+    for (const card of tunCards) {
+      card.z += dz;
+      if (card.z > g.near) {
+        card.z -= card.core ? g.coreSpan : g.span;
+        tunDetachVid(card);
+        if (card.core) { tunAssign(card); tunPose(card); } // 主轴循环素材；氛围卡槽位内容固定
+      }
+      if (!card.core && g.shape === 'space' && card.spinRz) {
+        // 少量氛围卡自转 + 自漂移，漂出 1.6R 反弹
+        card.rz += card.spinRz * spinR * dt;
+        card.rx += card.spinRx * spinR * dt;
+        card.ry += card.spinRy * spinR * dt;
+        const dr = (spinR / 10) * g.minDim * 0.03 * dt;
+        card.sx += card.dx * dr;
+        card.sy += card.dy * dr;
+        if (Math.hypot(card.sx, card.sy) > g.R * 1.6) { card.dx = -card.dx; card.dy = -card.dy; }
+        tunPose(card);
+      }
+      tunApply(card, cfg);
+    }
+  }
+  tunNeonFront(); // 主轴霓虹：越过进入时机深度的卡点亮，常亮到回绕消失
+  tunVideosTick(cfg);
+}
+
+/** 主轴霓虹：读取总开关/线条粗细/辉光强度/进入时机 */
+function tunNeonVals(c) {
+  const nsMax = Math.max(0, Math.min(6, c.tunnelNeonWidth ?? 2)); // 线条粗细 0 = 无描边
+  const ngMax = Math.max(0, Math.min(100, c.tunnelNeonGlowAmt ?? 80)) / 100; // 辉光强度 0 = 无辉光
+  const en = Math.max(0, Math.min(100, Number(c.tunnelNeonEnter) || 0)); // 进入时机：生命线位置%（0=出生即亮，100=临近死亡才亮）
+  return { on: c.tunnelNeon !== false && (nsMax > 0 || ngMax > 0), nsMax, ngMax, enter: en };
+}
+/** 把霓虹稳态写到卡上（供设置热更新复用） */
+function tunNeonSteady(card, v) {
+  card.el.style.setProperty('--nw', v.nsMax.toFixed(1) + 'px');
+  card.el.style.setProperty('--ns', v.nsMax > 0 ? '.9' : '0');
+  card.el.style.setProperty('--ng', v.ngMax > 0 ? v.ngMax.toFixed(2) : '0');
+}
+/** 清掉卡上的霓虹定时器（交接/设置热更新时用） */
+function tunNeonClearTimers(card) {
+  if (card._neonFlicker) { clearTimeout(card._neonFlicker); card._neonFlicker = null; }
+  if (card._neonReflash) { clearTimeout(card._neonReflash); card._neonReflash = null; }
+}
+/** 熄灭单张主轴卡霓虹（定时器/类/强度全清）：卡片回绕换装、提高进入时机、总开关关闭时用 */
+function tunNeonOff(card) {
+  tunNeonClearTimers(card);
+  card.el.classList.remove('neon-front');
+  card.el.style.setProperty('--ns', '0');
+  card.el.style.setProperty('--ng', '0');
+}
+/** 把当前线条粗细/辉光强度写到所有已点亮的主轴卡（宽度/辉光滑块热更新；闪烁中的卡收尾时会自取最新值） */
+function tunNeonRefreshSteady() {
+  if (!tunCards.length) return;
+  const v = tunNeonVals(perfCfg());
+  for (const card of tunCards) {
+    if (!card.core || !card.el.classList.contains('neon-front')) continue;
+    card.el.style.setProperty('--nw', v.nsMax.toFixed(1) + 'px');
+    if (!card._neonFlicker) tunNeonSteady(card, v);
+  }
+}
+/** 霓虹灯开关闪烁：快速随机 on/off 几下后常亮（出现时机由 tunNeonFront 按进入时机调度） */
+function tunNeonFlash(card, v) {
+  tunNeonClearTimers(card);
+  let step = 0;
+  const total = 5 + ((Math.random() * 4) | 0);
+  const tick = () => {
+    const on = step < total ? Math.random() > 0.4 : true;
+    card.el.style.setProperty('--ns', (v.nsMax > 0 && on) ? '.9' : '0');
+    card.el.style.setProperty('--ng', (v.ngMax > 0 && on) ? v.ngMax.toFixed(2) : '0');
+    step++;
+    if (step < total + 1) card._neonFlicker = setTimeout(tick, 30 + Math.random() * 80);
+    else {
+      card._neonFlicker = null;
+      // 收尾用“当前”配置：闪烁期间调过线条粗细/辉光强度也能拿到最新值；
+      // 若闪烁中已被熄灭（neon-front 移除且定时器已清），这里不再写回，避免“关不掉”
+      if (card.el.classList.contains('neon-front')) tunNeonSteady(card, tunNeonVals(perfCfg()));
+    }
+  };
+  tick();
+}
+/** 主轴霓虹：卡片越过「进入时机」深度即点亮，之后常亮到卡片回绕消失为止（多卡可同时亮，不互相交接熄灭）。
+ *  进入时机 enter% = 点亮位置在最远端(0%，出生即亮)与最近端(100%，临近消亡才亮)之间取深度，中间值 = 对应深度。
+ *  点亮瞬间走 tunNeonFlash 灯管闪烁；熄灭只发生在：卡片生命周期结束（回绕换装 tunAssign → tunNeonOff）、
+ *  进入时机被调高（尚未到达新深度的已点亮卡收回）、总开关关闭。 */
+function tunNeonFront() {
+  const g = tunGeo;
+  const v = tunNeonVals(perfCfg());
+  const thr = (v.enter / 100) * 0.98; // 100% 也留 2% 生命可见期（p 恒<1，卡到 p=1 处必已回绕）
+  for (const card of tunCards) {
+    if (!card.core || card.kind === 'ghost') continue;
+    // 生命线进度：0=出生(最远端) 1=死亡(最近端回绕)
+    const p = Math.max(0, Math.min(1, (card.z - (g.near - g.coreSpan)) / g.coreSpan));
+    const lit = card.el.classList.contains('neon-front');
+    if (!v.on) { // 总开关关：清掉所有残留点亮（含闪烁进行中的卡），保证立刻熄灭
+      if (lit) tunNeonOff(card);
+      continue;
+    }
+    if (!lit && p >= thr) { // 越过进入时机点：闪动点亮，随后随卡常亮直到卡片消失
+      card.el.classList.add('neon-front');
+      card.el.style.setProperty('--nw', v.nsMax.toFixed(1) + 'px');
+      tunNeonFlash(card, v);
+    } else if (lit && p < thr) { // 进入时机调高：把尚未到达新深度的点亮卡收回
+      tunNeonOff(card);
+    }
+  }
+}
+/** 氛围卡亮度/透明度热更新：按已存的 _glow/_glitch/_opForce/_transF 重组，不重掷概率 */
+function tunRetint() {
+  if (!tunCards.length) return;
+  const c = perfCfg();
+  const br = Math.max(30, Math.min(150, c.tunnelWallBright ?? 100)) / 100;
+  const wOp = Math.max(0, Math.min(100, c.tunnelWallOpacity ?? 100)) / 100;
+  for (const card of tunCards) {
+    if (card.core) continue; // 主轴卡不受氛围亮度/透明度影响
+    // 透明基数同样作用于 ghost 占位卡（素材不足时槽位多为 ghost，此前它们被跳过 → 滑块看起来完全无效）
+    card._opBase = card._opForce ?? wOp * (card._transF ?? 1);
+    card.lastOp = -1; // 强制下帧重写透明度
+    if (card.kind === 'ghost' || !card.media) continue;
+    let f = card._glow ? 'brightness(1)' : (br !== 1 ? `brightness(${br.toFixed(2)})` : '');
+    if (card._glitch) f = (f ? f + ' ' : '') + card._glitch;
+    card.media.style.filter = f; // 亮度：内联 filter 立即生效
+  }
+  // 透明度此前只置 lastOp=-1、等下一帧 rAF 才写入：表演被暂停（空格）时没有帧 → 滑块毫无反应。
+  // 这里同步跑一帧 0 位移积分（dt=0 不移动任何卡片），透明度与亮度一样即时上屏。
+  if (perf.active && perf.mode === 'tunnel' && tunGeo && tunGeo.near) {
+    try { tunIntegrate(0, c); } catch (e) { console.warn('[tunnel] tunRetint 同步应用失败', e); }
+  }
+}
+
+/** 视频优先级：⓪前 3 张主轴卡无条件保播（最高优先级，直到完全消失回绕才停，不占名额）
+ *  ①主轴近处（占半预算）→②氛围近处→③主轴第四张起→④其他；进入起播点深度才具资格，ghost 永不播放
+ *  250ms 节流：管道卡数多时每帧跑 filter+4 路 sort 开销大 */
+function tunVideosTick(cfg) {
+  const g = tunGeo;
+  const now = performance.now();
+  if (perf._tunVidTk && now - perf._tunVidTk < 250) return;
+  perf._tunVidTk = now;
+  const vids = tunCards.filter((cd) => cd.kind === 'video');
+  if (!vids.length) return;
+  const sub = tunSubCfg();
+  const maxN = Math.max(0, Math.min(30, sub.videos ?? 6));
+  const startT = 1 - Math.max(5, Math.min(90, sub.start ?? 30)) / 100; // 起播点：距近端深度百分比
+  const coreNear = [], wallNear = [], coreFar = [], wallFar = [];
+  for (const card of vids) {
+    const span = card.core ? g.coreSpan : g.span;
+    const t = (card.z - (g.near - span)) / span;
+    const bucket = card.core ? (t >= startT ? coreNear : coreFar) : (t >= startT ? wallNear : wallFar);
+    bucket.push([card, t]);
+  }
+  const byDepth = (a, b) => b[1] - a[1];
+  coreNear.sort(byDepth); wallNear.sort(byDepth); coreFar.sort(byDepth); wallFar.sort(byDepth);
+  const capNear = Math.ceil(maxN / 2);
+  const order = [];
+  // ⓪ 前 3 张主轴卡：最高优先级，不受起播点/名额限制（回绕时已完全消失，由积分循环 detach）
+  const frontSet = new Set();
+  for (const c of coreNear.concat(coreFar).sort((x, y) => y[0].z - x[0].z).map((e) => e[0]).slice(0, 3)) {
+    frontSet.add(c); order.push(c);
+  }
+  for (const [c] of coreNear) if (!frontSet.has(c) && order.length < capNear) order.push(c); // ① 主轴近处
+  for (const [c] of wallNear) if (order.length < maxN) order.push(c);    // ② 氛围近处
+  for (const [c] of coreFar) if (order.length < maxN) order.push(c);     // ③ 主轴第四张起
+  for (const [c] of wallFar) if (order.length < maxN) order.push(c);     // ④ 其他卡片
+  const play = new Set(order);
+  for (const card of vids) {
+    if (play.has(card) && !card._vid) {
+      card._vid = true;
+      card.img.style.display = 'none';
+      perfShowVideo(card.path, card.media);
+      card.lastBlur = -1;
+    } else if (!play.has(card) && card._vid) {
+      tunDetachVid(card);
+    }
+  }
+}
+
+/** 中央卡大小/间隔热应用：重算几何并重定型，不打断推进 */
+function tunCoreRelayout() {
+  if (!tunStage) return;
+  const oldNear = tunGeo.near, oldCore = tunGeo.coreSpan || 1;
+  tunLayout();
+  for (const card of tunCards) {
+    if (!card.core) continue;
+    card.z = tunGeo.near - ((oldNear - card.z) / oldCore) * tunGeo.coreSpan;
+    tunPose(card);
+    tunApply(card, perfCfg());
+  }
+}
+
+/** 消失点：透视原点 + 雾光/暗角渐变中心 + 辉光范围跟随 */
+function tunApplyVanish() {
+  if (!tunStage) return;
+  const c = perfCfg();
+  const vx = Math.max(-20, Math.min(20, c.tunnelVpx ?? 0));
+  const vy = Math.max(-20, Math.min(20, c.tunnelVpy ?? 0));
+  tunStage.style.perspectiveOrigin = `${50 + vx}% ${50 + vy}%`;
+  tunStage.style.setProperty('--tun-vx', `${50 + vx}%`);
+  tunStage.style.setProperty('--tun-vy', `${50 + vy}%`);
+  tunStage.style.setProperty('--tun-glow', `${Math.max(80, Math.min(600, c.tunnelGlow ?? 240))}px`);
+}
+
+/** 星光层：纯 CSS 闪烁（无逐帧 JS），少量大星带辉光 */
+function tunBuildStars() {
+  const box = document.createElement('div');
+  box.className = 'tun-stars';
+  for (let i = 0; i < 46; i++) {
+    const s = document.createElement('i');
+    s.className = 'tun-star';
+    const big = Math.random() > 0.82;
+    const sz = big ? 2 + Math.random() * 1.4 : 1 + Math.random();
+    s.style.cssText =
+      `left:${(Math.random() * 100).toFixed(1)}%;top:${(Math.random() * 100).toFixed(1)}%;` +
+      `width:${sz.toFixed(1)}px;height:${sz.toFixed(1)}px;` +
+      `animation-duration:${(2.4 + Math.random() * 3.4).toFixed(2)}s;` +
+      `animation-delay:${(-Math.random() * 6).toFixed(2)}s;` +
+      (big ? 'box-shadow:0 0 6px rgba(160,210,255,.85);' : '');
+    box.appendChild(s);
+  }
+  return box;
+}
+
+/** 窗口 resize 或近/远端调整：重算几何与姿态，按相对进度映射各卡深度；管道几何全静态，直接重建 */
+function tunResize() {
+  if (!tunStage) return;
+  if (tunIsPipe(tunShape())) { startTunnel(); return; }
+  const g = tunGeo;
+  const oldNear = g.near, oldSpan = g.span || 1, oldCore = g.coreSpan || 1;
+  tunLayout();
+  for (const card of tunCards) {
+    const oldL = card.core ? oldCore : oldSpan;
+    const newL = card.core ? g.coreSpan : g.span;
+    card.z = g.near - ((oldNear - card.z) / oldL) * newL;
+    tunPose(card);
+    card.lastOp = -1;
+    card.lastBlur = -1;
+    tunApply(card, perfCfg());
+  }
+}
+
 // ─── 表演设置面板（半透明居中；主 TAB 选中即切换表演模式） ───
 function openPerfSettings() {
   syncPerfUI();
@@ -8389,6 +10400,104 @@ function syncPerfUI() {
   const csc = $('perfCoverSideCount'); if (csc) csc.value = String(c.coverSideCount ?? 3);
   const covrf = $('perfCoverRandomFx'); if (covrf) covrf.classList.toggle('on', c.coverRandomFx === true);
   const covrand = $('perfCoverRandom'); if (covrand) covrand.classList.toggle('on', c.coverRandom === true);
+  // 3D 圆筒
+  const carSpin = $('perfCarSpin'); if (carSpin) carSpin.value = c.carouselSpin || 'step';
+  $('perfCarInterval').value = c.carouselInterval ?? 6;
+  $('perfCarIntervalVal').textContent = (c.carouselInterval ?? 6) + 's';
+  $('perfCarSpeed').value = c.carouselSpeed ?? 8;
+  $('perfCarSpeedVal').textContent = (c.carouselSpeed ?? 8) + '°/s';
+  $('perfCarVisible').value = String(c.carouselVisible ?? 2);
+  $('perfCarWidth').value = c.carouselWidth ?? 46;
+  $('perfCarWidthVal').textContent = (c.carouselWidth ?? 46) + 'vw';
+  $('perfCarRandom').classList.toggle('on', c.carouselRandomStart === true);
+  const carShape = $('perfCarShape'); if (carShape) carShape.value = c.carouselShape || 'cylinder';
+  const carSolid = $('perfCarSolid'); if (carSolid) carSolid.value = c.carouselSolid || 'cube';
+  $('perfCarPolyInterval').value = c.carouselPolyInterval ?? 6;
+  $('perfCarPolyIntervalVal').textContent = (c.carouselPolyInterval ?? 6) + 's';
+  $('perfCarPolySize').value = c.carouselPolySize ?? 27;
+  $('perfCarPolySizeVal').textContent = (c.carouselPolySize ?? 27) + '%';
+  // 活拼贴墙
+  $('perfMosCols').value = c.mosaicCols ?? 4;
+  $('perfMosRows').value = c.mosaicRows ?? 3;
+  $('perfMosInterval').value = c.mosaicInterval ?? 8;
+  $('perfMosIntervalVal').textContent = (c.mosaicInterval ?? 8) + 's';
+  $('perfMosJitter').classList.toggle('on', c.mosaicJitter !== false);
+  $('perfMosAnim').value = c.mosaicAnim || 'fade';
+  $('perfMosVideos').value = String(c.mosaicVideoCount ?? 6);
+  $('perfMosWave').classList.toggle('on', c.mosaicWave === true);
+  $('perfMosWaveInterval').value = c.mosaicWaveInterval ?? 60;
+  $('perfMosWaveIntervalVal').textContent = (c.mosaicWaveInterval ?? 60) + 's';
+  $('perfMosGap').value = c.mosaicGap ?? 8;
+  $('perfMosGapVal').textContent = (c.mosaicGap ?? 8) + 'px';
+  const mosFocus = $('perfMosFocus'); if (mosFocus) mosFocus.value = c.mosaicFocus || 'off';
+  $('perfMosFocusInterval').value = c.mosaicFocusInterval ?? 10;
+  $('perfMosFocusIntervalVal').textContent = (c.mosaicFocusInterval ?? 10) + 's';
+  // 漂浮粒子流
+  $('perfFltCount').value = c.floatCount ?? 12;
+  $('perfFltSpeed').value = c.floatSpeed ?? 1;
+  $('perfFltSpeedVal').textContent = (c.floatSpeed ?? 1) + 'x';
+  $('perfFltSpin').value = c.floatSpin ?? 8;
+  $('perfFltSpinVal').textContent = (c.floatSpin ?? 8) + '°';
+  $('perfFltDepth').classList.toggle('on', c.floatDepth !== false);
+  $('perfFltVideos').value = String(c.floatVideos ?? 6);
+  $('perfFltSwap').value = c.floatSwap || 'wrap';
+  $('perfFltInterval').value = c.floatInterval ?? 10;
+  $('perfFltIntervalVal').textContent = (c.floatInterval ?? 10) + 's';
+  // 时空隧道
+  // 时空隧道：speed/count/videos/start 读当前子模式独立参数
+  const ts = tunSubCfg();
+  $('perfTunShape').value = tunShape();
+  $('perfTunSpeed').value = ts.speed;
+  $('perfTunSpeedVal').textContent = ts.speed + 'x';
+  $('perfTunCount').value = String(Math.max(6, Math.min(36, ts.count)));
+  $('perfTunVideos').value = String(ts.videos);
+  $('perfTunStart').value = String(ts.start);
+  $('perfTunStartVal').textContent = ts.start + '%';
+  $('perfTunNearZ').value = String(c.tunnelNearZ ?? 800);
+  $('perfTunNearZVal').textContent = (c.tunnelNearZ ?? 800) + 'px';
+  $('perfTunFarZ').value = String(c.tunnelFarZ ?? 3300);
+  $('perfTunFarZVal').textContent = (c.tunnelFarZ ?? 3300) + 'px';
+  $('perfTunDOF').value = String(c.tunnelDof ?? 6);
+  $('perfTunDOFVal').textContent = (c.tunnelDof ?? 6) + '';
+  $('perfTunNeon').checked = c.tunnelNeon !== false;
+  $('perfTunNeonEnter').value = String(c.tunnelNeonEnter ?? 0);
+  $('perfTunNeonEnterVal').textContent = (c.tunnelNeonEnter ?? 0) + '%';
+  $('perfTunNeonWidth').value = String(c.tunnelNeonWidth ?? 2);
+  $('perfTunNeonWidthVal').textContent = (c.tunnelNeonWidth ?? 2) + 'px';
+  $('perfTunNeonGlowAmt').value = String(c.tunnelNeonGlowAmt ?? 80);
+  $('perfTunNeonGlowAmtVal').textContent = (c.tunnelNeonGlowAmt ?? 80) + '%';
+  $('perfTunWallBright').value = String(c.tunnelWallBright ?? 100);
+  $('perfTunWallBrightVal').textContent = (c.tunnelWallBright ?? 100) + '%';
+  $('perfTunWallOpacity').value = String(c.tunnelWallOpacity ?? 100);
+  $('perfTunWallOpacityVal').textContent = (c.tunnelWallOpacity ?? 100) + '%';
+  $('perfTunRandOpacity').value = String(c.tunnelRandOpacity ?? 15);
+  $('perfTunRandOpacityVal').textContent = (c.tunnelRandOpacity ?? 15) + '%';
+  $('perfTunRandOpaque').value = String(c.tunnelRandOpaque ?? 10);
+  $('perfTunRandOpaqueVal').textContent = (c.tunnelRandOpaque ?? 10) + '%';
+  $('perfTunGlow').value = String(c.tunnelGlow ?? 240);
+  $('perfTunGlowVal').textContent = (c.tunnelGlow ?? 240) + 'px';
+  $('perfTunSpin').value = String(c.tunnelSpin ?? 8);
+  $('perfTunSpinVal').textContent = (c.tunnelSpin ?? 8) + '';
+  $('perfTunGlowRate').value = String(c.tunnelGlowRate ?? 15);
+  $('perfTunGlowRateVal').textContent = (c.tunnelGlowRate ?? 15) + '%';
+  $('perfTunNeonRate').value = String(c.tunnelNeonRate ?? 10);
+  $('perfTunNeonRateVal').textContent = (c.tunnelNeonRate ?? 10) + '%';
+  $('perfTunGlitchRate').value = String(c.tunnelGlitchRate ?? 3);
+  $('perfTunGlitchRateVal').textContent = (c.tunnelGlitchRate ?? 3) + '%';
+  $('perfTunCoreN').value = String(Math.max(0, Math.min(14, c.tunnelCoreN ?? 6)));
+  $('perfTunCoreSize').value = String(c.tunnelCoreSize ?? 16);
+  $('perfTunCoreSizeVal').textContent = (c.tunnelCoreSize ?? 16) + '%';
+  $('perfTunCoreGap').value = String(c.tunnelCoreGap ?? 1);
+  $('perfTunCoreGapVal').textContent = Number(c.tunnelCoreGap ?? 1).toFixed(1) + 'x';
+  $('perfTunDrift').value = String(c.tunnelCoreDrift ?? 8);
+  $('perfTunDriftVal').textContent = (c.tunnelCoreDrift ?? 8) + '%';
+  $('perfTunVpx').value = String(c.tunnelVpx ?? 0);
+  $('perfTunVpxVal').textContent = (c.tunnelVpx ?? 0) + '%';
+  $('perfTunVpy').value = String(c.tunnelVpy ?? 0);
+  $('perfTunVpyVal').textContent = (c.tunnelVpy ?? 0) + '%';
+  $('perfTunStars').classList.toggle('on', c.tunnelStars !== false);
+  // 3D 圆筒：同时播放视频数上限
+  const carVid = $('perfCarVidLimit'); if (carVid) carVid.value = String(c.perfVidLimit ?? 6);
   $('perfMute').classList.toggle('on', c.mute !== false);
 }
 
@@ -8604,6 +10713,363 @@ $('perfCoverRandom')?.addEventListener('click', (e) => {
   e.target.classList.toggle('on', c.coverRandom);
   saveCfg();
   if (perf.active && perf.mode === 'cover') startPerfMode('cover');
+});
+// 模式6 3D 圆筒子设置
+$('perfCarSpin').addEventListener('change', (e) => {
+  ensurePerfCfg().carouselSpin = e.target.value;
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel') startPerfMode('carousel'); // 推进方式切换需重启
+});
+$('perfCarInterval').addEventListener('input', (e) => {
+  ensurePerfCfg().carouselInterval = Number(e.target.value);
+  $('perfCarIntervalVal').textContent = e.target.value + 's';
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel' && (perfCfg().carouselSpin || 'step') === 'step') {
+    scheduleCarouselTimer(perfMedia()); // 重新计时
+  }
+});
+$('perfCarSpeed').addEventListener('input', (e) => {
+  ensurePerfCfg().carouselSpeed = Number(e.target.value);
+  $('perfCarSpeedVal').textContent = e.target.value + '°/s';
+  saveCfg(); // 连续模式下一帧积分即生效
+});
+$('perfCarVisible').addEventListener('change', (e) => {
+  ensurePerfCfg().carouselVisible = Math.max(1, Math.min(3, Number(e.target.value) || 2));
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel') startPerfMode('carousel'); // 环大小变化重建
+});
+$('perfCarWidth').addEventListener('input', (e) => {
+  ensurePerfCfg().carouselWidth = Number(e.target.value);
+  $('perfCarWidthVal').textContent = e.target.value + 'vw';
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel') carResize(); // 半径/卡宽热应用，不打断角度
+});
+$('perfCarRandom')?.addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.carouselRandomStart = !(c.carouselRandomStart === true);
+  e.target.classList.toggle('on', c.carouselRandomStart);
+  saveCfg(); // 下次进入模式时生效
+});
+$('perfCarShape').addEventListener('change', (e) => {
+  ensurePerfCfg().carouselShape = e.target.value === 'polyhedron' ? 'polyhedron' : 'cylinder';
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel') startPerfMode('carousel'); // 环面数变化重建
+});
+$('perfCarSolid').addEventListener('change', (e) => {
+  ensurePerfCfg().carouselSolid = e.target.value;
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel' && (perfCfg().carouselShape || 'cylinder') === 'polyhedron') {
+    startPerfMode('carousel'); // 体式变化重建
+  }
+});
+$('perfCarPolyInterval').addEventListener('input', (e) => {
+  ensurePerfCfg().carouselPolyInterval = Math.max(0.5, Math.min(60, Number(e.target.value) || 6));
+  $('perfCarPolyIntervalVal').textContent = e.target.value + 's';
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel' && (perfCfg().carouselShape || 'cylinder') === 'polyhedron') {
+    startPerfMode('carousel'); // 重挂步进定时器（新周期）
+  }
+});
+$('perfCarPolySize').addEventListener('input', (e) => {
+  ensurePerfCfg().carouselPolySize = Math.max(12, Math.min(45, Number(e.target.value) || 27));
+  $('perfCarPolySizeVal').textContent = e.target.value + '%';
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel' && (perfCfg().carouselShape || 'cylinder') === 'polyhedron') {
+    polyLayout(); // 大小热应用：重算 R 与卡边长，翻滚角保持
+  }
+});
+// 3D 圆筒：同时播放视频数上限（可见范围内的视频最多同时起播 N 个）
+$('perfCarVidLimit').addEventListener('change', (e) => {
+  const c = ensurePerfCfg();
+  c.perfVidLimit = Math.max(1, Math.min(30, Number(e.target.value) || 6));
+  e.target.value = String(c.perfVidLimit);
+  saveCfg();
+  if (perf.active && perf.mode === 'carousel') {
+    if ((perfCfg().carouselShape || 'cylinder') === 'polyhedron') polyVideosTick();
+    else carVisibleVideos(perfMedia());
+  }
+});
+// 模式7 活拼贴墙子设置
+$('perfMosCols').addEventListener('change', (e) => {
+  ensurePerfCfg().mosaicCols = Math.max(2, Math.min(8, Number(e.target.value) || 4));
+  saveCfg();
+  if (perf.active && perf.mode === 'mosaic') startPerfMode('mosaic'); // 网格重建
+});
+$('perfMosRows').addEventListener('change', (e) => {
+  ensurePerfCfg().mosaicRows = Math.max(2, Math.min(6, Number(e.target.value) || 3));
+  saveCfg();
+  if (perf.active && perf.mode === 'mosaic') startPerfMode('mosaic');
+});
+$('perfMosInterval').addEventListener('input', (e) => {
+  ensurePerfCfg().mosaicInterval = Number(e.target.value);
+  $('perfMosIntervalVal').textContent = e.target.value + 's';
+  saveCfg(); // 每格定时器到点后按新间隔续期，不打断当前节奏
+});
+$('perfMosJitter').addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.mosaicJitter = !(c.mosaicJitter !== false);
+  e.target.classList.toggle('on', c.mosaicJitter);
+  saveCfg();
+});
+$('perfMosAnim').addEventListener('change', (e) => {
+  ensurePerfCfg().mosaicAnim = e.target.value;
+  saveCfg(); // 下一次换片生效
+});
+$('perfMosVideos').addEventListener('change', (e) => {
+  ensurePerfCfg().mosaicVideoCount = Math.max(0, Math.min(30, Number(e.target.value) || 0));
+  saveCfg();
+  if (perf.active && perf.mode === 'mosaic') startPerfMode('mosaic'); // 视频格重新分配
+});
+$('perfMosWave').addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.mosaicWave = !(c.mosaicWave === true);
+  e.target.classList.toggle('on', c.mosaicWave);
+  saveCfg();
+  if (perf.active && perf.mode === 'mosaic') {
+    if (c.mosaicWave) scheduleMosaicWave();
+    else if (perf.timer) { clearTimeout(perf.timer); perf.timer = 0; }
+  }
+});
+$('perfMosWaveInterval').addEventListener('input', (e) => {
+  ensurePerfCfg().mosaicWaveInterval = Number(e.target.value);
+  $('perfMosWaveIntervalVal').textContent = e.target.value + 's';
+  saveCfg();
+  if (perf.active && perf.mode === 'mosaic' && perfCfg().mosaicWave) scheduleMosaicWave(); // 重新计时
+});
+$('perfMosGap').addEventListener('input', (e) => {
+  ensurePerfCfg().mosaicGap = Number(e.target.value);
+  $('perfMosGapVal').textContent = e.target.value + 'px';
+  saveCfg();
+  const g = $('perfOverlay')?.querySelector('.mosaic-grid');
+  if (g) g.style.gap = e.target.value + 'px'; // 间隙热应用
+});
+$('perfMosFocus').addEventListener('change', (e) => {
+  ensurePerfCfg().mosaicFocus = e.target.value;
+  saveCfg();
+  if (perf.active && perf.mode === 'mosaic') {
+    if (perf._mosFocusTimer) { clearTimeout(perf._mosFocusTimer); perf._mosFocusTimer = 0; }
+    const f = perfCfg().mosaicFocus || 'off';
+    if (f === 'random') mosFocusPick();
+    else if (f === 'timer') { mosFocusPick(); scheduleMosaicFocus(); } // 重新挂重挑链
+    else mosFocusOff();
+  }
+});
+$('perfMosFocusInterval').addEventListener('input', (e) => {
+  ensurePerfCfg().mosaicFocusInterval = Number(e.target.value);
+  $('perfMosFocusIntervalVal').textContent = e.target.value + 's';
+  saveCfg();
+  if (perf.active && perf.mode === 'mosaic' && (perfCfg().mosaicFocus || 'off') === 'timer') {
+    if (perf._mosFocusTimer) { clearTimeout(perf._mosFocusTimer); perf._mosFocusTimer = 0; }
+    scheduleMosaicFocus(); // 重新计时
+  }
+});
+// 模式8 漂浮粒子流子设置
+$('perfFltCount').addEventListener('change', (e) => {
+  ensurePerfCfg().floatCount = Math.max(6, Math.min(24, Number(e.target.value) || 12));
+  saveCfg();
+  if (perf.active && perf.mode === 'float') startPerfMode('float');
+});
+$('perfFltSpeed').addEventListener('input', (e) => {
+  ensurePerfCfg().floatSpeed = Number(e.target.value);
+  $('perfFltSpeedVal').textContent = e.target.value + 'x';
+  saveCfg(); // 下一帧积分即生效
+});
+$('perfFltSpin').addEventListener('input', (e) => {
+  ensurePerfCfg().floatSpin = Number(e.target.value);
+  $('perfFltSpinVal').textContent = e.target.value + '°';
+  saveCfg();
+  const v = Math.max(0, Math.min(20, Number(e.target.value) || 0));
+  for (const card of fltCards) card.spin = v; // 摆动幅度热应用
+});
+$('perfFltDepth').addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.floatDepth = !(c.floatDepth !== false);
+  e.target.classList.toggle('on', c.floatDepth);
+  saveCfg();
+  if (perf.active && perf.mode === 'float') startPerfMode('float'); // 深度样式随卡定型，需重铺
+});
+$('perfFltVideos').addEventListener('change', (e) => {
+  ensurePerfCfg().floatVideos = Math.max(0, Math.min(30, Number(e.target.value) || 0));
+  saveCfg();
+  if (perf.active && perf.mode === 'float') startPerfMode('float');
+});
+$('perfFltSwap').addEventListener('change', (e) => {
+  ensurePerfCfg().floatSwap = e.target.value;
+  saveCfg();
+  if (perf.active && perf.mode === 'float') startPerfMode('float'); // timer 定时器启停
+});
+$('perfFltInterval').addEventListener('input', (e) => {
+  ensurePerfCfg().floatInterval = Number(e.target.value);
+  $('perfFltIntervalVal').textContent = e.target.value + 's';
+  saveCfg();
+  if (perf.active && perf.mode === 'float' && (perfCfg().floatSwap || 'wrap') === 'timer') {
+    startPerfMode('float'); // 重新计时
+  }
+});
+// 模式9 时空隧道子设置（speed/count/videos/start 按子模式独立记忆）
+$('perfTunShape').addEventListener('change', (e) => {
+  ensurePerfCfg().tunnelShape = e.target.value;
+  saveCfg();
+  if (perf.active && perf.mode === 'tunnel') startPerfMode('tunnel'); // 结构重建
+  syncPerfUI(); // 回填当前子模式的独立参数
+});
+$('perfTunSpeed').addEventListener('input', (e) => {
+  tunSetSub('speed', Number(e.target.value));
+  $('perfTunSpeedVal').textContent = e.target.value + 'x';
+  saveCfg(); // 下一帧积分即生效
+});
+$('perfTunCount').addEventListener('change', (e) => {
+  tunSetSub('count', Math.max(6, Math.min(36, Number(e.target.value) || 14)));
+  saveCfg();
+  if (perf.active && perf.mode === 'tunnel') startPerfMode('tunnel'); // 数量变化重建结构
+});
+$('perfTunVideos').addEventListener('change', (e) => {
+  tunSetSub('videos', Math.max(0, Math.min(30, Number(e.target.value) || 0)));
+  saveCfg();
+  if (perf.active && perf.mode === 'tunnel') tunVideosTick(perfCfg()); // 起播上限热应用
+});
+$('perfTunStart').addEventListener('input', (e) => {
+  tunSetSub('start', Math.max(5, Math.min(90, Number(e.target.value) || 30)));
+  $('perfTunStartVal').textContent = e.target.value + '%';
+  saveCfg(); // 下一帧 tick 即生效
+});
+$('perfTunNearZ').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelNearZ = Math.max(300, Math.min(950, Number(e.target.value) || 800));
+  $('perfTunNearZVal').textContent = e.target.value + 'px';
+  saveCfg();
+});
+$('perfTunNearZ').addEventListener('change', () => {
+  tunResize(); // 近端穿出平面：松手应用（管道重建，其余映射）
+});
+$('perfTunFarZ').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelFarZ = Math.max(1500, Math.min(6000, Number(e.target.value) || 3300));
+  $('perfTunFarZVal').textContent = e.target.value + 'px';
+  saveCfg();
+});
+$('perfTunFarZ').addEventListener('change', () => {
+  tunResize();
+});
+$('perfTunDOF').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelDof = Math.max(0, Math.min(30, Number(e.target.value) || 0));
+  $('perfTunDOFVal').textContent = e.target.value;
+  saveCfg(); // 下一帧 tunApply 即生效
+});
+$('perfTunNeon').addEventListener('change', (e) => {
+  ensurePerfCfg().tunnelNeon = e.target.checked;
+  saveCfg();
+  tunNeonFront(); // 立即生效（暂停时也一样）：关闭→清掉全部残留点亮（含闪烁中的），开启→点亮所有越过进入时机深度的卡
+});
+$('perfTunNeonEnter').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelNeonEnter = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunNeonEnterVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunNeonFront(); // 时机点移动 → 立即按新深度补点亮/收回（暂停时同样即时生效）
+});
+$('perfTunWallBright').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelWallBright = Math.max(30, Math.min(150, Number(e.target.value) || 100));
+  $('perfTunWallBrightVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunRetint(); // 亮度即时生效（发光卡不受影响）
+});
+$('perfTunWallOpacity').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelWallOpacity = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunWallOpacityVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunRetint(); // 透明度即时生效
+});
+$('perfTunRandOpacity').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelRandOpacity = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunRandOpacityVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunRerollWall('trans'); // 即时对已发牌氛围卡重掷随机透明（中签 35-75%，覆盖透明度滑块）
+});
+$('perfTunRandOpaque').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelRandOpaque = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunRandOpaqueVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunRerollWall('force'); // 即时重掷随机不透明（中签恒 100%，覆盖透明度滑块）
+});
+$('perfTunNeonWidth').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelNeonWidth = Math.max(0, Math.min(6, Number(e.target.value) || 0));
+  $('perfTunNeonWidthVal').textContent = e.target.value + 'px';
+  saveCfg();
+  tunNeonRefreshSteady(); // 所有已点亮主轴卡即时更新线宽
+});
+$('perfTunNeonGlowAmt').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelNeonGlowAmt = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunNeonGlowAmtVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunNeonRefreshSteady(); // 所有已点亮主轴卡即时更新辉光
+});
+$('perfTunGlow').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelGlow = Math.max(80, Math.min(600, Number(e.target.value) || 240));
+  $('perfTunGlowVal').textContent = e.target.value + 'px';
+  saveCfg();
+  tunApplyVanish();
+});
+$('perfTunSpin').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelSpin = Math.max(0, Math.min(30, Number(e.target.value) || 0));
+  $('perfTunSpinVal').textContent = e.target.value;
+  saveCfg(); // 下一帧积分即生效
+});
+$('perfTunGlowRate').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelGlowRate = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunGlowRateVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunRerollWall('glow'); // 即时重掷发光（中签卡亮度恒 100%，覆盖亮度滑块）
+});
+$('perfTunNeonRate').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelNeonRate = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunNeonRateVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunRerollWall('neon'); // 即时重掷霓虹描边（氛围卡霓虹概率，独立抽奖）
+});
+$('perfTunGlitchRate').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelGlitchRate = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+  $('perfTunGlitchRateVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunRerollWall('glitch'); // 即时重掷科技失真滤镜
+});
+$('perfTunCoreN').addEventListener('change', (e) => {
+  ensurePerfCfg().tunnelCoreN = Math.max(0, Math.min(14, Number(e.target.value) || 0));
+  saveCfg();
+  if (perf.active && perf.mode === 'tunnel') startPerfMode('tunnel'); // 数量变化重建
+});
+$('perfTunCoreSize').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelCoreSize = Math.max(8, Math.min(40, Number(e.target.value) || 16));
+  $('perfTunCoreSizeVal').textContent = e.target.value + '%';
+  saveCfg();
+  if (perf.active && perf.mode === 'tunnel') tunCoreRelayout(); // 热应用不打断推进
+});
+$('perfTunCoreGap').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelCoreGap = Math.max(0.4, Math.min(3, Number(e.target.value) || 1));
+  $('perfTunCoreGapVal').textContent = Number(e.target.value).toFixed(1) + 'x';
+  saveCfg();
+  if (perf.active && perf.mode === 'tunnel') tunCoreRelayout();
+});
+$('perfTunDrift').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelCoreDrift = Math.max(0, Math.min(30, Number(e.target.value) || 0));
+  $('perfTunDriftVal').textContent = e.target.value + '%';
+  saveCfg(); // 下一帧姿态即生效
+});
+$('perfTunVpx').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelVpx = Math.max(-20, Math.min(20, Number(e.target.value) || 0));
+  $('perfTunVpxVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunApplyVanish();
+});
+$('perfTunVpy').addEventListener('input', (e) => {
+  ensurePerfCfg().tunnelVpy = Math.max(-20, Math.min(20, Number(e.target.value) || 0));
+  $('perfTunVpyVal').textContent = e.target.value + '%';
+  saveCfg();
+  tunApplyVanish();
+});
+$('perfTunStars').addEventListener('click', (e) => {
+  const c = ensurePerfCfg();
+  c.tunnelStars = !(c.tunnelStars !== false);
+  e.target.classList.toggle('on', c.tunnelStars);
+  saveCfg();
+  if (tunStarsEl) tunStarsEl.style.display = c.tunnelStars ? '' : 'none'; // 热开关
 });
 // 通用：静音（同时作用于预判播放池中的表演视频）
 $('perfMute').addEventListener('click', (e) => {

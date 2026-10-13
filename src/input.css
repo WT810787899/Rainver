@@ -932,6 +932,332 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   100% { opacity: 1; filter: brightness(1) saturate(1); }
 }
 
+/* ─── 模式6 圆筒走马灯：3D 圆筒（卡框尺寸/半径/角度全由 JS 写内联） ─── */
+.car-stage {
+  position: absolute;
+  inset: 0;
+  perspective: 1200px;
+  /* 走马灯整层不需要额外的 3D 继承：ring 单独 preserve-3d，stage 只提供透视 */
+}
+.car-ring {
+  position: absolute;
+  left: 50%; top: 50%;
+  transform-style: preserve-3d;
+  will-change: transform; /* transition 由 JS 按步进/连续模式写内联 */
+}
+/* 多面体形态容器：卡片贴面法线组合成立体，整体复合翻滚（姿态由 JS 写内联） */
+.car-poly {
+  position: absolute;
+  left: 50%; top: 50%;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+/* 多面体拼片：背面必须可见（翻滚时背面卡构成封闭体外壳），小圆角减少拼缝感 */
+.car-poly .car-card {
+  border-radius: 10px;
+  backface-visibility: visible;
+  -webkit-backface-visibility: visible;
+}
+.car-poly .car-card .car-inner {
+  border-radius: 10px;
+}
+.car-card {
+  position: absolute;
+  left: 0; top: 0;
+  /* 尺寸与 translate(-50%,-50%) rotateY translateZ 均由 carLayout 写内联 */
+  border-radius: 18px;
+  backface-visibility: hidden; /* 背面卡不可见，穿越 90° 瞬间由 JS 换装 */
+  -webkit-backface-visibility: hidden;
+  will-change: transform;
+  pointer-events: auto; /* 正面卡需接收 hover 以显示视频控制条 */
+}
+.car-inner {
+  position: relative;
+  width: 100%; height: 100%;
+  border-radius: 18px;
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgba(0,0,0,.6);
+  background: #0b0f16;
+}
+.car-inner img,
+.car-inner video {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* 池内裸挂视频：未 ready 时由底层封面帧垫着，canplay 后 .ready 淡入（同 .perf-vid video 约定） */
+.car-inner video {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity .25s ease;
+}
+.car-inner video.ready { opacity: 1; }
+
+/* ─── 模式7 活拼贴墙：CSS grid 铺满，行列与间隙由 JS 写内联 ─── */
+.mosaic-grid {
+  position: absolute;
+  inset: 0;
+  display: grid;
+}
+.mosaic-cell {
+  position: relative;
+  overflow: hidden;
+  border-radius: 10px;
+  background: rgba(125,125,125,.10);
+}
+.mosaic-img {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity .8s ease; /* 双层 crossfade：换入层 zIndex 置顶（JS 内联） */
+  will-change: opacity;
+}
+.mosaic-img.mos-zoom {
+  animation: mosZoom .9s cubic-bezier(.22,.61,.36,1);
+}
+@keyframes mosZoom {
+  0%   { transform: scale(1.12); }
+  100% { transform: scale(1); }
+}
+/* 视频格：垫封面帧（底层 img），起播后淡入 */
+.mosaic-cell video {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+  z-index: 3;
+  opacity: 0;
+  transition: opacity .25s ease;
+}
+.mosaic-cell video.ready { opacity: 1; }
+/* 景深聚焦：聚焦格保持清晰，其余格模糊降亮（filter 过渡 0.8s） */
+.mosaic-cell { transition: filter .8s ease; }
+.mosaic-cell.mos-focus { filter: none; }
+.mosaic-cell.mos-blur { filter: blur(7px) brightness(.45); }
+
+/* ─── 模式8 漂浮粒子流：卡位置/尺寸/透明度/深度模糊全由 rAF 积分写内联 ─── */
+.float-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.float-card {
+  position: absolute;
+  left: 0; top: 0;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 14px 44px rgba(0,0,0,.45);
+  background: rgba(125,125,125,.12);
+  will-change: transform; /* translate3d + rotate + scale 每帧更新 */
+  pointer-events: auto; /* 视频卡底部热区需接收 hover */
+}
+.float-card img,
+.float-card video {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.float-card video {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  opacity: 0;
+  transition: opacity .25s ease;
+}
+.float-card video.ready { opacity: 1; }
+
+/* ─── 模式9 时空隧道：三种结构 + 星空/雾光/暗角（3D 姿态全由 rAF 写内联） ─── */
+.tun-stage {
+  position: absolute;
+  inset: 0;
+  perspective: 1000px;
+  perspective-origin: var(--tun-vx, 50%) var(--tun-vy, 50%);
+  overflow: hidden;
+  background: radial-gradient(ellipse 62% 62% at var(--tun-vx, 50%) var(--tun-vy, 50%),
+    #0b1729 0%, #050810 55%, #020307 100%);
+}
+/* 星光层：纯 CSS 闪烁，不占用 rAF */
+.tun-stars {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+.tun-star {
+  position: absolute;
+  display: block;
+  border-radius: 50%;
+  background: #cfe4ff;
+  animation: tunTwinkle 3.6s ease-in-out infinite;
+}
+@keyframes tunTwinkle {
+  0%, 100% { opacity: .12; }
+  50% { opacity: .85; }
+}
+.tun-world {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 2;
+  width: 0;
+  height: 0;
+  transform-style: preserve-3d;
+}
+/* 闭合管道整圈容器：卡片完全静态，推进时每帧只写容器的 translateZ */
+.tun-ring {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+/* 管道壁卡贴壁旋转后从管内看必须始终可见 */
+.tun-ring .tun-card {
+  backface-visibility: visible;
+}
+.tun-card {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border-radius: 14px;
+  overflow: hidden;
+  background: rgb(125 125 125 / calc(0.12 * var(--op, 1))); /* 氛围卡透明度走 --op 变量（JS 逐帧写入），卡底随之衰减 */
+  box-shadow: 0 18px 50px rgb(0 0 0 / calc(0.45 * var(--op, 1))); /* 投影同理；主轴/ghost 卡仍走 el.style.opacity（--op 未设=1，不变） */
+  backface-visibility: hidden;
+  will-change: transform, opacity;
+  pointer-events: auto;
+}
+/* 主轴层序：独立世界高于壁卡层，主轴卡绝不被氛围卡遮挡 */
+.tun-world.core-world {
+  z-index: 3;
+}
+/* 素材不足的占位卡：半透明随机色渐变（背景由 JS 内联写入），无媒体层 */
+.tun-card.ghost {
+  overflow: hidden;
+}
+.tun-card.ghost .tun-media {
+  display: none;
+}
+/* 中央飘移卡：卡片本身不发光；霓虹描边(--ns/--nw)与辉光(--ng)独立控制，由 JS 闪烁驱动
+   overflow:visible + will-change:opacity 避免合成层按基础尺寸光栅化，3D 透视放大后不模糊 */
+.tun-card.core {
+  --ns: 0;   /* 描边霓虹线条透明度 */
+  --ng: 0;   /* 辉光透明度 */
+  --nw: 2px; /* 描边线条粗细 */
+  overflow: visible;           /* 不在卡级裁剪，避免低分辨率合成层 */
+  backface-visibility: visible; /* 主轴卡始终面向相机，无需背面剔除 */
+  will-change: opacity;         /* 不含 transform，避免预创建合成层 */
+}
+/* 主轴卡媒体层承担裁剪职责 */
+.tun-card.core .tun-media {
+  overflow: hidden;
+  border-radius: 14px;
+}
+.tun-card.core.neon-front {
+  box-shadow:
+    0 18px 50px rgba(0, 0, 0, .45),
+    0 0 calc(var(--nw, 2px) * 9) hsl(var(--neon, 200) 95% 62% / var(--ng, 0)),
+    0 0 calc(var(--nw, 2px) * 26) hsl(var(--neon, 200) 95% 55% / calc(var(--ng, 0) * 0.5)),
+    0 0 0 var(--nw, 2px) hsl(var(--neon, 200) 95% 70% / var(--ns, 0)); /* 外扩描边环：在卡片边界外括出，不被卡内容挡住 */
+}
+/* 间隔排列氛围卡：媒体完整显示不裁剪（含起播后的视频） */
+.tun-card.fit-contain .tun-media img,
+.tun-card.fit-contain .tun-media video {
+  object-fit: contain;
+}
+/* 氛围卡透明度只作用于图片/视频与卡底/投影（--op 逐帧写入），霓虹/发光覆盖层不受透明度影响 */
+.tun-card:not(.core) .tun-media img {
+  opacity: var(--op, 1);
+}
+.tun-card:not(.core) .tun-media video.ready {
+  opacity: var(--op, 1); /* ready 淡入终点 = 透明基数（未 ready 仍 opacity:0） */
+}
+/* 氛围卡发光外辉光：类驱动（--gh 色相），随 --op 一起衰减 */
+.tun-card.glow-on {
+  box-shadow: 0 0 12px hsl(var(--gh, 200) 95% 64% / calc(0.25 * var(--op, 1)));
+}
+/* 氛围卡发光：描边与辉光用 ::after 覆盖层画在图片之上，不被媒体内容/相邻卡盖住 */
+.tun-card.glow-on .tun-media::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 2; /* 高于 .tun-media video(z1)：播放中的视频也不盖住覆盖层 */
+  border-radius: 14px;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--gh, 200) 95% 72% / 0.6),
+    inset 0 0 26px hsl(var(--gh, 200) 95% 60% / 0.35);
+}
+/* 氛围卡霓虹：亮环+小内辉光画在图片之上（z2 高于视频），随机色，不受透明度影响 */
+.tun-card.neon-on .tun-media::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: 14px;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 0 2px hsl(var(--nh, 200) 95% 68% / 0.85),
+    inset 0 0 14px hsl(var(--nh, 200) 95% 58% / 0.5);
+}
+/* 媒体层：复用卡的镜像/颜色滤镜写在这一层，不干扰卡的 3D 姿态 */
+.tun-media {
+  position: absolute;
+  inset: 0;
+}
+.tun-media img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* 视频卡：垫封面帧，起播后淡入（absolute 铺满媒体层） */
+.tun-media video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 1;
+  opacity: 0;
+  transition: opacity .25s ease;
+}
+.tun-media video.ready { opacity: 1; }
+/* 主轴卡按媒体真实比例定型（异步校准），媒体用 contain 保证内容完整不裁切 */
+.tun-card.core .tun-media img,
+.tun-card.core .tun-media video {
+  object-fit: contain;
+  background: transparent;
+}
+/* 消失点雾光：screen 混合，中心与范围跟随消失点/辉光设置 */
+.tun-fog {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  background: radial-gradient(circle var(--tun-glow, 240px) at var(--tun-vx, 50%) var(--tun-vy, 50%),
+    rgba(140, 205, 255, .26), rgba(80, 140, 255, .08) 45%, transparent 70%);
+  mix-blend-mode: screen;
+}
+/* 暗角：边缘压暗聚焦纵深 */
+.tun-vignette {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  background: radial-gradient(ellipse 70% 70% at var(--tun-vx, 50%) var(--tun-vy, 50%),
+    transparent 30%, rgba(0, 0, 0, .5) 74%, rgba(0, 0, 0, .88) 100%);
+}
+
 /* 快捷键行 */
 .shortcutRow {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -1004,11 +1330,20 @@ input[type="range"] { cursor: pointer; accent-color: var(--accent); }
   box-shadow: 0 6px 22px rgba(0,0,0,.4);
 }
 .seek-preview.hidden { display: none; }
+/* 进度缩略图未就绪：保留上一帧降透明度过渡，时间文本照常即时更新，不闪空白 */
+.seek-preview.sp-pending img {
+  opacity: .38;
+  transition: opacity .12s ease;
+}
 .seek-preview img {
   display: block;
   width: 168px;
+  /* 覆盖 preflight 的 img{max-width:100%}：气泡容器 absolute 收缩定位与 img 宽度
+     互相依赖，加载间隙塌缩后正反馈锁死，表现为悬浮时缩略图越缩越小 */
+  max-width: none;
   border-radius: 5px;
   background: #000;
+  transition: opacity .1s ease;
 }
 .seek-preview span {
   display: block;

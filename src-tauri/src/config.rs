@@ -203,6 +203,68 @@ pub struct GalleryPerfConfig {
     pub perf_ver: u32,
     // 通用
     pub mute: bool,                 // 表演时静音卡片视频
+    // 模式6 3D 圆筒
+    pub carousel_spin: String,          // step | continuous
+    pub carousel_interval: f64,         // 步进间隔秒
+    pub carousel_speed: f64,           // 连续速度 °/s
+    pub carousel_visible: u32,         // 同时可见卡数
+    pub carousel_width: f64,           // 卡宽占视口短边百分比
+    pub carousel_random_start: bool,
+    pub carousel_shape: String,        // cylinder | polyhedron
+    pub carousel_solid: String,        // 多面体形状
+    pub carousel_poly_size: f64,      // 多面体大小百分比
+    pub carousel_poly_interval: f64,  // 多面体步进间隔秒
+    // 模式7 活拼贴墙
+    pub mosaic_cols: u32,
+    pub mosaic_rows: u32,
+    pub mosaic_interval: f64,
+    pub mosaic_jitter: bool,
+    pub mosaic_anim: String,
+    pub mosaic_video_count: u32,
+    pub mosaic_wave: bool,
+    pub mosaic_wave_interval: f64,
+    pub mosaic_gap: f64,
+    pub mosaic_focus: String,           // off | random | timer
+    pub mosaic_focus_interval: f64,
+    // 模式8 漂浮粒子流
+    pub float_count: u32,
+    pub float_speed: f64,
+    pub float_spin: f64,
+    pub float_depth: bool,
+    pub float_videos: u32,
+    pub float_swap: String,
+    pub float_interval: f64,
+    // 模式9 时空隧道
+    pub tunnel_shape: String,           // spaced | round | quad | hex | dodec | space
+    pub tunnel_speed: f64,
+    pub tunnel_count: u32,
+    pub tunnel_videos: u32,
+    pub tunnel_start: f64,              // 起播点百分比
+    pub tunnel_core_n: u32,
+    pub tunnel_core_size: f64,
+    pub tunnel_core_gap: f64,
+    pub tunnel_core_drift: f64,
+    pub tunnel_vpx: f64,
+    pub tunnel_vpy: f64,
+    pub tunnel_stars: bool,
+    pub tunnel_near_z: f64,
+    pub tunnel_far_z: f64,
+    pub tunnel_dof: f64,               // 景深量
+    pub tunnel_glow: f64,              // 辉光范围 px
+    pub tunnel_neon: bool,
+    pub tunnel_neon_enter: f64,       // 霓虹进入时机%（主轴卡生命线位置，0=出生即亮）
+    pub tunnel_neon_width: f64,        // 霓虹线条粗细 px
+    pub tunnel_neon_glow_amt: f64,    // 辉光强度 %
+    pub tunnel_wall_bright: f64,      // 氛围卡片亮度 %（发光卡不受影响）
+    pub tunnel_wall_opacity: f64,     // 氛围卡片透明度 %（0-100）
+    pub tunnel_rand_opacity: f64,     // 随机透明概率 %（0-100）
+    pub tunnel_rand_opaque: f64,      // 随机不透明概率 %（0-100）
+    pub tunnel_spin: f64,             // 宇宙自转漂移
+    pub tunnel_glow_rate: f64,        // 氛围卡发光概率 %（0-100）
+    pub tunnel_neon_rate: f64,        // 氛围卡霓虹概率 %（独立随机抽奖，0-100）
+    pub tunnel_glitch_rate: f64,      // 科技失真概率 %（0-100）
+    pub tunnel_sub: serde_json::Value, // 子模式独立参数 {shape:{speed,count,videos,start}}
+    pub perf_vid_limit: u32,          // 同时播放视频数上限
 }
 
 impl Default for GalleryPerfConfig {
@@ -245,6 +307,68 @@ impl Default for GalleryPerfConfig {
             waterfall_scroll_mode: "smooth".into(),
             perf_ver: 0,
             mute: true,
+            // 模式6 3D 圆筒
+            carousel_spin: "step".into(),
+            carousel_interval: 6.0,
+            carousel_speed: 8.0,
+            carousel_visible: 2,
+            carousel_width: 46.0,
+            carousel_random_start: false,
+            carousel_shape: "cylinder".into(),
+            carousel_solid: "cube".into(),
+            carousel_poly_size: 27.0,
+            carousel_poly_interval: 6.0,
+            // 模式7 活拼贴墙
+            mosaic_cols: 4,
+            mosaic_rows: 3,
+            mosaic_interval: 8.0,
+            mosaic_jitter: true,
+            mosaic_anim: "fade".into(),
+            mosaic_video_count: 6,
+            mosaic_wave: false,
+            mosaic_wave_interval: 60.0,
+            mosaic_gap: 8.0,
+            mosaic_focus: "off".into(),
+            mosaic_focus_interval: 10.0,
+            // 模式8 漂浮粒子流
+            float_count: 12,
+            float_speed: 1.0,
+            float_spin: 8.0,
+            float_depth: true,
+            float_videos: 6,
+            float_swap: "wrap".into(),
+            float_interval: 10.0,
+            // 模式9 时空隧道
+            tunnel_shape: "hex".into(),           // 默认 = 用户调校参数固化 2026-10-13
+            tunnel_speed: 0.6,
+            tunnel_count: 30,
+            tunnel_videos: 6,
+            tunnel_start: 30.0,
+            tunnel_core_n: 6,
+            tunnel_core_size: 18.0,
+            tunnel_core_gap: 1.1,
+            tunnel_core_drift: 6.0,
+            tunnel_vpx: 4.0,
+            tunnel_vpy: -1.0,
+            tunnel_stars: true,
+            tunnel_near_z: 860.0,
+            tunnel_far_z: 4550.0,
+            tunnel_dof: 6.0,
+            tunnel_glow: 600.0,
+            tunnel_neon: true,
+            tunnel_neon_enter: 73.0,
+            tunnel_neon_width: 1.0,
+            tunnel_neon_glow_amt: 84.0,
+            tunnel_wall_bright: 100.0,
+            tunnel_wall_opacity: 20.0,
+            tunnel_rand_opacity: 100.0,
+            tunnel_rand_opaque: 34.0,
+            tunnel_spin: 8.0,
+            tunnel_glow_rate: 59.0,
+            tunnel_neon_rate: 100.0,
+            tunnel_glitch_rate: 0.0,
+            tunnel_sub: serde_json::json!({ "hex": { "speed": 0.6 }, "spaced": { "count": 30 } }),
+            perf_vid_limit: 6,
         }
     }
 }

@@ -11,7 +11,7 @@
        meta 里的 CSP 和 tauri.conf.json 里的 CSP 是「取交集」，两边都得放行，所以两处都要改。 -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https://asset.localhost http://127.0.0.1:* http://localhost:*; img-src 'self' asset: http://asset.localhost https://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost https://asset.localhost blob: http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob: data:" />
-  <link rel="stylesheet" href="style.css?v=53" />
+  <link rel="stylesheet" href="style.css?v=72" />
 </head>
 <body class="h-screen w-screen overflow-hidden select-none bg-transparent text-slate-800 dark:text-slate-200">
 
@@ -862,6 +862,10 @@
         <button data-perf="array"     class="settingsTab perfTab">阵列图案</button>
         <button data-perf="slideshow" class="settingsTab perfTab">幻灯片</button>
         <button data-perf="cover"     class="settingsTab perfTab">封面流</button>
+        <button data-perf="carousel"  class="settingsTab perfTab">3D 圆筒</button>
+        <button data-perf="mosaic"    class="settingsTab perfTab">活拼贴墙</button>
+        <button data-perf="float"     class="settingsTab perfTab">漂浮粒子流</button>
+        <button data-perf="tunnel"    class="settingsTab perfTab">时空隧道</button>
       </div>
       <div class="flex-1 overflow-y-auto p-5 text-sm space-y-5">
         <!-- ── 模式1：瀑布流 ── -->
@@ -1034,7 +1038,7 @@
           <div class="settingsRow">
             <label>每张停留</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
-              <input id="perfSlideInterval" type="range" min="1" max="20" step="1" class="w-44" />
+              <input id="perfSlideInterval" type="range" min="0.5" max="20" step="0.5" class="w-44" />
               <span id="perfSlideIntervalVal" class="w-12 text-right opacity-70"></span>
             </div>
           </div>
@@ -1074,7 +1078,7 @@
           <div class="settingsRow">
             <label>推进速度</label>
             <div class="flex items-center gap-2 flex-1 justify-end">
-              <input id="perfCoverInterval" type="range" min="0.8" max="8" step="0.1" class="w-44" />
+              <input id="perfCoverInterval" type="range" min="0.5" max="8" step="0.1" class="w-44" />
               <span id="perfCoverIntervalVal" class="w-12 text-right opacity-70"></span>
             </div>
           </div>
@@ -1112,6 +1116,453 @@
           </div>
           <p class="text-xs opacity-50 leading-relaxed">3D 封面流：中央大图高清展示，两侧卡片斜立后退，自动向前翻转推进。</p>
         </div>
+        <!-- ── 模式6：3D 圆筒 ── -->
+        <div id="perf-carousel" class="perfPage hidden space-y-5">
+          <div class="settingsRow">
+            <label>旋转方式</label>
+            <select id="perfCarSpin" class="settingsSelect">
+              <option value="step">步进（定时推进一格）</option>
+              <option value="continuous">连续匀速旋转</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>形态</label>
+            <select id="perfCarShape" class="settingsSelect">
+              <option value="cylinder">圆筒</option>
+              <option value="polyhedron">多面体</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>立体形状</label>
+            <select id="perfCarSolid" class="settingsSelect">
+              <option value="tetra">正四面体（4 面）</option>
+              <option value="cube">立方体（6 面）</option>
+              <option value="cuboid">长方体（6 面）</option>
+              <option value="octa">正八面体（8 面）</option>
+              <option value="dodeca">正十二面体（12 面）</option>
+              <option value="icosa">正二十面体（20 面）</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>每面切换间隔</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfCarPolyInterval" type="range" min="0.5" max="60" step="0.5" class="w-44" />
+              <span id="perfCarPolyIntervalVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>多面体大小</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfCarPolySize" type="range" min="15" max="40" step="1" class="w-44" />
+              <span id="perfCarPolySizeVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>步进间隔</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfCarInterval" type="range" min="0.5" max="20" step="0.5" class="w-44" />
+              <span id="perfCarIntervalVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>连续旋转速度</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfCarSpeed" type="range" min="2" max="30" step="1" class="w-44" />
+              <span id="perfCarSpeedVal" class="w-14 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>可见卡数（每侧）</label>
+            <select id="perfCarVisible" class="settingsSelect">
+              <option value="1">1 张</option>
+              <option value="2">2 张</option>
+              <option value="3">3 张</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>卡宽</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfCarWidth" type="range" min="30" max="60" step="1" class="w-44" />
+              <span id="perfCarWidthVal" class="w-14 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>随机起点</label>
+            <button id="perfCarRandom" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>同时播放视频数</label>
+            <select id="perfCarVidLimit" class="settingsSelect">
+              <option value="1">1 个</option>
+              <option value="2">2 个</option>
+              <option value="3">3 个</option>
+              <option value="4">4 个</option>
+              <option value="5">5 个</option>
+              <option value="6">6 个</option>
+              <option value="8">8 个</option>
+              <option value="10">10 个</option>
+              <option value="12">12 个</option>
+              <option value="15">15 个</option>
+              <option value="20">20 个</option>
+              <option value="25">25 个</option>
+              <option value="30">30 个</option>
+            </select>
+          </div>
+          <p class="text-xs opacity-50 leading-relaxed">圆筒形态：卡片围成圆筒面向观众，步进或匀速旋转，可见范围内的视频起播；多面体形态：卡片按所选立体（柏拉图立体/长方体）的真实面形状精确裁剪拼接成封闭几何体，整体复合翻滚，每面按独立间隔切换内容。</p>
+        </div>
+        <!-- ── 模式7：活拼贴墙 ── -->
+        <div id="perf-mosaic" class="perfPage hidden space-y-5">
+          <div class="settingsRow">
+            <label>列数</label>
+            <input id="perfMosCols" type="number" min="2" max="8" step="1" class="settingsInput w-20" />
+          </div>
+          <div class="settingsRow">
+            <label>行数</label>
+            <input id="perfMosRows" type="number" min="2" max="6" step="1" class="settingsInput w-20" />
+          </div>
+          <div class="settingsRow">
+            <label>单格停留</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfMosInterval" type="range" min="0.5" max="60" step="0.5" class="w-44" />
+              <span id="perfMosIntervalVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>间隔随机抖动</label>
+            <button id="perfMosJitter" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>换片动画</label>
+            <select id="perfMosAnim" class="settingsSelect">
+              <option value="fade">交叉淡化</option>
+              <option value="zoom">缩放浮现</option>
+              <option value="none">直接切换</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>视频格数量</label>
+            <select id="perfMosVideos" class="settingsSelect">
+              <option value="0">0 个</option>
+              <option value="1">1 个</option>
+              <option value="2">2 个</option>
+              <option value="3">3 个</option>
+              <option value="4">4 个</option>
+              <option value="6">6 个</option>
+              <option value="8">8 个</option>
+              <option value="10">10 个</option>
+              <option value="12">12 个</option>
+              <option value="15">15 个</option>
+              <option value="20">20 个</option>
+              <option value="25">25 个</option>
+              <option value="30">30 个</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>波浪刷新</label>
+            <button id="perfMosWave" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>波浪间隔</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfMosWaveInterval" type="range" min="30" max="600" step="10" class="w-44" />
+              <span id="perfMosWaveIntervalVal" class="w-14 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>格子间隙</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfMosGap" type="range" min="0" max="24" step="1" class="w-44" />
+              <span id="perfMosGapVal" class="w-14 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>景深聚焦</label>
+            <select id="perfMosFocus" class="settingsSelect">
+              <option value="off">关闭</option>
+              <option value="random">随机聚焦（每次换片后重挑）</option>
+              <option value="timer">定时聚焦</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>聚焦间隔</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfMosFocusInterval" type="range" min="1" max="120" step="1" class="w-44" />
+              <span id="perfMosFocusIntervalVal" class="w-14 text-right opacity-70"></span>
+            </div>
+          </div>
+          <p class="text-xs opacity-50 leading-relaxed">全屏网格拼贴：每格独立定时换片（间隔随机抖动），波浪刷新时从屏幕中心向外依次换一轮；景深聚焦随机或定时挑一格保持清晰，其余格模糊降亮，主次分明。</p>
+        </div>
+        <!-- ── 模式8：漂浮粒子流 ── -->
+        <div id="perf-float" class="perfPage hidden space-y-5">
+          <div class="settingsRow">
+            <label>卡片数量</label>
+            <input id="perfFltCount" type="number" min="6" max="24" step="1" class="settingsInput w-20" />
+          </div>
+          <div class="settingsRow">
+            <label>漂浮速度</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfFltSpeed" type="range" min="0.2" max="3" step="0.1" class="w-44" />
+              <span id="perfFltSpeedVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>摆动幅度</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfFltSpin" type="range" min="0" max="20" step="1" class="w-44" />
+              <span id="perfFltSpinVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>远近景深</label>
+            <button id="perfFltDepth" class="settingsToggle"></button>
+          </div>
+          <div class="settingsRow">
+            <label>视频卡数量</label>
+            <select id="perfFltVideos" class="settingsSelect">
+              <option value="0">0 个</option>
+              <option value="1">1 个</option>
+              <option value="2">2 个</option>
+              <option value="3">3 个</option>
+              <option value="4">4 个</option>
+              <option value="6">6 个</option>
+              <option value="8">8 个</option>
+              <option value="10">10 个</option>
+              <option value="12">12 个</option>
+              <option value="15">15 个</option>
+              <option value="20">20 个</option>
+              <option value="25">25 个</option>
+              <option value="30">30 个</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>内容轮换时机</label>
+            <select id="perfFltSwap" class="settingsSelect">
+              <option value="wrap">飘出屏幕时换</option>
+              <option value="timer">定时轮换</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>轮换间隔</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfFltInterval" type="range" min="0.5" max="120" step="0.5" class="w-44" />
+              <span id="perfFltIntervalVal" class="w-14 text-right opacity-70"></span>
+            </div>
+          </div>
+          <p class="text-xs opacity-50 leading-relaxed">卡片如悬浮粒子缓缓漂过屏幕：越近的越大越清晰，飘出边界后从对侧换新内容进入；视频卡漂速减半循环播放。</p>
+        </div>
+        <!-- ── 模式9：时空隧道 ── -->
+        <div id="perf-tunnel" class="perfPage hidden space-y-5">
+          <div class="settingsRow">
+            <label>隧道类型（子模式参数各自独立记忆）</label>
+            <select id="perfTunShape" class="settingsSelect">
+              <option value="spaced">间隔排列（分片环阵推进）</option>
+              <option value="round">闭合管道 · 圆形（16 面密排）</option>
+              <option value="quad">闭合管道 · 四边形</option>
+              <option value="hex">闭合管道 · 六边形</option>
+              <option value="dodec">闭合管道 · 十二边形</option>
+              <option value="space">宇宙空间（零碎碎片外围漂浮）</option>
+            </select>
+          </div>
+          <p class="text-xs font-semibold tracking-wider opacity-60">运动与纵深</p>
+          <div class="settingsRow">
+            <label>推进速度</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfTunSpeed" type="range" min="0.2" max="3" step="0.1" class="w-44" />
+              <span id="perfTunSpeedVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>隧道卡片数量（间隔排列/宇宙空间）</label>
+            <input id="perfTunCount" type="number" min="6" max="36" step="1" class="settingsInput w-20" />
+          </div>
+          <div class="settingsRow">
+            <label>同时播放视频卡</label>
+            <select id="perfTunVideos" class="settingsSelect">
+              <option value="0">0 个</option>
+              <option value="1">1 个</option>
+              <option value="2">2 个</option>
+              <option value="3">3 个</option>
+              <option value="4">4 个</option>
+              <option value="6">6 个</option>
+              <option value="8">8 个</option>
+              <option value="10">10 个</option>
+              <option value="12">12 个</option>
+              <option value="15">15 个</option>
+              <option value="20">20 个</option>
+              <option value="25">25 个</option>
+              <option value="30">30 个</option>
+            </select>
+          </div>
+          <div class="settingsRow">
+            <label>视频起播点（进入近段深度才播放）</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfTunStart" type="range" min="5" max="90" step="1" class="w-44" />
+              <span id="perfTunStartVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>近端消失距离（贴屏才消失）</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfTunNearZ" type="range" min="300" max="950" step="10" class="w-44" />
+              <span id="perfTunNearZVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>远端进入距离</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfTunFarZ" type="range" min="1500" max="6000" step="50" class="w-44" />
+              <span id="perfTunFarZVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>消失点 X</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfTunVpx" type="range" min="-20" max="20" step="1" class="w-44" />
+              <span id="perfTunVpxVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="settingsRow">
+            <label>消失点 Y</label>
+            <div class="flex items-center gap-2 flex-1 justify-end">
+              <input id="perfTunVpy" type="range" min="-20" max="20" step="1" class="w-44" />
+              <span id="perfTunVpyVal" class="w-12 text-right opacity-70"></span>
+            </div>
+          </div>
+          <div class="border-t border-white/20 dark:border-white/5 pt-4 space-y-5">
+            <p class="text-xs font-semibold tracking-wider opacity-60">主轴卡片</p>
+            <div class="settingsRow">
+              <label>中央卡片数量</label>
+              <input id="perfTunCoreN" type="number" min="0" max="14" step="1" class="settingsInput w-20" />
+            </div>
+            <div class="settingsRow">
+              <label>中央卡大小</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunCoreSize" type="range" min="8" max="40" step="1" class="w-44" />
+                <span id="perfTunCoreSizeVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>中央卡间隔</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunCoreGap" type="range" min="0.4" max="3" step="0.1" class="w-44" />
+                <span id="perfTunCoreGapVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>XY 飘移幅度</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunDrift" type="range" min="0" max="30" step="1" class="w-44" />
+                <span id="perfTunDriftVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>霓虹开关</label>
+              <input id="perfTunNeon" type="checkbox" class="settingsCheckbox" />
+            </div>
+            <div class="settingsRow">
+              <label>霓虹进入时机</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunNeonEnter" type="range" min="0" max="100" step="1" class="w-44" />
+                <span id="perfTunNeonEnterVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>霓虹线条粗细（0=无描边）</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunNeonWidth" type="range" min="0" max="6" step="0.5" class="w-44" />
+                <span id="perfTunNeonWidthVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>辉光强度（0=无辉光）</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunNeonGlowAmt" type="range" min="0" max="100" step="1" class="w-44" />
+                <span id="perfTunNeonGlowAmtVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+          </div>
+          <div class="border-t border-white/20 dark:border-white/5 pt-4 space-y-5">
+            <p class="text-xs font-semibold tracking-wider opacity-60">氛围卡片</p>
+            <div class="settingsRow">
+              <label>卡片亮度（30-150%）</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunWallBright" type="range" min="30" max="150" step="5" class="w-44" />
+                <span id="perfTunWallBrightVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>透明度（0-100%）</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunWallOpacity" type="range" min="0" max="100" step="5" class="w-44" />
+                <span id="perfTunWallOpacityVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>随机透明概率</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunRandOpacity" type="range" min="0" max="100" step="1" class="w-44" />
+                <span id="perfTunRandOpacityVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>随机不透明概率</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunRandOpaque" type="range" min="0" max="100" step="1" class="w-44" />
+                <span id="perfTunRandOpaqueVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>发光概率</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunGlowRate" type="range" min="0" max="100" step="1" class="w-44" />
+                <span id="perfTunGlowRateVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>霓虹概率</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunNeonRate" type="range" min="0" max="100" step="1" class="w-44" />
+                <span id="perfTunNeonRateVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>科技失真概率</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunGlitchRate" type="range" min="0" max="100" step="1" class="w-44" />
+                <span id="perfTunGlitchRateVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>景深量（远处模糊，主轴卡不受影响）</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunDOF" type="range" min="0" max="30" step="1" class="w-44" />
+                <span id="perfTunDOFVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>宇宙自转漂移（宇宙空间）</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunSpin" type="range" min="0" max="30" step="1" class="w-44" />
+                <span id="perfTunSpinVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+          </div>
+          <div class="border-t border-white/20 dark:border-white/5 pt-4 space-y-5">
+            <p class="text-xs font-semibold tracking-wider opacity-60">画面氛围</p>
+            <div class="settingsRow">
+              <label>消失点辉光范围</label>
+              <div class="flex items-center gap-2 flex-1 justify-end">
+                <input id="perfTunGlow" type="range" min="80" max="600" step="10" class="w-44" />
+                <span id="perfTunGlowVal" class="w-12 text-right opacity-70"></span>
+              </div>
+            </div>
+            <div class="settingsRow">
+              <label>星光特效</label>
+              <button id="perfTunStars" class="settingsToggle"></button>
+            </div>
+          </div>
+          <p class="text-xs opacity-50 leading-relaxed">六种子模式各自独立记忆速度/数量/视频/起播点。闭合管道面数固定四边相接（圆形=16 面密排近似），素材不足时零散空缺并以半透明色卡补位；主轴卡循环素材，最前卡沿生命线（出生→死亡）推进到「霓虹进入时机」位置点亮随机色霓虹描边，始终清晰不受景深影响；氛围卡统一亮度/透明度可调（霓虹与发光覆盖层不受透明度影响），随机不透明卡恒不透明、随机透明卡更透；发光与霓虹为各自独立的随机概率——发光卡恢复正常亮度带淡发光，霓虹卡带随机色描边，偶尔科技失真；宇宙空间少量碎片自转自漂移。视频按「最前主轴→主轴近处→氛围近处→其他」优先级播放。</p>
+        </div>
         <!-- ── 通用 ── -->
         <div class="border-t border-white/20 dark:border-white/5 pt-4">
           <div class="settingsRow">
@@ -1126,6 +1577,6 @@
   <!-- 画廊表演：模式2 卡片动画的全屏覆盖层（视口定格，卡片快切） -->
   <div id="perfOverlay" class="hidden fixed inset-0 z-[56] overflow-hidden"></div>
 
-  <script src="main.js?v=88" type="module"></script>
+  <script src="main.js?v=121" type="module"></script>
 </body>
 </html>

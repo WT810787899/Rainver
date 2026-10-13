@@ -70,6 +70,9 @@ fn main() {
             thumb::get_preview_path,        // 卡片预览专用：只重封装开头 N 秒
             thumb::cancel_preview,          // 卡片滚走时掐掉正在跑的重封装
             thumb::frame_at,                // L131：进度条悬浮帧预览
+            thumb::build_seek_frames,        // L131c：进度缩略图关键帧序列（后台实时落盘）
+            thumb::list_seek_frames,        // L131c：轮询已落盘关键帧清单
+            thumb::cancel_sprite,           // L131c：杀正在跑的逐帧生成 ffmpeg
             media_info::get_media_info,     // 单项元信息（含音频封面）
             media_info::get_media_props,    // 属性面板：帧率/分辨率/编码等
             config::load_config,            // 读取持久化配置
@@ -145,6 +148,7 @@ fn main() {
                         if let Some(win) = app.get_webview_window("main") {
                             if win.is_visible().unwrap_or(false) {
                                 let _ = win.hide();
+                                release_background_ffmpeg(app); // 托盘隐藏：回收 ffmpeg 视频类工作
                             } else {
                                 let _ = win.show();
                                 let _ = win.set_focus();
@@ -190,6 +194,15 @@ fn main() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // 最小化进后台：回收 ffmpeg 视频类工作，避免后台空耗 CPU/GPU。
+            // （Tauri 2 无 Minimized 事件：Resized 时查 is_minimized，最小化仅触发一次）
+            if let tauri::WindowEvent::Resized(_) = event {
+                if window.is_minimized().unwrap_or(false) {
+                    release_background_ffmpeg(window.app_handle());
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("Rainver 启动失败")
         .run(move |_app_handle, event| {
@@ -210,9 +223,19 @@ fn toggle_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if win.is_visible().unwrap_or(false) && win.is_focused().unwrap_or(false) {
             let _ = win.hide();
+            release_background_ffmpeg(app);
         } else {
             let _ = win.show();
             let _ = win.set_focus();
         }
     }
+}
+
+/// 隐藏/最小化进后台：回收全部 ffmpeg 视频类工作（转码流 + 预览 remux），
+/// 避免后台空耗 CPU/GPU/IO。音频播放独立于这些进程，不受影响。
+/// emit 通知前端暂停视频层（转码流已被杀，video 会僵等死流）。
+fn release_background_ffmpeg(app: &tauri::AppHandle) {
+    thumb::stop_transcode_stream();
+    thumb::cancel_all_previews();
+    let _ = app.emit("ffmpeg-released", ());
 }

@@ -255,58 +255,321 @@ pub async fn frame_at(
     let sec = time.max(0.0).round() as i64;
     let key = hash_key(&src);
     let out = dir.join(format!("{key}.f{sec}.jpg"));
-    if !out.exists() {
-        // 必须限流，但**只抢不排**：悬浮帧是可有可无的装饰，抢不到就直接放弃
-        // （前端 catch 会保留旧帧）。原来这里刻意不占信号量，理由是「前端已防抖」，
-        // 但防抖只挡住了「还没发出去」的请求 —— 已经 spawn 的 ffmpeg 照跑不误，
-        // 而缓存键是按秒分档的（{key}.f{sec}.jpg），鼠标扫过进度条等于每个秒数
-        // 起一个新进程且无上限。4K mkv 上并发几十个抽帧（每个 ~600MB 显存），
-        // 足以把正在播放的解码管线挤到卡死。
-        // sem 必须绑到局部变量：try_acquire 借的是它，直接对临时值调用会让
-        // 临时 Arc 在语句结束就被丢掉，而 permit 还活着（E0716）
-        let sem = slots_current();
-        let Ok(_permit) = sem.try_acquire() else {
-            return Err("抽帧繁忙".into());
-        };
-        let src2 = src.clone();
-        let out2 = out.clone();
-        tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-            let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg".to_string())?;
-            let mut cmd = std::process::Command::new(ffmpeg);
-            cmd
-                .arg("-hide_banner")
-                .arg("-nostdin")
-                .arg("-ss")
-                .arg(sec.to_string())
-                .arg("-i")
-                .arg(&src2)
-                .arg("-frames:v")
-                .arg("1")
-                .arg("-vf")
-                .arg("scale=320:-2")
-                .arg("-q:v")
-                .arg("4")
-                .arg("-y")
-                .arg(&out2);
-
-            #[cfg(windows)]
-            {
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                cmd.creation_flags(CREATE_NO_WINDOW);
-            }
-
-            let output = cmd.output()
-                .map_err(|e| format!("调用 ffmpeg 失败: {e}"))?;
-            if !output.status.success() {
-                let _ = std::fs::remove_file(&out2);
-                return Err("提取帧失败".into());
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("任务失败: {e}"))??;
+    // 单帧缓存（frame_at 自己生成的）
+    if out.exists() {
+        return Ok(out.to_string_lossy().into_owned());
     }
+    // 关键帧序列目录（build_seek_frames 产物）：取 sec 之前最近的关键帧
+    let fdir = dir.join(format!("{key}.dir"));
+    if fdir.exists() {
+        let interval = std::fs::read_to_string(fdir.join("interval.txt"))
+            .ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(5);
+        let done = fdir.join("done.txt").exists();
+        // done → pts.txt 精确找 ≤ sec 的最大秒；未 done → idx 近似（f{i} 对应 (i-1)*interval）
+        let mut best: Option<(i64, std::path::PathBuf)> = None;
+        if done {
+            for (i, s) in parse_pts_txt(&fdir.join("pts.txt")) {
+                if s <= sec {
+                    let p = fdir.join(format!("f{}.jpg", i + 1));
+                    if p.exists() && best.as_ref().map_or(true, |(bs, _)| s > *bs) {
+                        best = Some((s, p));
+                    }
+                }
+            }
+        } else {
+            // 进行中：近似秒 = (idx-1)*interval，但真实关键帧位置 ≥ 近似值（select
+            // 顺延），扫描头未到 hover 位置时帧内容可能落后十几秒——超出 2 个窗口
+            // 就放弃，让前端走精确的单帧兜底（nokey+noaccurate，百毫秒级）
+            let max_idx = sec / interval.max(1) + 1;
+            for idx in (1..=max_idx).rev() {
+                let p = fdir.join(format!("f{idx}.jpg"));
+                if p.exists() {
+                    let approx = (idx - 1) * interval;
+                    if approx + interval * 2 < sec {
+                        return Err("扫描未及".into());
+                    }
+                    best = Some((approx, p));
+                    break;
+                }
+            }
+        }
+        if let Some((_, p)) = best {
+            return Ok(p.to_string_lossy().into_owned());
+        }
+    }
+    // 都没有 → 自己生成
+    // 必须限流，但**只抢不排**：悬浮帧是可有可无的装饰，抢不到就直接放弃
+    // （前端 catch 会保留旧帧）。信号量必须绑到局部变量：try_acquire 借的是它，
+    // 直接对临时值调用会让临时 Arc 在语句结束就被丢掉，而 permit 还活着（E0716）
+    let sem = slots_current();
+    let Ok(_permit) = sem.try_acquire() else {
+        return Err("抽帧繁忙".into());
+    };
+    let src2 = src.clone();
+    let out2 = out.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg".to_string())?;
+        let mut cmd = std::process::Command::new(ffmpeg);
+        cmd
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            // 慢的根因：-ss 只能定位到目标秒之前的关键帧，解码器随后要顺序解完
+            // 中间所有帧才输出——TS 关键帧间隔数秒（几百帧），每 hover 一格就解码
+            // 几秒视频。-skip_frame nokey 让解码器只解关键帧（解码帧数 ~1），
+            // 出图从秒级降到百毫秒级；画面为目标秒前最近的关键帧，悬浮缩略图足够。
+            // 解码量已极小，无需 hwaccel（省去 GPU 初始化与兼容开销）。
+            .arg("-skip_frame")
+            .arg("nokey")
+            // accurate_seek（默认开）会把定位到的关键帧丢掉、继续解码到目标时间戳才
+            // 输出——多等整整一个 GOP。关闭后定位关键帧立即出图，悬浮缩略图足够。
+            .arg("-noaccurate_seek")
+            .arg("-ss")
+            .arg(sec.to_string())
+            .arg("-i")
+            .arg(&src2)
+            .arg("-an")
+            .arg("-sn")
+            .arg("-dn")
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-vf")
+            .arg("scale=320:-2")
+            .arg("-q:v")
+            .arg("4")
+            .arg("-y")
+            .arg(&out2);
+
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = cmd.output()
+            .map_err(|e| format!("调用 ffmpeg 失败: {e}"))?;
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&out2);
+            return Err("提取帧失败".into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))??;
     Ok(out.to_string_lossy().into_owned())
+}
+// ─── L131c：进度缩略图关键帧序列（后台 ffmpeg 实时落盘，前端轮询来一张显一张） ───
+/// 全局取消句柄。**并发规则**：任何路径都不得长时间持有 Child 锁——kill 是主线程
+/// 切文件的必经之路，大分辨率 ffmpeg 死亡收割（GPU 驱动清理）可能数秒，若持锁
+/// wait 会冻结 UI。因此：kill 只瞬间持锁发起；收割一律 try_wait 轮询（每次持锁
+/// 不足 1ms），在后台线程完成。
+static SPRITE_RUNNING: Mutex<Option<(PathBuf, Arc<Mutex<std::process::Child>>)>> = Mutex::new(None);
+
+/// 轮询等待进程退出（try_wait 短持锁，不阻塞 kill 路径）。返回是否成功退出。
+fn reap_child(shared: &Arc<Mutex<std::process::Child>>, max_ms: u64) -> Option<bool> {
+    let step = 200u64;
+    for _ in 0..(max_ms / step + 1) {
+        let done = shared.try_lock().ok()
+            .and_then(|mut c| c.try_wait().ok())
+            .flatten();
+        if done.is_some() {
+            return Some(done.unwrap().success());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(step as u64));
+    }
+    None
+}
+
+/// 杀指定 ffmpeg 并后台收割。瞬间返回，主线程/调用线程零等待。
+fn kill_sprite_job(shared: &Arc<Mutex<std::process::Child>>) {
+    if let Ok(mut c) = shared.lock() {
+        let _ = c.kill();
+    }
+    let shared2 = shared.clone();
+    std::thread::spawn(move || { reap_child(&shared2, 10_000); });
+}
+
+#[tauri::command]
+pub fn cancel_sprite() {
+    let job = SPRITE_RUNNING.lock().unwrap().take();
+    if let Some((_, shared)) = job {
+        kill_sprite_job(&shared);
+    }
+}
+
+/// 解析 pts.txt：每行 `frame:N pts:P pts_time:T`，返回 N → T 映射（N 从 0 起，对应 f{N+1}.jpg）
+fn parse_pts_txt(path: &Path) -> Vec<(i64, i64)> {
+    let Ok(txt) = std::fs::read_to_string(path) else { return vec![] };
+    let mut out = Vec::new();
+    for line in txt.lines() {
+        if let Some(t) = line.split("pts_time:").nth(1) {
+            if let Ok(f) = t.trim().parse::<f64>() {
+                out.push((out.len() as i64, f.round() as i64));
+            }
+        }
+    }
+    out
+}
+
+/// 后台启动 ffmpeg 扫全片关键帧，逐帧落盘到 {key}.dir/f{i}.jpg，立即返回不阻塞。
+/// 设计要点：
+/// - `-skip_frame nokey` 只解关键帧：2 小时片只解码几千帧（非数百万帧），算力极小；
+/// - `select` 按 interval 窗口采样关键帧，窗口内没关键帧时顺延到下一个关键帧——
+///   不产生 fps 滤镜那种「无输入就跳过采样点」的空洞；
+/// - 帧文件直接写到最终目录（f1.jpg/f2.jpg…），不做任何 rename——此前「生成完批量
+///   rename」在 Windows 上会撞 WebView 正打开的文件句柄，rename 失败导致大段进度缺图；
+/// - pts.txt 由 metadata=print 记录每帧真实秒数（索引→秒），比「均匀间隔」假设精确；
+/// - done.txt 是完成标志：半成品目录下次进来清空重建。
+/// 前端用 list_seek_frames 轮询 (路径, 秒) 列表实时显示。
+#[tauri::command]
+pub async fn build_seek_frames(
+    app: tauri::AppHandle,
+    path: String,
+    duration: f64,
+) -> Result<(f64, Vec<(String, i64)>), String> {
+    let src = crate::utils::canonicalize_checked(&path)?;
+    if !src.is_file() || duration <= 1.0 {
+        return Err("无效参数".into());
+    }
+    let dir = cache_dir(&app, "video")?;
+    let key = hash_key(&src);
+    let interval = ((duration / 120.0).ceil().max(5.0)) as i64;
+    let interval_f = interval as f64;
+    let fdir = dir.join(format!("{key}.dir"));
+
+    // 已完成：直接返回现有帧清单（路径, 秒）
+    if fdir.join("done.txt").exists() {
+        let pts = parse_pts_txt(&fdir.join("pts.txt"));
+        let items: Vec<(String, i64)> = pts.iter()
+            .map(|(i, s)| (fdir.join(format!("f{}.jpg", i + 1)).to_string_lossy().into_owned(), *s))
+            .collect();
+        if !items.is_empty() {
+            return Ok((interval_f, items));
+        }
+    }
+
+    let sem = slots_current();
+    let permit = sem.try_acquire_owned().map_err(|_| "抽帧繁忙".to_string())?;
+
+    // 信号量被占时的场景：上一文件的收割还没放 permit。先把旧任务杀掉
+    // （kill 瞬间返回），等旧收割 drop permit 后下次 hover 即可成功。
+    // 不在这里重试 acquire：避免 hover 同步链路被拖长。
+    {
+        let job = SPRITE_RUNNING.lock().unwrap().take();
+        if let Some((_, shared)) = job {
+            kill_sprite_job(&shared);
+        }
+    }
+
+    let src2 = src.clone();
+    let fdir2 = fdir.clone();
+    let interval2 = interval_f;
+    // 启动流程全部后台化（大分辨率下 kill 后死透要数秒、目录里上百个帧文件
+    // 删除也慢——任何一步放 async/主线程都会卡死切文件链路）：
+    // 杀旧并等死透 → 清空目录（无句柄竞态）→ spawn ffmpeg → 注册句柄
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let old = SPRITE_RUNNING.lock().unwrap().take();
+        if let Some((_, shared)) = old {
+            if let Ok(mut c) = shared.lock() { let _ = c.kill(); }
+            reap_child(&shared, 5_000); // 等死透再删目录，避免文件占用
+        }
+        let _ = std::fs::remove_dir_all(&fdir2);
+        std::fs::create_dir_all(&fdir2).map_err(|e| e.to_string())?;
+        std::fs::write(fdir2.join("interval.txt"), interval2.to_string())
+            .map_err(|e| e.to_string())?;
+
+        let ffmpeg = find_ffmpeg().ok_or_else(|| "未找到 ffmpeg".to_string())?;
+        let mut cmd = std::process::Command::new(ffmpeg);
+        cmd.arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-loglevel").arg("error")
+            .arg("-hwaccel").arg("auto")        // GPU 解码关键帧
+            .arg("-skip_frame").arg("nokey")    // 只解关键帧，解码量≈关键帧数
+            .arg("-i").arg(&src2)
+            .arg("-an").arg("-sn").arg("-dn")
+            // select 窗口采样：每个 interval 窗口取首个关键帧；首帧 prev_selected_t=NaN 需特判；
+            // vsync vfr 按实际帧透传（不补帧不丢帧）。metadata=print 把每帧 pts_time 写入 pts.txt。
+            .arg("-vf").arg(format!(
+                "select='if(isnan(prev_selected_t),1,gte(t\\,{interval}))',scale=168:-2,metadata=print:file=pts.txt"
+            ))
+            .arg("-vsync").arg("vfr")
+            .arg("-frame_pts").arg("false")
+            .arg("-q:v").arg("5")
+            .arg("-y")
+            .arg("f%d.jpg");
+        // 工作目录设为帧目录：滤镜参数里的 pts.txt、输出 f%d.jpg 都用相对路径，
+        // 避免 Windows 盘符冒号在 ffmpeg 滤镜参数解析中被误切
+        cmd.current_dir(&fdir2);
+
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let child = cmd.spawn().map_err(|e| format!("调用 ffmpeg 失败: {e}"))?;
+        let shared = Arc::new(Mutex::new(child));
+        *SPRITE_RUNNING.lock().unwrap() = Some((src2.clone(), shared.clone()));
+
+        // 收割线程：try_wait 轮询（短持锁，kill 路径随时可插入）→ 成功写 done.txt
+        let shared_wait = shared.clone();
+        let fdir_wait = fdir2.clone();
+        std::thread::spawn(move || {
+            let ok = reap_child(&shared_wait, u64::MAX).unwrap_or(false);
+            {
+                let mut g = SPRITE_RUNNING.lock().unwrap();
+                if let Some((_, cur)) = g.as_ref() {
+                    if Arc::ptr_eq(cur, &shared_wait) { g.take(); }
+                }
+            }
+            if ok {
+                let _ = std::fs::write(fdir_wait.join("done.txt"), "1");
+            }
+            drop(permit); // 信号量在收割结束后释放
+        });
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("任务启动失败: {e}"))??;
+    Ok((interval_f, vec![]))
+}
+
+/// 轮询当前已落盘的关键帧清单：返回 [(完整路径, 秒)]。
+/// done 前用 idx×interval 近似秒（悬浮显示差几秒无感），done 后用 pts.txt 精确秒。
+#[tauri::command]
+pub async fn list_seek_frames(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<(f64, bool, Vec<(String, i64)>), String> {
+    let src = crate::utils::canonicalize_checked(&path)?;
+    let dir = cache_dir(&app, "video")?;
+    let key = hash_key(&src);
+    let fdir = dir.join(format!("{key}.dir"));
+    if !fdir.exists() {
+        return Ok((0.0, false, vec![]));
+    }
+    let interval = std::fs::read_to_string(fdir.join("interval.txt"))
+        .ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(5.0);
+    let done = fdir.join("done.txt").exists();
+    let mut items: Vec<(String, i64)> = Vec::new();
+    if done {
+        for (i, s) in parse_pts_txt(&fdir.join("pts.txt")) {
+            let p = fdir.join(format!("f{}.jpg", i + 1));
+            if p.exists() { items.push((p.to_string_lossy().into_owned(), s)); }
+        }
+    } else {
+        // 进行中：f%d.jpg 每帧落盘即可见，秒数用近似（窗口采样，误差 ≤ interval）
+        if let Ok(entries) = std::fs::read_dir(&fdir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_str().unwrap_or("").to_string();
+                if let Some(idx) = name.strip_prefix('f').and_then(|n| n.strip_suffix(".jpg"))
+                    .and_then(|n| n.parse::<i64>().ok())
+                {
+                    items.push((entry.path().to_string_lossy().into_owned(), (idx - 1) as i64 * interval as i64));
+                }
+            }
+            items.sort_by_key(|(_, s)| *s);
+        }
+    }
+    Ok((interval, done, items))
 }
 // ─── 播放兼容：WebView2 不支持的容器 → ffmpeg 无损重封装为 mp4 ───
 /// 需要重封装的容器后缀（Chromium/WebView2 原生不支持，但内部编码多为 H.264/AAC 可直接拷贝）
@@ -742,7 +1005,7 @@ fn build_transcode_cmd(
     seek: Option<f64>,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(ffmpeg);
-    cmd.arg("-hide_banner").arg("-nostdin");
+    cmd.arg("-hide_banner").arg("-nostdin").arg("-loglevel").arg("error");
     // 进度跳转：demuxer 级 -ss 置于 -i 之前（快速定位关键帧），
     // 输出时间轴从 0 重新计起，浏览器侧由前端叠加偏移换算绝对时间
     if let Some(t) = seek {
@@ -974,6 +1237,7 @@ pub async fn transcode_stream(path: String, seek_secs: Option<f64>) -> Result<Tr
 /// 停止当前流式转码（关闭查看器/切换视频时调用）
 #[tauri::command]
 pub fn stop_transcode_stream() {
+    cancel_sprite();       // 雪碧图与转码管线抢资源，一起停
     stop_transcode_stream_inner();
 }
 
@@ -995,6 +1259,7 @@ fn stop_transcode_stream_inner() {
 /// 取消所有正在运行的预览重封装（全屏播放开始时调用，释放 CPU/IO）
 #[tauri::command]
 pub fn cancel_all_previews() {
+    cancel_sprite();       // 关预览器：雪碧图 ffmpeg 也停
     // 标记所有 tag=="prev" 的任务为取消
     let mut running_paths: Vec<PathBuf> = Vec::new();
     {
@@ -1221,7 +1486,7 @@ fn remux_to_mp4(
     let tmp = part_path(out);
     let _ = std::fs::remove_file(&tmp);
     let mut cmd = std::process::Command::new(&ffmpeg);
-    cmd.arg("-y").arg("-hide_banner").arg("-nostdin");
+    cmd.arg("-y").arg("-hide_banner").arg("-nostdin").arg("-loglevel").arg("error");
     if let Some(s) = limit_secs {
         if start > 0.0 {
             cmd.arg("-ss").arg(format!("{start:.2}"));
@@ -1322,6 +1587,7 @@ fn transcode_audio_to_aac(src: &Path, out: &Path, audio_index: u32) -> Result<()
     cmd.arg("-y")
         .arg("-hide_banner")
         .arg("-nostdin")
+        .arg("-loglevel").arg("error")
         .arg("-i")
         .arg(src)
         .arg("-map")
@@ -1390,6 +1656,7 @@ fn extract_video_only_inner(src: &Path, out: &Path) -> Result<(), String> {
     cmd.arg("-y")
         .arg("-hide_banner")
         .arg("-nostdin")
+        .arg("-loglevel").arg("error")
         .arg("-i")
         .arg(src)
         .arg("-map").arg("0:v:0")
@@ -1441,6 +1708,7 @@ pub async fn stream_audio(app: tauri::AppHandle, path: String, audio_index: u32)
     let mut cmd = std::process::Command::new(&ffmpeg);
     cmd.arg("-hide_banner")
         .arg("-nostdin")
+        .arg("-loglevel").arg("error")
         .arg("-i").arg(&src)
         .arg("-map").arg(format!("0:a:{}", audio_index))
         .arg("-c:a").arg("aac")
@@ -1686,6 +1954,7 @@ fn build_ffmpeg_args(src: &Path, tmp: &Path, vcodec: &str, aac_idx: Option<usize
 /// 运行 ffmpeg，失败时打印 stderr 末尾便于诊断。
 fn run_ffmpeg(ffmpeg: &Path, args: &[String]) -> Result<(), String> {
     let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
     cmd.args(args);
     #[cfg(windows)]
     {
@@ -1844,6 +2113,7 @@ fn make_image_thumb_ffmpeg(src: &Path, out: &Path, req: u32) -> Result<(), Strin
     cmd
         .arg("-hide_banner")
         .arg("-nostdin")
+        // 注意：需从 stderr 解析尺寸（info 级），不能设 loglevel error；output() 已捕获不泄漏终端
         .arg("-i")
         .arg(src)
         .arg("-frames:v")
@@ -2018,10 +2288,11 @@ fn jpeg_insert_exif(jpeg: &mut Vec<u8>, tiff: &[u8]) {
     if jpeg.len() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
         return;
     }
-    let seg_len = (tiff.len() + 2) as u16;
-    if seg_len > 0xFFFF {
-        return; // 单段超长（罕见），放弃保留
+    // 段长超 64KB 上限时放弃保留（usize 先比较，避免 u16 截断后比较恒假）
+    if tiff.len() + 2 > 0xFFFF {
+        return;
     }
+    let seg_len = (tiff.len() + 2) as u16;
     let mut app1 = vec![0xFF, 0xE1, (seg_len >> 8) as u8, (seg_len & 0xFF) as u8];
     app1.extend_from_slice(b"Exif\0\0");
     app1.extend_from_slice(tiff);
@@ -2171,6 +2442,7 @@ fn make_video_thumb(src: &Path, out: &Path, req: u32) -> Result<(Option<f64>, (O
         let mut cmd = std::process::Command::new(&ffmpeg);
         cmd.arg("-hide_banner");
         cmd.arg("-nostdin");
+        // 注意：需从 stderr 解析 Duration/尺寸（info 级），不能设 loglevel error；output() 已捕获不泄漏终端
         if seek {
             // -ss 放在 -i 之前：输入定位（关键帧级 seek），远快于精确 seek
             cmd.arg("-ss").arg("1");
